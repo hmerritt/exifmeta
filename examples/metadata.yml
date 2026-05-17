@@ -1,0 +1,33 @@
+roll: 35
+date: 2026-04-26
+date_end: 2026-04-26
+frame_count: 15
+notable_frames: [5, 9, 15]
+locations: [Wales]
+comment:
+
+camera:
+    make: Zenza Bronica
+    model: ETRS
+
+lenses:
+    - name: Zenzanon 75mm f/2.8
+      focal_length: 75mm
+
+film:
+    format: 120
+    stock:
+        manufacturer: CineStill Kodak
+        name: Kodak Double-X
+        iso: 250
+        color: false
+        negative: true
+
+development:
+    developer:
+    process: B&W
+    developing_date: 2026-04-28
+    developed_by: The Darkroom, UK
+
+scan:
+    scanned: false
