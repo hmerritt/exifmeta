@@ -6,6 +6,9 @@ notable_frames: [5, 9, 15]
 locations: [Wales]
 comment:
 
+by:
+    - Harry Merritt
+
 camera:
     make: Zenza Bronica
     model: ETRS

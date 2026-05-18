@@ -15,6 +15,7 @@ See example files in [`./examples`](./examples/metadata.yml) directory.
 | `notable_frames`                 | `number[]`               |
 | `locations`                      | `string[]`               |
 | `comment`                        | `string`                 |
+| `by`                             | `string[]`               |
 | `camera -> make`                 | `string`                 |
 | `camera -> model`                | `string`                 |
 | `lenses -> lens -> make`         | `string`                 |

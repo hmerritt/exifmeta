@@ -33,6 +33,32 @@ function Get-YmlFirstListValue($section, $key) {
     return $null
 }
 
+function Get-YmlListValues($section, $key) {
+    if ($yml -notmatch "(?ms)^\s*${section}:\s*\r?\n(?<body>.*?)(?=^\S|\z)") {
+        return @()
+    }
+
+    $body = $Matches["body"]
+    $values = [regex]::Matches($body, "(?m)^\s*(?:-\s*)?${key}:\s*(.*)") | ForEach-Object {
+        $_.Groups[1].Value.Trim().Trim('"').Trim("'")
+    }
+
+    return @($values | Where-Object { $_ })
+}
+
+function Get-YmlScalarListValues($section) {
+    if ($yml -notmatch "(?ms)^\s*${section}:\s*\r?\n(?<body>.*?)(?=^\S|\z)") {
+        return @()
+    }
+
+    $body = $Matches["body"]
+    $values = [regex]::Matches($body, "(?m)^\s*-\s*(.+?)\s*$") | ForEach-Object {
+        $_.Groups[1].Value.Trim().Trim('"').Trim("'")
+    }
+
+    return @($values | Where-Object { $_ })
+}
+
 # Extraction of Base Data
 $make = Get-YmlValue "make"
 $model = Get-YmlValue "model"
@@ -43,6 +69,8 @@ $iso = Get-YmlValue "iso"
 $lensMake = Get-YmlFirstListValue "lenses" "make"
 $lensModel = Get-YmlFirstListValue "lenses" "model"
 $focalLength = Get-YmlFirstListValue "lenses" "focal_length"
+$authors = Get-YmlScalarListValues "by"
+$authorText = $authors -join ", "
 $dateString = Get-YmlValue "date" # "2025-08-29"
 $stock = "$mfg $name"
 
@@ -87,6 +115,17 @@ foreach ($img in $images) {
         "-FileModifyDate=$formattedDate",
         $img.FullName
     )
+
+    if ($authors.Count -gt 0) {
+        $arguments = $arguments[0..($arguments.Count - 2)] + "-XMP-dc:Creator=" + $arguments[-1]
+        foreach ($author in $authors) {
+            $arguments = $arguments[0..($arguments.Count - 2)] + "-XMP-dc:Creator+=$author" + $arguments[-1]
+        }
+    }
+
+    if ($authorText) {
+        $arguments = $arguments[0..($arguments.Count - 2)] + @("-Artist=$authorText", "-XPAuthor=$authorText") + $arguments[-1]
+    }
 
     & $exiftoolPath $arguments
 
