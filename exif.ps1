@@ -1,5 +1,5 @@
 #
-# Edit EXIF v1.5:
+# Edit EXIF v1.12:
 # - Reads `metadata.yml` for film roll data
 # - Edits all JPG, JPEG, PNG, and TIF files in the current directory to add ex
 #
@@ -82,13 +82,14 @@ $imageExtensions = @(".jpg", ".jpeg", ".png", ".tif")
 $images = Get-ChildItem -File | Where-Object { $_.Extension -in $imageExtensions } | Sort-Object Name
 
 if ($images.Count -eq 0) {
-    Write-Host "No JPG, JPEG, PNG, or TIF files found." -ForegroundColor Yellow
+    Write-Warning "No JPG, JPEG, PNG, or TIF files found."
     exit
 }
 
-Write-Host "Processing $($images.Count) images with 10-second increments..." -ForegroundColor Cyan
-
 $incrementSeconds = 0
+$processedImages = 0
+$updatedImages = 0
+$failedImages = @()
 
 foreach ($img in $images) {
     # Calculate the incremental time for the current frame
@@ -131,11 +132,32 @@ foreach ($img in $images) {
     & $exiftoolPath $arguments
 
     if ($LASTEXITCODE -eq 0) {
-        Write-Host "Image updated: $($img.Name)" -ForegroundColor Green
+        $updatedImages += 1
     }
+    else {
+        $failedImages += $img.Name
+    }
+
+    $processedImages += 1
+    $percentComplete = [Math]::Round(($processedImages / $images.Count) * 100)
+    Write-Progress `
+        -Activity "Updating image metadata" `
+        -Status "$processedImages of $($images.Count): $($img.Name)" `
+        -PercentComplete $percentComplete
 
     # Advance the clock by 60 seconds for the next file
     $incrementSeconds += 60
 }
 
-Write-Host "Batch processing complete. Frames are now chronologically ordered." -ForegroundColor Green
+Write-Progress -Activity "Updating image metadata" -Completed
+
+if ($failedImages.Count -eq 0) {
+    Write-Host "Success: Updated $updatedImages of $($images.Count) images." -ForegroundColor Green
+}
+else {
+    Write-Host "Error: Updated $updatedImages of $($images.Count) images. Failed: $($failedImages.Count)." -ForegroundColor Red
+    foreach ($failedImage in $failedImages) {
+        Write-Host "Failed: $failedImage" -ForegroundColor Red
+    }
+    exit 1
+}
