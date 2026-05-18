@@ -1,7 +1,9 @@
 #
-# Edit EXIF v1.4:
+# Edit EXIF v1.5:
 # - Reads `metadata.yml` for film roll data
 # - Edits all JPG, JPEG, PNG, and TIF files in the current directory to add ex
+#
+# Requires: exiftool — `scoop install exiftool`
 #
 
 $exiftoolPath = "exiftool"
@@ -21,12 +23,26 @@ function Get-YmlValue($key) {
     return $null
 }
 
+function Get-YmlFirstListValue($section, $key) {
+    if ($yml -match "(?ms)^\s*${section}:\s*\r?\n(?<body>\s*-\s.*?)(?=^\S|\z)") {
+        $body = $Matches["body"]
+        if ($body -match "(?m)^\s*(?:-\s*)?${key}:\s*(.*)") {
+            return $Matches[1].Trim().Trim('"').Trim("'")
+        }
+    }
+    return $null
+}
+
 # Extraction of Base Data
 $make = Get-YmlValue "make"
 $model = Get-YmlValue "model"
 $fmt = Get-YmlValue "format"
 $mfg = Get-YmlValue "manufacturer"
 $name = Get-YmlValue "name"
+$iso = Get-YmlValue "iso"
+$lensMake = Get-YmlFirstListValue "lenses" "make"
+$lensModel = Get-YmlFirstListValue "lenses" "model"
+$focalLength = Get-YmlFirstListValue "lenses" "focal_length"
 $dateString = Get-YmlValue "date" # "2025-08-29"
 $stock = "$mfg $name"
 
@@ -57,6 +73,10 @@ foreach ($img in $images) {
         "-overwrite_original",
         "-Make=$make",
         "-Model=$model",
+        "-LensMake=$lensMake",
+        "-LensModel=$lensModel",
+        "-FocalLength=$focalLength",
+        "-ISO=$iso",
         "-XMP-dc:Subject=$fmt",
         "-UserComment=Film: $stock, Format: $fmt",
         "-Description=Film Stock: $stock",
