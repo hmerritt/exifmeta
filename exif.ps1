@@ -1,35 +1,32 @@
 #
-# Edit EXIF v1.3:
+# Edit EXIF v1.4:
 # - Reads `metadata.yml` for film roll data
-# - Edits all `.tif` files in the current directory to add ex
+# - Edits all JPG, JPEG, PNG, and TIF files in the current directory to add ex
 #
 
 $exiftoolPath = "exiftool"
 $metadataFile = "metadata.yml"
 
-if (-not (Test-Path $metadataFile))
-{
+if (-not (Test-Path $metadataFile)) {
     Write-Error "The file $metadataFile was not found."
     exit
 }
 
 $yml = Get-Content $metadataFile -Raw
 
-function Get-YmlValue($key)
-{
-    if ($yml -match "(?m)^\s*${key}:\s*(.*)")
-    {
+function Get-YmlValue($key) {
+    if ($yml -match "(?m)^\s*${key}:\s*(.*)") {
         return $Matches[1].Trim().Trim('"').Trim("'")
     }
     return $null
 }
 
 # Extraction of Base Data
-$make  = Get-YmlValue "make"
+$make = Get-YmlValue "make"
 $model = Get-YmlValue "model"
-$fmt   = Get-YmlValue "format"
-$mfg   = Get-YmlValue "manufacturer"
-$name  = Get-YmlValue "name"
+$fmt = Get-YmlValue "format"
+$mfg = Get-YmlValue "manufacturer"
+$name = Get-YmlValue "name"
 $dateString = Get-YmlValue "date" # "2025-08-29"
 $stock = "$mfg $name"
 
@@ -37,11 +34,11 @@ $stock = "$mfg $name"
 $baseDate = [DateTime]::ParseExact($dateString, "yyyy-MM-dd", $null).AddHours(12)
 
 # Ensure images are sorted alphabetically/numerically
-$images = Get-ChildItem -Filter *.tif | Sort-Object Name
+$imageExtensions = @(".jpg", ".jpeg", ".png", ".tif")
+$images = Get-ChildItem -File | Where-Object { $_.Extension -in $imageExtensions } | Sort-Object Name
 
-if ($images.Count -eq 0)
-{
-    Write-Host "No .tif files found." -ForegroundColor Yellow
+if ($images.Count -eq 0) {
+    Write-Host "No JPG, JPEG, PNG, or TIF files found." -ForegroundColor Yellow
     exit
 }
 
@@ -49,8 +46,7 @@ Write-Host "Processing $($images.Count) images with 10-second increments..." -Fo
 
 $incrementSeconds = 0
 
-foreach ($img in $images)
-{
+foreach ($img in $images) {
     # Calculate the incremental time for the current frame
     $currentTime = $baseDate.AddSeconds($incrementSeconds)
 
