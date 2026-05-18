@@ -99,6 +99,7 @@ foreach ($img in $images) {
 
     $arguments = @(
         "-overwrite_original",
+        "-q",
         "-Make=$make",
         "-Model=$model",
         "-LensMake=$lensMake",
@@ -128,6 +129,10 @@ foreach ($img in $images) {
     }
 
     & $exiftoolPath $arguments
+
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Image updated: $($img.Name)" -ForegroundColor Green
+    }
 
     # Advance the clock by 60 seconds for the next file
     $incrementSeconds += 60
