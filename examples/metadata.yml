@@ -11,7 +11,8 @@ camera:
     model: ETRS
 
 lenses:
-    - name: Zenzanon 75mm f/2.8
+    - make: Zenza Bronica
+      model: Zenzanon 75mm f/2.8
       focal_length: 75mm
 
 film:
@@ -29,5 +30,8 @@ development:
     developing_date: 2026-04-28
     developed_by: The Darkroom, UK
 
-scan:
-    scanned: false
+scans:
+    - lab: true
+      frames: []
+      scanner: Noritsu
+      resolution: 2796x2048
