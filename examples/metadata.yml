@@ -1,40 +1,64 @@
-roll: 35
-date: 2026-04-26
-date_end: 2026-04-26
-frame_count: 15
-notable_frames: [5, 9, 15]
-locations: [Wales]
-comment:
+# ──────────────────────────────────────────
+# Standard EXIF Properties
+# Any valid EXIF tag can be set here.
+# ──────────────────────────────────────────
+exif:
+    # Camera & Lens
+    Make: Zenza Bronica
+    Model: ETRS
+    LensMake: Zenza Bronica
+    LensModel: Zenzanon 75mm f/2.8
+    FocalLength: 75mm
 
-by:
-    - Harry Merritt
+    # Film / Capture
+    ISOSpeedRatings: 250 # ISOSpeedRatings | exif:ISO | exifEX:ISOSpeed
+    DateTimeOriginal: "2026-04-28"
+    CreateDate: "2026-04-28"
+    # 1 = Film Scanner
+    # 2 = Reflection Print Scanner
+    # 3 = Digital Camera
+    FileSource: 1
 
-camera:
-    make: Zenza Bronica
-    model: ETRS
+    # Film
+    # AnalogueData
+    FilmRoll: 35
+    FilmMaker: CineStill Kodak
+    FilmName: Kodak Double-X
+    FilmFormat: 120
+    FilmColor: false
+    FilmNegative: true
+    # Film Development
+    FilmDevelopProcess: B&W
+    FilmDeveloper:
+    FilmProcessLab: The Darkroom, UK
+    FilmProcessDate: 2026-04-30
+    FilmScanner: Noritsu
 
-lenses:
-    - make: Zenza Bronica
-      model: Zenzanon 75mm f/2.8
-      focal_length: 75mm
+    # Image Description
+    Artist: Harry Merritt
+    Photographer: Harry Merritt
+    ImageDescription:
+    UserComment:
 
-film:
-    format: 120
-    stock:
-        manufacturer: CineStill Kodak
-        name: Kodak Double-X
-        iso: 250
-        color: false
-        negative: true
+# ──────────────────────────────────────────
+# Custom Properties
+# Anything you like can go here!
+# ──────────────────────────────────────────
+custom:
+    roll: 35
+    date: 2026-04-28
+    date_end: 2026-04-29
+    frame_count: 15
+    notable_frames: [5, 9, 15]
+    locations: [Wales]
 
-development:
-    developer:
-    process: B&W
-    developing_date: 2026-04-28
-    developed_by: The Darkroom, UK
+    lenses:
+        - make: Zenza Bronica
+          model: Zenzanon 75mm f/2.8
+          focal_length: 75mm
 
-scans:
-    - lab: true
-      frames: []
-      scanner: Noritsu
-      resolution: 2796x2048
+    scans:
+        - lab: true
+          frames: []
+          scanner: Noritsu
+          resolution: 2796x2048

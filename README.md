@@ -4,19 +4,21 @@ A simple program to read a standardised `metadata.yaml` file and add the informa
 
 ## CLI Commands
 
-| Command    | Function                                                                                     |
-| :--------- | :------------------------------------------------------------------------------------------- |
-| `run`      | Main function; reads `metadata.yaml` file and adds information as exif to target image files |
-| `init`     | Create template `metadata.yaml` file                                                         |
-| `validate` | Checks `metadata.yaml` is valid                                                              |
-| `inspect`  | Read and pretty-print the current EXIF data of a specific image file                         |
-| `strip`    | Removes all existing EXIF metadata from target image files                                   |
+| Command       | Function                                                                                     |
+| :------------ | :------------------------------------------------------------------------------------------- |
+| `run`         | Main function; reads `metadata.yaml` file and adds information as exif to target image files |
+| `init`        | Create template `metadata.yaml` file                                                         |
+| `validate`    | Checks `metadata.yaml` is valid                                                              |
+| `inspect`     | Read and pretty-print the current EXIF data of a specific image file                         |
+| `interactive` | Interactively read and set EXIF data for any image                                           |
+| `strip`       | Removes all existing EXIF metadata from target image files                                   |
 
 ### Flags
 
 | Command          | Function                                                                                                                                   |
 | :--------------- | :----------------------------------------------------------------------------------------------------------------------------------------- |
 | `--dry-run`      | Runs the program in 'simulation' mode, without making any changes to any files                                                             |
+| `--strip`        | Will remove all existing EXIF data before adding new data                                                                                  |
 | `--no-overwrite` | Prevents overwriting exif data if there is already data there                                                                              |
 | `--extensions`   | Restricts processing to specified file typologies to prevent the script from attempting to modify unsupported binaries (e.g., -e jpg,tiff) |
 | `--recursive`    | Find image files across all subdirectories, applying the root configuration to nested image repositories                                   |
