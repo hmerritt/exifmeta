@@ -34,6 +34,8 @@ A simple program to read a standardised `metadata.yaml` file and add the informa
 
 ## `metadata.yaml` file
 
+[EXIF Tags reference](https://exiftool.org/TagNames/EXIF.html)
+
 See example files in [`./examples`](./examples/metadata.yml) directory.
 
 | Parent Interface                 | Property                 |

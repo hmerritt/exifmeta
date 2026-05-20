@@ -9,6 +9,7 @@ exif:
     LensMake: Zenza Bronica
     LensModel: Zenzanon 75mm f/2.8
     FocalLength: 75mm
+    MaxApertureValue: 2.8
 
     # Film / Capture
     ISOSpeedRatings: 250 # ISOSpeedRatings | exif:ISO | exifEX:ISOSpeed
@@ -19,8 +20,8 @@ exif:
     # 3 = Digital Camera
     FileSource: 1
 
-    # Film
     # AnalogueData
+    # Film
     FilmRoll: 35
     FilmMaker: CineStill Kodak
     FilmName: Kodak Double-X
@@ -34,9 +35,11 @@ exif:
     FilmProcessDate: 2026-04-30
     FilmScanner: Noritsu
 
-    # Image Description
+    # Attribution
     Artist: Harry Merritt
     Photographer: Harry Merritt
+
+    # Image Description (note: this gets applied to ALL images)
     ImageDescription:
     UserComment:
 
@@ -62,3 +65,35 @@ custom:
           frames: []
           scanner: Noritsu
           resolution: 2796x2048
+
+# ──────────────────────────────────────────
+# Per Frame/File EXIF Properties
+# Use this to set EXIF data for individual files, like ExposureTime, FNumber, or GPS data
+# ──────────────────────────────────────────
+frames:
+    # Frame number (first file when sorted alphabetically, useful when shooting film and files are in-order)
+    1:
+        - ExposureTime: 1/500
+        - FNumber: 2.8
+        # 0 = Unknown
+        # 1 = Average
+        # 2 = Center-weighted average
+        # 3 = Spot
+        # 4 = Multi-spot
+        # 5 = Multi-segment
+        # 6 = Partial
+        # 255 = Other
+        - MeteringMode: 2
+        # When setting GPS, all of the following values must be set!
+        - GPSLatitude: "51.5074"
+        - GPSLatitudeRef: "N"
+        - GPSLongitude: "3.1791"
+        - GPSLongitudeRef: "W"
+        - GPSAltitude: "142"
+        - GPSAltitudeRef: 0 # 0 = above sea level
+        - GPSMapDatum: "WGS-84"
+
+    # Filename (direct but more verbose)
+    "image-file.tif":
+        - ExposureTime: 1/250
+        - FNumber: 5.6
