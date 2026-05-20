@@ -1,7 +1,29 @@
-# ──────────────────────────────────────────
-# Standard EXIF Properties
-# Any valid EXIF tag can be set here.
-# ──────────────────────────────────────────
+# ───────────────────────────────────────────────
+# Custom Properties
+# These values will not be written as EXIF, and are meant for personal organisational purposes — e.g. private metadata for your shoot
+# ───────────────────────────────────────────────
+roll: 35
+date: 2026-04-28
+date_end: 2026-04-29
+frame_count: 15
+notable_frames: [5, 9, 15]
+locations: [Wales]
+
+lenses:
+    - make: Zenza Bronica
+      model: Zenzanon 75mm f/2.8
+      focal_length: 75mm
+
+scans:
+    - lab: true
+      frames: []
+      scanner: Noritsu
+      resolution: 2796x2048
+
+# ───────────────────────────────────────────────
+# Global EXIF Properties
+# Any valid EXIF tag can be set here. These tags will be written to ALL images.
+# ───────────────────────────────────────────────
 exif:
     # Camera & Lens
     Make: Zenza Bronica
@@ -43,38 +65,25 @@ exif:
     ImageDescription:
     UserComment:
 
-# ──────────────────────────────────────────
-# Custom Properties
-# Anything you like can go here!
-# ──────────────────────────────────────────
-custom:
-    roll: 35
-    date: 2026-04-28
-    date_end: 2026-04-29
-    frame_count: 15
-    notable_frames: [5, 9, 15]
-    locations: [Wales]
-
-    lenses:
-        - make: Zenza Bronica
-          model: Zenzanon 75mm f/2.8
-          focal_length: 75mm
-
-    scans:
-        - lab: true
-          frames: []
-          scanner: Noritsu
-          resolution: 2796x2048
-
-# ──────────────────────────────────────────
+# ───────────────────────────────────────────────
 # Per Frame/File EXIF Properties
-# Use this to set EXIF data for individual files, like ExposureTime, FNumber, or GPS data
-# ──────────────────────────────────────────
+# Use this to set EXIF tags for individual files, like ExposureTime, FNumber, or GPS data.
+# Values set here will override the above `exif` values.
+# ───────────────────────────────────────────────
 frames:
     # Frame number (first file when sorted alphabetically, useful when shooting film and files are in-order)
     1:
+        - ImageDescription:
         - ExposureTime: 1/500
         - FNumber: 2.8
+        # Special key (`$` prefix) that will match city/town names to GPS long/lat values automatically,
+        # uses an embeded database, no internet requried.
+        - $Location: Betws-y-Coed
+
+    # Filename (direct but more verbose)
+    "image-file.tif":
+        - ExposureTime: 1/250
+        - FNumber: 5.6
         # 0 = Unknown
         # 1 = Average
         # 2 = Center-weighted average
@@ -84,7 +93,7 @@ frames:
         # 6 = Partial
         # 255 = Other
         - MeteringMode: 2
-        # When setting GPS, all of the following values must be set!
+        # Manually setting  GPS, all of the following values must be set!
         - GPSLatitude: "51.5074"
         - GPSLatitudeRef: "N"
         - GPSLongitude: "3.1791"
@@ -92,8 +101,3 @@ frames:
         - GPSAltitude: "142"
         - GPSAltitudeRef: 0 # 0 = above sea level
         - GPSMapDatum: "WGS-84"
-
-    # Filename (direct but more verbose)
-    "image-file.tif":
-        - ExposureTime: 1/250
-        - FNumber: 5.6
