@@ -1,8 +1,11 @@
 pub mod cli;
+pub mod version;
 
 pub use cli::{Cli, Command, RunArgs};
 
 pub fn run(cli: Cli) -> Result<(), String> {
+    version::print_title();
+
     match cli.command {
         Command::Run(args) => run_command(cli.dry_run, args),
         Command::Init => stub_command(cli.dry_run, "init"),
