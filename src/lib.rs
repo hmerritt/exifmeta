@@ -1,7 +1,9 @@
-use std::fs::File;
-use std::io::BufReader;
+use std::fs::{self, File, Metadata};
+use std::io::{BufReader, Read};
 use std::path::Path;
+use std::time::SystemTime;
 
+use chrono::{DateTime, Local};
 use exif::{Exif, Field, Reader, Tag, Value};
 
 pub mod cli;
@@ -54,12 +56,104 @@ fn read_metadata(image: &Path) -> Result<InspectMetadata, String> {
             )
         })?;
 
-    Ok(InspectMetadata { exif, warnings })
+    let file_info = InspectFileInfo::from_path(image, &exif)?;
+
+    Ok(InspectMetadata {
+        exif,
+        warnings,
+        file_info,
+    })
 }
 
 struct InspectMetadata {
     exif: Exif,
     warnings: Vec<String>,
+    file_info: InspectFileInfo,
+}
+
+struct InspectFileInfo {
+    rows: Vec<InspectInfoRow>,
+}
+
+impl InspectFileInfo {
+    fn from_path(image: &Path, exif: &Exif) -> Result<Self, String> {
+        let metadata = fs::metadata(image).map_err(|error| {
+            format!(
+                "failed to read file metadata for {}: {error}",
+                image.display()
+            )
+        })?;
+        let file_kind = detect_file_kind(image);
+        let mut rows = Vec::new();
+
+        rows.push(InspectInfoRow::new(
+            "Exifmeta Version Number",
+            version::get_version().version_number(),
+        ));
+        rows.push(InspectInfoRow::new("File Name", file_name(image)));
+        rows.push(InspectInfoRow::new("Directory", directory_name(image)));
+        rows.push(InspectInfoRow::new(
+            "File Size",
+            format_file_size(metadata.len()),
+        ));
+
+        if let Ok(modified) = metadata.modified() {
+            rows.push(InspectInfoRow::new(
+                "File Modification Date/Time",
+                format_system_time(modified),
+            ));
+        }
+
+        if let Ok(accessed) = metadata.accessed() {
+            rows.push(InspectInfoRow::new(
+                "File Access Date/Time",
+                format_system_time(accessed),
+            ));
+        }
+
+        if let Ok(created) = metadata.created() {
+            rows.push(InspectInfoRow::new(
+                "File Creation Date/Time",
+                format_system_time(created),
+            ));
+        }
+
+        rows.push(InspectInfoRow::new(
+            "File Permissions",
+            format_permissions(&metadata),
+        ));
+        rows.push(InspectInfoRow::new("File Type", file_kind.file_type));
+        rows.push(InspectInfoRow::new(
+            "File Type Extension",
+            file_kind.extension,
+        ));
+        rows.push(InspectInfoRow::new("MIME Type", file_kind.mime_type));
+        rows.push(InspectInfoRow::new(
+            "Exif Byte Order",
+            format_exif_byte_order(exif),
+        ));
+
+        Ok(Self { rows })
+    }
+
+    #[cfg(test)]
+    fn empty() -> Self {
+        Self { rows: Vec::new() }
+    }
+}
+
+struct InspectInfoRow {
+    name: String,
+    value: String,
+}
+
+impl InspectInfoRow {
+    fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
 }
 
 fn validate_image_path(image: &Path) -> Result<(), String> {
@@ -75,11 +169,11 @@ fn validate_image_path(image: &Path) -> Result<(), String> {
 }
 
 fn format_inspect_output(
-    image: &Path,
+    _image: &Path,
     metadata: &InspectMetadata,
     format: InspectFormat,
 ) -> String {
-    let mut output = format!("EXIF metadata for {}\n", image.display());
+    let mut output = String::new();
     let mut rows = metadata
         .exif
         .fields()
@@ -87,13 +181,19 @@ fn format_inspect_output(
         .collect::<Vec<_>>();
 
     if rows.is_empty() {
+        append_info_rows(&mut output, &metadata.file_info.rows, None);
         output.push_str("No EXIF metadata found.");
     } else {
         sort_inspect_rows(&mut rows);
 
         match format {
-            InspectFormat::Pretty => append_pretty_inspect_rows(&mut output, &rows),
-            InspectFormat::Raw => append_raw_inspect_rows(&mut output, &rows),
+            InspectFormat::Pretty => {
+                append_pretty_inspect_rows(&mut output, &metadata.file_info.rows, &rows)
+            }
+            InspectFormat::Raw => {
+                append_info_rows(&mut output, &metadata.file_info.rows, None);
+                append_raw_inspect_rows(&mut output, &rows);
+            }
         }
 
         output = output.trim_end().to_string();
@@ -108,6 +208,19 @@ fn format_inspect_output(
     }
 
     output
+}
+
+fn append_info_rows(output: &mut String, rows: &[InspectInfoRow], width: Option<usize>) {
+    if rows.is_empty() {
+        return;
+    }
+
+    let name_width =
+        width.unwrap_or_else(|| rows.iter().map(|row| row.name.len()).max().unwrap_or(0));
+
+    for row in rows {
+        output.push_str(&format!("{:<name_width$}  {}\n", row.name, row.value));
+    }
 }
 
 fn sort_inspect_rows(rows: &mut [InspectRow]) {
@@ -134,18 +247,200 @@ fn append_raw_inspect_rows(output: &mut String, rows: &[InspectRow]) {
     }
 }
 
-fn append_pretty_inspect_rows(output: &mut String, rows: &[InspectRow]) {
-    let name_width = rows
+fn append_pretty_inspect_rows(
+    output: &mut String,
+    info_rows: &[InspectInfoRow],
+    rows: &[InspectRow],
+) {
+    let name_width = info_rows
         .iter()
-        .map(|row| row.pretty_name.len())
+        .map(|row| row.name.len())
+        .chain(rows.iter().map(|row| row.pretty_name.len()))
         .max()
         .unwrap_or(0);
+
+    append_info_rows(output, info_rows, Some(name_width));
 
     for row in rows {
         output.push_str(&format!(
             "{:<name_width$}  {}\n",
             row.pretty_name, row.value
         ));
+    }
+}
+
+struct FileKind {
+    file_type: &'static str,
+    extension: String,
+    mime_type: &'static str,
+}
+
+fn detect_file_kind(image: &Path) -> FileKind {
+    let signature = read_file_signature(image);
+    let detected = signature.as_deref().and_then(file_kind_from_signature);
+    let fallback = file_kind_from_extension(image);
+
+    let (file_type, default_extension, mime_type) =
+        detected
+            .or(fallback)
+            .unwrap_or(("Unknown", "", "application/octet-stream"));
+
+    FileKind {
+        file_type,
+        extension: if default_extension.is_empty() {
+            file_extension(image).unwrap_or_default()
+        } else {
+            default_extension.to_string()
+        },
+        mime_type,
+    }
+}
+
+fn read_file_signature(image: &Path) -> Option<Vec<u8>> {
+    let mut file = File::open(image).ok()?;
+    let mut buffer = vec![0; 32];
+    let length = file.read(&mut buffer).ok()?;
+    buffer.truncate(length);
+    Some(buffer)
+}
+
+fn file_kind_from_signature(
+    signature: &[u8],
+) -> Option<(&'static str, &'static str, &'static str)> {
+    if signature.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some(("JPEG", "jpg", "image/jpeg"));
+    }
+
+    if signature.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some(("PNG", "png", "image/png"));
+    }
+
+    if signature.starts_with(b"II*\0") || signature.starts_with(b"MM\0*") {
+        return Some(("TIFF", "tif", "image/tiff"));
+    }
+
+    if signature.len() >= 12 && signature.starts_with(b"RIFF") && &signature[8..12] == b"WEBP" {
+        return Some(("WEBP", "webp", "image/webp"));
+    }
+
+    if signature.starts_with(&[0xff, 0x0a]) || signature.starts_with(b"\0\0\0\x0cJXL ") {
+        return Some(("JXL", "jxl", "image/jxl"));
+    }
+
+    if signature.len() >= 12 && &signature[4..8] == b"ftyp" {
+        let brand = &signature[8..12];
+        return match brand {
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" | b"hevm" | b"hevs" => {
+                Some(("HEIC", "heic", "image/heic"))
+            }
+            b"mif1" | b"msf1" => Some(("HEIF", "heif", "image/heif")),
+            b"avif" | b"avis" => Some(("AVIF", "avif", "image/avif")),
+            _ => None,
+        };
+    }
+
+    None
+}
+
+fn file_kind_from_extension(image: &Path) -> Option<(&'static str, &'static str, &'static str)> {
+    match file_extension(image)?.as_str() {
+        "jpg" | "jpeg" => Some(("JPEG", "jpg", "image/jpeg")),
+        "png" => Some(("PNG", "png", "image/png")),
+        "tif" | "tiff" => Some(("TIFF", "tif", "image/tiff")),
+        "webp" => Some(("WEBP", "webp", "image/webp")),
+        "jxl" => Some(("JXL", "jxl", "image/jxl")),
+        "heif" | "hif" => Some(("HEIF", "heif", "image/heif")),
+        "heic" => Some(("HEIC", "heic", "image/heic")),
+        "avif" => Some(("AVIF", "avif", "image/avif")),
+        _ => None,
+    }
+}
+
+fn file_extension(image: &Path) -> Option<String> {
+    image
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+}
+
+fn file_name(image: &Path) -> String {
+    image
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| image.display().to_string(), ToString::to_string)
+}
+
+fn directory_name(image: &Path) -> String {
+    let directory = image.parent().map(|parent| parent.display().to_string());
+
+    match directory.as_deref() {
+        Some("") | None => ".".to_string(),
+        Some(directory) => directory.to_string(),
+    }
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
+
+    if bytes < 1000 {
+        return format!("{bytes} bytes");
+    }
+
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+
+    if value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        let formatted = format!("{value:.1}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string();
+        format!("{formatted} {}", UNITS[unit])
+    }
+}
+
+fn format_system_time(time: SystemTime) -> String {
+    let datetime: DateTime<Local> = time.into();
+
+    datetime.format("%Y:%m:%d %H:%M:%S%:z").to_string()
+}
+
+#[cfg(unix)]
+fn format_permissions(metadata: &Metadata) -> String {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode();
+    let mut output = String::with_capacity(10);
+    output.push(if metadata.is_dir() { 'd' } else { '-' });
+
+    for shift in [6, 3, 0] {
+        output.push(if mode & (0o4 << shift) != 0 { 'r' } else { '-' });
+        output.push(if mode & (0o2 << shift) != 0 { 'w' } else { '-' });
+        output.push(if mode & (0o1 << shift) != 0 { 'x' } else { '-' });
+    }
+
+    output
+}
+
+#[cfg(not(unix))]
+fn format_permissions(metadata: &Metadata) -> String {
+    if metadata.permissions().readonly() {
+        "read-only".to_string()
+    } else {
+        "read-write".to_string()
+    }
+}
+
+fn format_exif_byte_order(exif: &Exif) -> &'static str {
+    if exif.little_endian() {
+        "Little-endian (Intel, II)"
+    } else {
+        "Big-endian (Motorola, MM)"
     }
 }
 
@@ -363,10 +658,11 @@ mod tests {
                 &InspectMetadata {
                     exif: parse_raw_exif(&[]),
                     warnings: Vec::new(),
+                    file_info: InspectFileInfo::empty(),
                 },
                 InspectFormat::Pretty,
             ),
-            "EXIF metadata for image.tif\nNo EXIF metadata found."
+            "No EXIF metadata found."
         );
     }
 
@@ -379,17 +675,20 @@ mod tests {
                 tiff_ascii_entry(0x0110, b"E\0"),
             ]),
             warnings: vec!["ignored malformed trailing field".to_string()],
+            file_info: test_file_info(),
         };
 
         let output = format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Raw);
 
         assert!(output.contains("KNOWN"));
         assert!(output.contains("UNKNOWN"));
+        assert!(output.contains("File Name  image.tif"));
         assert!(output.contains("0x010F"));
         assert!(output.contains("0x0110"));
         assert!(output.contains("0xFDE8"));
         assert!(output.contains("Warnings:"));
         assert!(output.contains("warning: ignored malformed trailing field"));
+        assert!(output.find("File Name").unwrap() < output.find("KNOWN").unwrap());
         assert!(output.find("0x0110").unwrap() < output.find("0xFDE8").unwrap());
     }
 
@@ -402,16 +701,19 @@ mod tests {
                 tiff_ascii_entry(0x0110, b"E\0"),
             ]),
             warnings: vec!["ignored malformed trailing field".to_string()],
+            file_info: test_file_info(),
         };
 
         let output =
             format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
 
+        assert!(output.contains("File Name         image.tif"));
         assert!(output.contains("Make              \"Z\""));
         assert!(output.contains("Model             \"E\""));
         assert!(output.contains("Unknown Tiff Tag  Short([42])"));
         assert!(output.contains("Warnings:"));
         assert!(output.contains("warning: ignored malformed trailing field"));
+        assert!(output.find("File Name").unwrap() < output.find("Make").unwrap());
         assert!(!output.contains("KNOWN"));
         assert!(!output.contains("UNKNOWN"));
         assert!(!output.contains("IFD"));
@@ -445,6 +747,32 @@ mod tests {
     }
 
     #[test]
+    fn file_info_reports_file_and_exif_metadata() {
+        let path = temporary_test_path("file-info.jpg");
+        std::fs::write(&path, [0xff, 0xd8, 0xff]).expect("test image should be written");
+        let exif = parse_raw_exif(&[]);
+        let file_info =
+            InspectFileInfo::from_path(&path, &exif).expect("file info should be collected");
+        let rows = file_info.rows;
+
+        assert!(info_row_value(&rows, "Exifmeta Version Number").is_some());
+        let expected_file_name = path.file_name().and_then(|name| name.to_str());
+        assert_eq!(info_row_value(&rows, "File Name"), expected_file_name);
+        assert!(info_row_value(&rows, "Directory").is_some());
+        assert_eq!(info_row_value(&rows, "File Size"), Some("3 bytes"));
+        assert!(info_row_value(&rows, "File Permissions").is_some());
+        assert_eq!(info_row_value(&rows, "File Type"), Some("JPEG"));
+        assert_eq!(info_row_value(&rows, "File Type Extension"), Some("jpg"));
+        assert_eq!(info_row_value(&rows, "MIME Type"), Some("image/jpeg"));
+        assert_eq!(
+            info_row_value(&rows, "Exif Byte Order"),
+            Some("Big-endian (Motorola, MM)")
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn appends_signed_decimal_gps_coordinates() {
         let (latitude_entry, latitude_data) =
             tiff_rational_entry(0x0002, [(52, 1), (21, 1), (101952, 10000)], 200);
@@ -461,6 +789,7 @@ mod tests {
                 &[(200, latitude_data), (224, longitude_data)],
             ),
             warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
         };
 
         let output =
@@ -479,6 +808,7 @@ mod tests {
         let metadata = InspectMetadata {
             exif: parse_raw_exif_with_gps_entries(&[latitude_entry], &[(200, latitude_data)]),
             warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
         };
 
         let output =
@@ -505,6 +835,22 @@ mod tests {
             validate_image_path(Path::new(".")),
             Err("image path is not a file: .".to_string())
         );
+    }
+
+    fn test_file_info() -> InspectFileInfo {
+        InspectFileInfo {
+            rows: vec![InspectInfoRow::new("File Name", "image.tif")],
+        }
+    }
+
+    fn info_row_value<'a>(rows: &'a [InspectInfoRow], name: &str) -> Option<&'a str> {
+        rows.iter()
+            .find(|row| row.name == name)
+            .map(|row| row.value.as_str())
+    }
+
+    fn temporary_test_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("exifmeta-{}-{name}", std::process::id()))
     }
 
     fn parse_raw_exif(entries: &[[u8; 12]]) -> Exif {

@@ -6,6 +6,7 @@ description = "Read metadata.yaml and write EXIF metadata to image files"
 license = "MIT"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
 kamadak-exif = "0.6.1"
 
