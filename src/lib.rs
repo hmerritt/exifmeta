@@ -261,11 +261,29 @@ fn append_pretty_inspect_rows(
     append_info_rows(output, info_rows, Some(name_width));
 
     for row in rows {
-        output.push_str(&format!(
-            "{:<name_width$}  {}\n",
-            row.pretty_name, row.value
-        ));
+        let value = pretty_inspect_value(row);
+        output.push_str(&format!("{:<name_width$}  {}\n", row.pretty_name, value));
     }
+}
+
+fn pretty_inspect_value(row: &InspectRow) -> String {
+    if row.name == "ExposureTime" {
+        return pretty_exposure_time(&row.value).unwrap_or_else(|| row.value.clone());
+    }
+
+    row.value.clone()
+}
+
+fn pretty_exposure_time(value: &str) -> Option<String> {
+    let denominator = value.strip_prefix("1/")?;
+    let denominator = denominator.strip_suffix(" s").unwrap_or(denominator);
+    let denominator = denominator.parse::<f64>().ok()?;
+
+    if !denominator.is_finite() {
+        return None;
+    }
+
+    Some(format!("1/{:.0}", denominator.round()))
 }
 
 struct FileKind {
@@ -474,7 +492,7 @@ impl InspectRow {
         let mut value = if is_unknown {
             format!("{:?}", field.value)
         } else {
-            field.display_value().with_unit(exif).to_string()
+            format_known_field_value(field, exif, &name)
         };
 
         if !is_unknown {
@@ -493,6 +511,18 @@ impl InspectRow {
             value,
         }
     }
+}
+
+fn format_known_field_value(field: &Field, exif: &Exif, name: &str) -> String {
+    let value = field.display_value().with_unit(exif).to_string();
+
+    if name == "ExposureTime" {
+        return value
+            .strip_suffix(" s")
+            .map_or(value.clone(), ToString::to_string);
+    }
+
+    value
 }
 
 fn title_case_tag_name(name: &str) -> String {
@@ -735,6 +765,56 @@ mod tests {
     }
 
     #[test]
+    fn formats_exposure_time_for_pretty_output() {
+        assert_eq!(
+            pretty_exposure_time("1/1439.2133835330962 s"),
+            Some("1/1439".to_string())
+        );
+        assert_eq!(
+            pretty_exposure_time("1/1439.2133835330962"),
+            Some("1/1439".to_string())
+        );
+        assert_eq!(pretty_exposure_time("1/500 s"), Some("1/500".to_string()));
+        assert_eq!(pretty_exposure_time("0.5 s"), None);
+    }
+
+    #[test]
+    fn raw_output_omits_exposure_time_unit() {
+        let (exposure_entry, exposure_data) =
+            tiff_rational_entry_with_count(0x829a, &[(1, 1439)], 200);
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif_with_exif_entries(&[exposure_entry], &[(200, exposure_data)]),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        };
+
+        let output = format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Raw);
+
+        assert!(output.contains("ExposureTime"));
+        assert!(output.contains("1/1439"));
+        assert!(!output.contains("1/1439 s"));
+    }
+
+    #[test]
+    fn pretty_output_rounds_exposure_time_reciprocal_denominator() {
+        let (exposure_entry, exposure_data) =
+            tiff_rational_entry_with_count(0x829a, &[(10_000, 14_392_134)], 200);
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif_with_exif_entries(&[exposure_entry], &[(200, exposure_data)]),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        };
+
+        let output =
+            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+
+        assert!(output.contains("Exposure Time"));
+        assert!(output.contains("1/1439"));
+        assert!(!output.contains("1/1439.2134"));
+        assert!(!output.contains("1/1439 s"));
+    }
+
+    #[test]
     fn reads_unknown_tags_without_failing() {
         let exif = parse_raw_exif(&[tiff_short_entry(0xfde8, 42)]);
         let fields = exif.fields().collect::<Vec<_>>();
@@ -912,6 +992,38 @@ mod tests {
             .expect("test EXIF should parse")
     }
 
+    fn parse_raw_exif_with_exif_entries(
+        exif_entries: &[[u8; 12]],
+        offset_data: &[(u32, Vec<u8>)],
+    ) -> Exif {
+        let mut data = vec![0x4d, 0x4d, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+        data.extend_from_slice(&1u16.to_be_bytes());
+        data.extend_from_slice(&tiff_long_entry(0x8769, 100));
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        data.resize(100, 0);
+        data.extend_from_slice(&(exif_entries.len() as u16).to_be_bytes());
+        for entry in exif_entries {
+            data.extend_from_slice(entry);
+        }
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+        let mut offset_data = offset_data.to_vec();
+        offset_data.sort_by_key(|(offset, _)| *offset);
+        for (offset, bytes) in offset_data {
+            let offset = offset as usize;
+            if data.len() < offset {
+                data.resize(offset, 0);
+            }
+            data.extend_from_slice(&bytes);
+        }
+
+        Reader::new()
+            .continue_on_error(true)
+            .read_raw(data)
+            .or_else(|error| error.distill_partial_result(|_| {}))
+            .expect("test EXIF should parse")
+    }
+
     fn tiff_ascii_entry(tag: u16, value: &[u8]) -> [u8; 12] {
         let mut entry = [0; 12];
         entry[0..2].copy_from_slice(&tag.to_be_bytes());
@@ -940,18 +1052,31 @@ mod tests {
     }
 
     fn tiff_rational_entry(tag: u16, values: [(u32, u32); 3], offset: u32) -> ([u8; 12], Vec<u8>) {
+        let (entry, _) = tiff_rational_entry_with_count(tag, &values, offset);
+        (entry, tiff_rational_data(&values))
+    }
+
+    fn tiff_rational_entry_with_count(
+        tag: u16,
+        values: &[(u32, u32)],
+        offset: u32,
+    ) -> ([u8; 12], Vec<u8>) {
         let mut entry = [0; 12];
         entry[0..2].copy_from_slice(&tag.to_be_bytes());
         entry[2..4].copy_from_slice(&5u16.to_be_bytes());
-        entry[4..8].copy_from_slice(&3u32.to_be_bytes());
+        entry[4..8].copy_from_slice(&(values.len() as u32).to_be_bytes());
         entry[8..12].copy_from_slice(&offset.to_be_bytes());
 
+        (entry, tiff_rational_data(values))
+    }
+
+    fn tiff_rational_data(values: &[(u32, u32)]) -> Vec<u8> {
         let mut data = Vec::new();
-        for (numerator, denominator) in values {
+        for &(numerator, denominator) in values {
             data.extend_from_slice(&numerator.to_be_bytes());
             data.extend_from_slice(&denominator.to_be_bytes());
         }
 
-        (entry, data)
+        data
     }
 }
