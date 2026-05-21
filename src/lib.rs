@@ -379,17 +379,20 @@ impl PrettyInspectGroup {
 }
 
 fn classify_info_row(row: &InspectInfoRow) -> PrettyInspectGroup {
-    if matches!(
-        row.name.as_str(),
-        "File Name"
-            | "Directory"
-            | "File Size"
-            | "File Modification Date/Time"
-            | "File Access Date/Time"
-            | "File Creation Date/Time"
-            | "File Permissions"
-            | "File Type"
-            | "File Type Extension"
+    if normalized_label_matches(
+        &row.name,
+        &[
+            "filename",
+            "directory",
+            "filesize",
+            "filemodificationdate/time",
+            "fileaccessdate/time",
+            "filecreationdate/time",
+            "filepermissions",
+            "filetype",
+            "filetypeextension",
+            "mimetype",
+        ],
     ) {
         PrettyInspectGroup::File
     } else {
@@ -403,8 +406,8 @@ fn classify_exif_row(row: &InspectRow) -> PrettyInspectGroup {
     }
 
     if row.context == "Gps"
-        || starts_with_any(&row.name, &["GPS"])
-        || starts_with_any(&row.pretty_name, &["GPS"])
+        || normalized_label_starts_with(&row.name, &["gps"])
+        || normalized_label_starts_with(&row.pretty_name, &["gps"])
     {
         return PrettyInspectGroup::Gps;
     }
@@ -429,96 +432,85 @@ fn classify_exif_row(row: &InspectRow) -> PrettyInspectGroup {
 }
 
 fn is_file_label(label: &str) -> bool {
-    label != "FileSource" && label != "File Source" && label.starts_with("File")
+    let label = normalized_label(label);
+    label != "filesource" && label.starts_with("file")
 }
 
 fn is_camera_label(label: &str) -> bool {
-    matches!(
+    normalized_label_matches(
         label,
-        "Make"
-            | "Model"
-            | "FileSource"
-            | "File Source"
-            | "FocalLength"
-            | "Focal Length"
-            | "FocalLengthIn35mmFilm"
-            | "Focal Length In 35mm Film"
-            | "MaxApertureValue"
-            | "Max Aperture Value"
-            | "LensMake"
-            | "Lens Make"
-            | "LensModel"
-            | "Lens Model"
-    ) || starts_with_any(label, &["Camera", "Lens"])
+        &[
+            "make",
+            "model",
+            "filesource",
+            "focallength",
+            "focallengthin35mmfilm",
+            "maxaperturevalue",
+            "lensmake",
+            "lensmodel",
+        ],
+    ) || normalized_label_starts_with(label, &["camera", "lens"])
 }
 
 fn is_film_label(label: &str) -> bool {
-    matches!(
+    normalized_label_matches(
         label,
-        "FilmRoll"
-            | "Film Roll"
-            | "FilmMaker"
-            | "Film Maker"
-            | "FilmName"
-            | "Film Name"
-            | "FilmFormat"
-            | "Film Format"
-            | "FilmColor"
-            | "Film Color"
-            | "FilmNegative"
-            | "Film Negative"
-            | "FilmDevelopProcess"
-            | "Film Develop Process"
-            | "FilmDeveloper"
-            | "Film Developer"
-            | "FilmProcessLab"
-            | "Film Process Lab"
-            | "FilmProcessDate"
-            | "Film Process Date"
-            | "FilmScanner"
-            | "Film Scanner"
-    ) || starts_with_any(label, &["AnalogueData", "Analogue Data"])
+        &[
+            "filmroll",
+            "filmmaker",
+            "filmname",
+            "filmformat",
+            "filmcolor",
+            "filmnegative",
+            "filmdevelopprocess",
+            "filmdeveloper",
+            "filmprocesslab",
+            "filmprocessdate",
+            "filmscanner",
+        ],
+    ) || normalized_label_starts_with(label, &["analoguedata"])
 }
 
 fn is_exposure_label(label: &str) -> bool {
-    matches!(
+    normalized_label_matches(
         label,
-        "ExposureTime"
-            | "Exposure Time"
-            | "FNumber"
-            | "F Number"
-            | "ISOSpeedRatings"
-            | "ISO Speed Ratings"
-            | "ISO"
-            | "ISOSpeed"
-            | "ISO Speed"
-            | "ShutterSpeedValue"
-            | "Shutter Speed Value"
-            | "ApertureValue"
-            | "Aperture Value"
-            | "BrightnessValue"
-            | "Brightness Value"
-            | "ExposureBiasValue"
-            | "Exposure Bias Value"
-            | "ExposureMode"
-            | "Exposure Mode"
-            | "ExposureProgram"
-            | "Exposure Program"
-            | "MaxApertureValue"
-            | "Max Aperture Value"
-            | "MeteringMode"
-            | "Metering Mode"
-            | "PhotographicSensitivity"
-            | "Photographic Sensitivity"
-            | "SensitivityType"
-            | "Sensitivity Type"
-            | "LightSource"
-            | "Light Source"
-            | "Flash"
+        &[
+            "exposuretime",
+            "fnumber",
+            "isospeedratings",
+            "iso",
+            "isospeed",
+            "shutterspeedvalue",
+            "aperturevalue",
+            "brightnessvalue",
+            "exposurebiasvalue",
+            "exposuremode",
+            "exposureprogram",
+            "maxaperturevalue",
+            "meteringmode",
+            "photographicsensitivity",
+            "sensitivitytype",
+            "lightsource",
+            "flash",
+        ],
     )
 }
 
-fn starts_with_any(label: &str, prefixes: &[&str]) -> bool {
+fn normalized_label(label: &str) -> String {
+    label
+        .chars()
+        .filter(|char| !char.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn normalized_label_matches(label: &str, tags: &[&str]) -> bool {
+    let label = normalized_label(label);
+    tags.contains(&label.as_str())
+}
+
+fn normalized_label_starts_with(label: &str, prefixes: &[&str]) -> bool {
+    let label = normalized_label(label);
     prefixes.iter().any(|prefix| label.starts_with(prefix))
 }
 
@@ -1062,10 +1054,14 @@ mod tests {
     fn classifies_extra_file_info_rows_as_file() {
         for name in [
             "File Access Date/Time",
+            "fileaccessdate/time",
             "File Creation Date/Time",
             "File Permissions",
             "File Type",
             "File Type Extension",
+            "file type extension",
+            "MIME Type",
+            "MIMEType",
         ] {
             let row = InspectInfoRow::new(name, "value");
 
@@ -1075,22 +1071,42 @@ mod tests {
 
     #[test]
     fn classifies_extra_camera_and_exposure_labels() {
-        for label in ["FocalLengthIn35mmFilm", "Focal Length In 35mm Film"] {
+        for label in [
+            "FocalLengthIn35mmFilm",
+            "Focal Length In 35mm Film",
+            "focal length in 35mm film",
+            "focallengthin35mmfilm",
+        ] {
             assert!(is_camera_label(label));
         }
 
         for label in [
             "ExposureMode",
             "Exposure Mode",
+            "exposure mode",
             "ExposureProgram",
             "Exposure Program",
+            "exposureprogram",
             "PhotographicSensitivity",
             "Photographic Sensitivity",
             "SensitivityType",
             "Sensitivity Type",
+            "sensitivity type",
         ] {
             assert!(is_exposure_label(label));
         }
+    }
+
+    #[test]
+    fn normalized_label_classifiers_ignore_spacing_and_case() {
+        assert!(is_file_label("file type"));
+        assert!(!is_file_label("File Source"));
+        assert!(is_camera_label("lens model"));
+        assert!(is_camera_label("CAMERA SERIAL NUMBER"));
+        assert!(is_film_label("Analogue Data Film Name"));
+        assert!(is_film_label("analoguedatafilmname"));
+        assert!(is_exposure_label("shutter speed value"));
+        assert!(normalized_label_starts_with("G P S Latitude", &["gps"]));
     }
 
     #[test]
