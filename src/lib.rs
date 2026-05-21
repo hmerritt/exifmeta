@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
-use exif::{Exif, Field, Reader, Tag, Value};
+use exif::{Error as ExifError, Exif, Field, Reader, Tag, Value};
 
 pub mod cli;
 pub mod version;
@@ -44,10 +44,11 @@ fn read_metadata(image: &Path) -> Result<InspectMetadata, String> {
     let exif = Reader::new()
         .continue_on_error(true)
         .read_from_container(&mut reader)
-        .or_else(|error| {
-            error.distill_partial_result(|errors| {
+        .or_else(|error| match error {
+            ExifError::NotFound(_) => Ok(empty_exif()),
+            error => error.distill_partial_result(|errors| {
                 warnings.extend(errors.into_iter().map(|error| error.to_string()));
-            })
+            }),
         })
         .map_err(|error| {
             format!(
@@ -63,6 +64,14 @@ fn read_metadata(image: &Path) -> Result<InspectMetadata, String> {
         warnings,
         file_info,
     })
+}
+
+fn empty_exif() -> Exif {
+    Reader::new()
+        .read_raw(vec![
+            0x4d, 0x4d, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ])
+        .expect("embedded empty EXIF should parse")
 }
 
 struct InspectMetadata {
@@ -181,8 +190,7 @@ fn format_inspect_output(
         .collect::<Vec<_>>();
 
     if rows.is_empty() {
-        append_info_rows(&mut output, &metadata.file_info.rows, None);
-        output.push_str("No EXIF metadata found.");
+        output.push_str("<No EXIF metadata found>");
     } else {
         sort_inspect_rows(&mut rows);
 
@@ -191,7 +199,6 @@ fn format_inspect_output(
                 append_pretty_inspect_rows(&mut output, &metadata.file_info.rows, &rows)
             }
             InspectFormat::Raw => {
-                append_info_rows(&mut output, &metadata.file_info.rows, None);
                 append_raw_inspect_rows(&mut output, &rows);
             }
         }
@@ -678,7 +685,7 @@ mod tests {
     use exif::{Context, Tag};
 
     #[test]
-    fn formats_empty_inspect_output() {
+    fn formats_empty_pretty_inspect_output() {
         assert_eq!(
             format_inspect_output(
                 Path::new("image.tif"),
@@ -689,7 +696,23 @@ mod tests {
                 },
                 InspectFormat::Pretty,
             ),
-            "No EXIF metadata found."
+            "<No EXIF metadata found>"
+        );
+    }
+
+    #[test]
+    fn formats_empty_raw_inspect_output() {
+        assert_eq!(
+            format_inspect_output(
+                Path::new("image.tif"),
+                &InspectMetadata {
+                    exif: parse_raw_exif(&[]),
+                    warnings: Vec::new(),
+                    file_info: test_file_info(),
+                },
+                InspectFormat::Raw,
+            ),
+            "<No EXIF metadata found>"
         );
     }
 
@@ -710,13 +733,12 @@ mod tests {
         assert!(!output.contains("KNOWN"));
         assert!(!output.contains("UNKNOWN"));
         assert!(output.contains("IFD"));
-        assert!(output.contains("File Name  image.tif"));
+        assert!(!output.contains("File Name"));
         assert!(output.contains("0x010F"));
         assert!(output.contains("0x0110"));
         assert!(output.contains("0xFDE8"));
         assert!(output.contains("Warnings:"));
         assert!(output.contains("warning: ignored malformed trailing field"));
-        assert!(output.find("File Name").unwrap() < output.find("IFD").unwrap());
         assert!(output.find("0x0110").unwrap() < output.find("0xFDE8").unwrap());
     }
 
@@ -895,6 +917,25 @@ mod tests {
         assert!(output.contains("GPS Latitude"));
         assert!(output.contains("[GPSLatitudeRef missing]"));
         assert!(output.contains("(10.5)"));
+    }
+
+    #[test]
+    fn reads_jpeg_without_exif_as_empty_metadata() {
+        let path = temporary_test_path("no-exif.jpg");
+        std::fs::write(&path, [0xff, 0xd8, 0xff, 0xd9]).expect("test JPEG should be written");
+
+        let metadata = read_metadata(&path).expect("missing EXIF should not fail inspect");
+
+        assert_eq!(
+            format_inspect_output(&path, &metadata, InspectFormat::Pretty),
+            "<No EXIF metadata found>"
+        );
+        assert_eq!(
+            format_inspect_output(&path, &metadata, InspectFormat::Raw),
+            "<No EXIF metadata found>"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
