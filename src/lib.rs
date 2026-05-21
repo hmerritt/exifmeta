@@ -297,7 +297,9 @@ fn append_pretty_inspect_rows(
             .max()
             .unwrap_or(0);
         for row in group_rows {
-            output.push_str(&format!("{:<name_width$}  {}\n", row.label, row.value));
+            output.push_str(&row.styled_label());
+            output.push_str(&" ".repeat(name_width - row.label.len()));
+            output.push_str(&format!("  {}\n", row.value));
         }
     }
 }
@@ -316,6 +318,7 @@ fn pretty_inspect_rows(info_rows: &[InspectInfoRow], rows: &[InspectRow]) -> Vec
         .map(|row| PrettyInspectRow {
             group: classify_info_row(row),
             label: row.name.clone(),
+            label_color: None,
             value: row.value.clone(),
         })
         .collect::<Vec<_>>();
@@ -332,6 +335,7 @@ fn pretty_inspect_rows(info_rows: &[InspectInfoRow], rows: &[InspectRow]) -> Vec
         pretty_rows.push(PrettyInspectRow {
             group: classify_exif_row(row),
             label: row.pretty_name.clone(),
+            label_color: None,
             value,
         });
     }
@@ -354,11 +358,12 @@ fn append_nearest_location_rows(
                 pretty_rows.push(PrettyInspectRow {
                     group: PrettyInspectGroup::Gps,
                     label: format!("Nearest Location {}", index + 1),
+                    label_color: Some(PrettyLabelColor::Green),
                     value: format!(
-                        "{}, {} ({})",
+                        "({}) {}, {}",
+                        format_distance(location.distance_km),
                         location.name,
-                        location.country_code,
-                        format_distance(location.distance_km)
+                        location.country_code
                     ),
                 });
             }
@@ -384,7 +389,22 @@ fn gps_coordinates(exif: &Exif) -> Option<(f64, f64)> {
 struct PrettyInspectRow {
     group: PrettyInspectGroup,
     label: String,
+    label_color: Option<PrettyLabelColor>,
     value: String,
+}
+
+#[derive(Clone, Copy)]
+enum PrettyLabelColor {
+    Green,
+}
+
+impl PrettyInspectRow {
+    fn styled_label(&self) -> String {
+        match self.label_color {
+            Some(PrettyLabelColor::Green) => self.label.green().to_string(),
+            None => self.label.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1508,16 +1528,19 @@ mod tests {
 
     #[test]
     fn pretty_inspect_output_appends_nearest_locations() {
+        colored::control::set_override(true);
         let metadata = test_gps_metadata();
 
         let output =
             format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Pretty);
+        colored::control::set_override(false);
         let plain_output = strip_ansi_codes(&output);
 
         assert!(plain_output.contains("GPS\n---\n"));
         assert_eq!(plain_output.matches("Nearest Location").count(), 5);
-        assert!(plain_output.contains("Nearest Location 1  Dunchurch, GB (1.9 km)"));
-        assert!(plain_output.contains("Nearest Location 2  Long Lawford, GB (3.2 km)"));
+        assert!(plain_output.contains("Nearest Location 1  (1.9 km) Dunchurch, GB"));
+        assert!(plain_output.contains("Nearest Location 2  (3.2 km) Long Lawford, GB"));
+        assert!(output.contains("\u{1b}[32mNearest Location 1\u{1b}[0m"));
     }
 
     #[test]
