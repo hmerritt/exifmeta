@@ -1,13 +1,13 @@
 use std::fs::File;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use exif::{Exif, Field, Reader, Tag, Value};
 
 pub mod cli;
 pub mod version;
 
-pub use cli::{Cli, Command, RunArgs};
+pub use cli::{Cli, Command, InspectArgs, InspectFormat, RunArgs};
 
 pub fn run(cli: Cli) -> Result<(), String> {
     version::print_title();
@@ -16,18 +16,19 @@ pub fn run(cli: Cli) -> Result<(), String> {
         Command::Run(args) => run_command(cli.dry_run, args),
         Command::Init => stub_command(cli.dry_run, "init"),
         Command::Validate => stub_command(cli.dry_run, "validate"),
-        Command::Inspect { image } => inspect_command(image),
+        Command::Inspect(args) => inspect_command(args),
         Command::Interactive => stub_command(cli.dry_run, "interactive"),
         Command::Strip => stub_command(cli.dry_run, "strip"),
     }
 }
 
-fn inspect_command(image: PathBuf) -> Result<(), String> {
+fn inspect_command(args: InspectArgs) -> Result<(), String> {
+    let image = args.image;
     validate_image_path(&image)?;
 
     let metadata = read_metadata(&image)?;
 
-    println!("{}", format_inspect_output(&image, &metadata));
+    println!("{}", format_inspect_output(&image, &metadata, args.format));
 
     Ok(())
 }
@@ -73,7 +74,11 @@ fn validate_image_path(image: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn format_inspect_output(image: &Path, metadata: &InspectMetadata) -> String {
+fn format_inspect_output(
+    image: &Path,
+    metadata: &InspectMetadata,
+    format: InspectFormat,
+) -> String {
     let mut output = format!("EXIF metadata for {}\n", image.display());
     let mut rows = metadata
         .exif
@@ -84,24 +89,11 @@ fn format_inspect_output(image: &Path, metadata: &InspectMetadata) -> String {
     if rows.is_empty() {
         output.push_str("No EXIF metadata found.");
     } else {
-        rows.sort_by(|left, right| {
-            left.is_unknown
-                .cmp(&right.is_unknown)
-                .then(left.ifd.cmp(&right.ifd))
-                .then(left.context.cmp(&right.context))
-                .then(left.tag_id.cmp(&right.tag_id))
-                .then(left.name.cmp(&right.name))
-        });
+        sort_inspect_rows(&mut rows);
 
-        let status_width = rows.iter().map(|row| row.status.len()).max().unwrap_or(0);
-        let context_width = rows.iter().map(|row| row.context.len()).max().unwrap_or(0);
-        let name_width = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
-
-        for row in rows {
-            output.push_str(&format!(
-                "{:<status_width$}  IFD {}  {:<context_width$}  0x{:04X}  {:<name_width$}  {}\n",
-                row.status, row.ifd, row.context, row.tag_id, row.name, row.value
-            ));
+        match format {
+            InspectFormat::Pretty => append_pretty_inspect_rows(&mut output, &rows),
+            InspectFormat::Raw => append_raw_inspect_rows(&mut output, &rows),
         }
 
         output = output.trim_end().to_string();
@@ -118,6 +110,45 @@ fn format_inspect_output(image: &Path, metadata: &InspectMetadata) -> String {
     output
 }
 
+fn sort_inspect_rows(rows: &mut [InspectRow]) {
+    rows.sort_by(|left, right| {
+        left.is_unknown
+            .cmp(&right.is_unknown)
+            .then(left.ifd.cmp(&right.ifd))
+            .then(left.context.cmp(&right.context))
+            .then(left.tag_id.cmp(&right.tag_id))
+            .then(left.name.cmp(&right.name))
+    });
+}
+
+fn append_raw_inspect_rows(output: &mut String, rows: &[InspectRow]) {
+    let status_width = rows.iter().map(|row| row.status.len()).max().unwrap_or(0);
+    let context_width = rows.iter().map(|row| row.context.len()).max().unwrap_or(0);
+    let name_width = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
+
+    for row in rows {
+        output.push_str(&format!(
+            "{:<status_width$}  IFD {}  {:<context_width$}  0x{:04X}  {:<name_width$}  {}\n",
+            row.status, row.ifd, row.context, row.tag_id, row.name, row.value
+        ));
+    }
+}
+
+fn append_pretty_inspect_rows(output: &mut String, rows: &[InspectRow]) {
+    let name_width = rows
+        .iter()
+        .map(|row| row.pretty_name.len())
+        .max()
+        .unwrap_or(0);
+
+    for row in rows {
+        output.push_str(&format!(
+            "{:<name_width$}  {}\n",
+            row.pretty_name, row.value
+        ));
+    }
+}
+
 struct InspectRow {
     status: &'static str,
     is_unknown: bool,
@@ -125,6 +156,7 @@ struct InspectRow {
     context: String,
     tag_id: u16,
     name: String,
+    pretty_name: String,
     value: String,
 }
 
@@ -140,6 +172,11 @@ impl InspectRow {
             )
         } else {
             field.tag.to_string()
+        };
+        let pretty_name = if is_unknown {
+            format!("Unknown {} Tag", format!("{:?}", field.tag.context()))
+        } else {
+            title_case_tag_name(&name)
         };
         let mut value = if is_unknown {
             format!("{:?}", field.value)
@@ -160,9 +197,65 @@ impl InspectRow {
             context: format!("{:?}", field.tag.context()),
             tag_id: field.tag.number(),
             name,
+            pretty_name,
             value,
         }
     }
+}
+
+fn title_case_tag_name(name: &str) -> String {
+    let spaced = decamelcase_tag_name(name);
+
+    spaced
+        .split_whitespace()
+        .map(title_case_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn decamelcase_tag_name(name: &str) -> String {
+    let mut output = String::new();
+    let mut chars = name.chars().peekable();
+    let mut previous: Option<char> = None;
+
+    while let Some(current) = chars.next() {
+        let next = chars.peek().copied();
+        let needs_space = previous.is_some_and(|previous| {
+            (previous.is_ascii_lowercase() && current.is_ascii_uppercase())
+                || (previous.is_ascii_alphabetic() && current.is_ascii_digit())
+                || (previous.is_ascii_uppercase()
+                    && current.is_ascii_uppercase()
+                    && next.is_some_and(|next| next.is_ascii_lowercase()))
+        });
+
+        if needs_space {
+            output.push(' ');
+        }
+
+        output.push(current);
+        previous = Some(current);
+    }
+
+    output
+}
+
+fn title_case_word(word: &str) -> String {
+    if word
+        .chars()
+        .all(|char| char.is_ascii_uppercase() || char.is_ascii_digit())
+    {
+        return word.to_string();
+    }
+
+    let mut chars = word.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+
+    let mut output = String::new();
+    output.push(first.to_ascii_uppercase());
+    output.extend(chars.map(|char| char.to_ascii_lowercase()));
+    output
 }
 
 fn decimal_gps_coordinate(field: &Field, exif: &Exif) -> Option<f64> {
@@ -271,13 +364,14 @@ mod tests {
                     exif: parse_raw_exif(&[]),
                     warnings: Vec::new(),
                 },
+                InspectFormat::Pretty,
             ),
             "EXIF metadata for image.tif\nNo EXIF metadata found."
         );
     }
 
     #[test]
-    fn formats_inspect_output_with_unknown_rows_at_the_bottom() {
+    fn formats_raw_inspect_output_with_unknown_rows_at_the_bottom() {
         let metadata = InspectMetadata {
             exif: parse_raw_exif(&[
                 tiff_ascii_entry(0x010f, b"Z\0"),
@@ -287,7 +381,7 @@ mod tests {
             warnings: vec!["ignored malformed trailing field".to_string()],
         };
 
-        let output = format_inspect_output(Path::new("image.tif"), &metadata);
+        let output = format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Raw);
 
         assert!(output.contains("KNOWN"));
         assert!(output.contains("UNKNOWN"));
@@ -297,6 +391,47 @@ mod tests {
         assert!(output.contains("Warnings:"));
         assert!(output.contains("warning: ignored malformed trailing field"));
         assert!(output.find("0x0110").unwrap() < output.find("0xFDE8").unwrap());
+    }
+
+    #[test]
+    fn formats_pretty_inspect_output_without_raw_columns() {
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif(&[
+                tiff_ascii_entry(0x010f, b"Z\0"),
+                tiff_short_entry(0xfde8, 42),
+                tiff_ascii_entry(0x0110, b"E\0"),
+            ]),
+            warnings: vec!["ignored malformed trailing field".to_string()],
+        };
+
+        let output =
+            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+
+        assert!(output.contains("Make              \"Z\""));
+        assert!(output.contains("Model             \"E\""));
+        assert!(output.contains("Unknown Tiff Tag  Short([42])"));
+        assert!(output.contains("Warnings:"));
+        assert!(output.contains("warning: ignored malformed trailing field"));
+        assert!(!output.contains("KNOWN"));
+        assert!(!output.contains("UNKNOWN"));
+        assert!(!output.contains("IFD"));
+        assert!(!output.contains("Tiff  "));
+        assert!(!output.contains("0x010F"));
+        assert!(!output.contains("0x0110"));
+        assert!(!output.contains("0xFDE8"));
+    }
+
+    #[test]
+    fn de_camelcases_tag_names_for_pretty_output() {
+        assert_eq!(title_case_tag_name("GPSLatitude"), "GPS Latitude");
+        assert_eq!(
+            title_case_tag_name("DateTimeOriginal"),
+            "Date Time Original"
+        );
+        assert_eq!(
+            title_case_tag_name("FocalLengthIn35mmFilm"),
+            "Focal Length In 35mm Film"
+        );
     }
 
     #[test]
@@ -328,11 +463,12 @@ mod tests {
             warnings: Vec::new(),
         };
 
-        let output = format_inspect_output(Path::new("image.jpg"), &metadata);
+        let output =
+            format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Pretty);
 
-        assert!(output.contains("GPSLatitude"));
+        assert!(output.contains("GPS Latitude"));
         assert!(output.contains("(52.352832)"));
-        assert!(output.contains("GPSLongitude"));
+        assert!(output.contains("GPS Longitude"));
         assert!(output.contains("(-1.304089)"));
     }
 
@@ -345,9 +481,10 @@ mod tests {
             warnings: Vec::new(),
         };
 
-        let output = format_inspect_output(Path::new("image.jpg"), &metadata);
+        let output =
+            format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Pretty);
 
-        assert!(output.contains("GPSLatitude"));
+        assert!(output.contains("GPS Latitude"));
         assert!(output.contains("[GPSLatitudeRef missing]"));
         assert!(output.contains("(10.5)"));
     }

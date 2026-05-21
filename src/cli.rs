@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
 #[command(name = "exifmeta")]
@@ -26,10 +26,7 @@ pub enum Command {
     Validate,
 
     #[command(about = "Read and pretty-print the current EXIF data of an image file")]
-    Inspect {
-        #[arg(value_name = "IMAGE")]
-        image: PathBuf,
-    },
+    Inspect(InspectArgs),
 
     #[command(about = "Interactively read and set EXIF data for an image")]
     Interactive,
@@ -59,6 +56,26 @@ pub struct RunArgs {
     pub recursive: bool,
 }
 
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct InspectArgs {
+    #[arg(value_name = "IMAGE")]
+    pub image: PathBuf,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = InspectFormat::Pretty,
+        help = "Choose the inspect output format"
+    )]
+    pub format: InspectFormat,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum InspectFormat {
+    Pretty,
+    Raw,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +90,43 @@ mod tests {
         }
 
         assert!(Cli::try_parse_from(["exifmeta", "inspect", "image.jpg"]).is_ok());
+    }
+
+    #[test]
+    fn parses_inspect_default_format() {
+        let cli = Cli::try_parse_from(["exifmeta", "inspect", "image.jpg"])
+            .expect("inspect command should parse");
+
+        let Command::Inspect(args) = cli.command else {
+            panic!("expected inspect command");
+        };
+
+        assert_eq!(args.image, PathBuf::from("image.jpg"));
+        assert_eq!(args.format, InspectFormat::Pretty);
+    }
+
+    #[test]
+    fn parses_inspect_raw_format() {
+        let cli = Cli::try_parse_from(["exifmeta", "inspect", "image.jpg", "--format", "raw"])
+            .expect("inspect raw format should parse");
+
+        let Command::Inspect(args) = cli.command else {
+            panic!("expected inspect command");
+        };
+
+        assert_eq!(args.format, InspectFormat::Raw);
+    }
+
+    #[test]
+    fn rejects_invalid_inspect_format() {
+        assert!(
+            Cli::try_parse_from(["exifmeta", "inspect", "image.jpg", "--format", "json"]).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_run_flags_on_inspect() {
+        assert!(Cli::try_parse_from(["exifmeta", "inspect", "image.jpg", "--recursive"]).is_err());
     }
 
     #[test]
