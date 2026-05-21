@@ -35,7 +35,7 @@ A simple program to read a standardised `metadata.yaml` file and write the data 
 ## `metadata.yaml` file
 
 - [EXIF Tags reference](https://exiftool.org/TagNames/EXIF.html)
-- [Locations reference](https://download.geonames.org/export/dump/)
+- [Locations reference](https://www.geonames.org)
 
 See example files in [`./examples`](./examples/metadata.yml) directory. `examples/metadata.yml`:
 
@@ -145,6 +145,26 @@ Development and testing can be Windows, Linux, and macOS.
 ```sh
 rustup toolchain install stable
 ```
+
+### GeoNames database generation
+
+`tools/geonames_to_sqlite.py` converts the GeoNames `cities1000.txt` dump into the compact SQLite database used for location lookups.
+
+Download `cities1000.zip` from the [GeoNames export dump](https://download.geonames.org/export/dump/), extract `cities1000.txt`, and place it in the repository root. The script only uses the Python standard library.
+
+```sh
+python tools/geonames_to_sqlite.py
+```
+
+By default, the script reads `cities1000.txt` and writes `assets/geonames/cities1000.sqlite`. To use different paths:
+
+```sh
+python tools/geonames_to_sqlite.py --input path/to/cities1000.txt --output assets/geonames/cities1000.sqlite
+```
+
+Each run deletes and recreates the output database. The generated database contains a `locations` table with `geoname_id`, `name`, `country_code`, `latitude`, and `longitude`, plus an index on case-insensitive `name` and `country_code`.
+
+During import, the script validates that each GeoNames row has 19 tab-separated fields and parses the ID and coordinates as numeric values. When it finishes, it prints the number of rows written and the final SQLite file size.
 
 ### Implementation
 

@@ -1,1 +1,6 @@
+# Build
 /target/
+
+# Assets
+cities1000.sqlite
+cities1000.txt
