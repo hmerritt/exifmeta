@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
+use colored::Colorize;
 use exif::{Error as ExifError, Exif, Field, Reader, Tag, Value};
 
 pub mod cli;
@@ -190,7 +191,7 @@ fn format_inspect_output(
         .collect::<Vec<_>>();
 
     if rows.is_empty() {
-        output.push_str("<No EXIF metadata found>");
+        output.push_str(&format_empty_exif_message(format));
     } else {
         sort_inspect_rows(&mut rows);
 
@@ -215,6 +216,13 @@ fn format_inspect_output(
     }
 
     output
+}
+
+fn format_empty_exif_message(format: InspectFormat) -> String {
+    match format {
+        InspectFormat::Pretty => "<No EXIF metadata found>".yellow().to_string(),
+        InspectFormat::Raw => "<No EXIF metadata found>".to_string(),
+    }
 }
 
 fn append_info_rows(output: &mut String, rows: &[InspectInfoRow], width: Option<usize>) {
@@ -686,6 +694,8 @@ mod tests {
 
     #[test]
     fn formats_empty_pretty_inspect_output() {
+        colored::control::set_override(true);
+
         assert_eq!(
             format_inspect_output(
                 Path::new("image.tif"),
@@ -696,7 +706,7 @@ mod tests {
                 },
                 InspectFormat::Pretty,
             ),
-            "<No EXIF metadata found>"
+            "\u{1b}[33m<No EXIF metadata found>\u{1b}[0m"
         );
     }
 
@@ -921,6 +931,8 @@ mod tests {
 
     #[test]
     fn reads_jpeg_without_exif_as_empty_metadata() {
+        colored::control::set_override(true);
+
         let path = temporary_test_path("no-exif.jpg");
         std::fs::write(&path, [0xff, 0xd8, 0xff, 0xd9]).expect("test JPEG should be written");
 
@@ -928,7 +940,7 @@ mod tests {
 
         assert_eq!(
             format_inspect_output(&path, &metadata, InspectFormat::Pretty),
-            "<No EXIF metadata found>"
+            "\u{1b}[33m<No EXIF metadata found>\u{1b}[0m"
         );
         assert_eq!(
             format_inspect_output(&path, &metadata, InspectFormat::Raw),

@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
+colored = "3"
 kamadak-exif = "0.6.1"
 
 [profile.release]
