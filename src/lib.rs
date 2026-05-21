@@ -235,14 +235,13 @@ fn sort_inspect_rows(rows: &mut [InspectRow]) {
 }
 
 fn append_raw_inspect_rows(output: &mut String, rows: &[InspectRow]) {
-    let status_width = rows.iter().map(|row| row.status.len()).max().unwrap_or(0);
     let context_width = rows.iter().map(|row| row.context.len()).max().unwrap_or(0);
     let name_width = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
 
     for row in rows {
         output.push_str(&format!(
-            "{:<status_width$}  IFD {}  {:<context_width$}  0x{:04X}  {:<name_width$}  {}\n",
-            row.status, row.ifd, row.context, row.tag_id, row.name, row.value
+            "IFD {}  {:<context_width$}  0x{:04X}  {:<name_width$}  {}\n",
+            row.ifd, row.context, row.tag_id, row.name, row.value
         ));
     }
 }
@@ -445,7 +444,6 @@ fn format_exif_byte_order(exif: &Exif) -> &'static str {
 }
 
 struct InspectRow {
-    status: &'static str,
     is_unknown: bool,
     ifd: usize,
     context: String,
@@ -486,7 +484,6 @@ impl InspectRow {
         }
 
         Self {
-            status: if is_unknown { "UNKNOWN" } else { "KNOWN" },
             is_unknown,
             ifd: usize::from(field.ifd_num.index()),
             context: format!("{:?}", field.tag.context()),
@@ -680,15 +677,16 @@ mod tests {
 
         let output = format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Raw);
 
-        assert!(output.contains("KNOWN"));
-        assert!(output.contains("UNKNOWN"));
+        assert!(!output.contains("KNOWN"));
+        assert!(!output.contains("UNKNOWN"));
+        assert!(output.contains("IFD"));
         assert!(output.contains("File Name  image.tif"));
         assert!(output.contains("0x010F"));
         assert!(output.contains("0x0110"));
         assert!(output.contains("0xFDE8"));
         assert!(output.contains("Warnings:"));
         assert!(output.contains("warning: ignored malformed trailing field"));
-        assert!(output.find("File Name").unwrap() < output.find("KNOWN").unwrap());
+        assert!(output.find("File Name").unwrap() < output.find("IFD").unwrap());
         assert!(output.find("0x0110").unwrap() < output.find("0xFDE8").unwrap());
     }
 
