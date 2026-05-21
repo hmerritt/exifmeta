@@ -2,10 +2,17 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
+    println!("cargo:rerun-if-changed=assets/geonames/cities1000.sqlite");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-env-changed=EXIFMETA_VERSION_PRERELEASE");
     println!("cargo:rerun-if-env-changed=EXIFMETA_VERSION_METADATA");
+
+    if !std::path::Path::new("assets/geonames/cities1000.sqlite").is_file() {
+        panic!(
+            "missing assets/geonames/cities1000.sqlite; run `python tools/geonames_to_sqlite.py` to generate it"
+        );
+    }
 
     emit_env("EXIFMETA_BUILD_DATE", &build_date());
     emit_env(

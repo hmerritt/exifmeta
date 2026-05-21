@@ -10,6 +10,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 clap = { version = "4.5", features = ["derive"] }
 colored = "3"
 kamadak-exif = "0.6.1"
+rusqlite = { version = "0.32.1", features = ["bundled", "serialize"] }
 
 [profile.release]
 strip = true    # Automatically strip symbols from the binary.

@@ -2,16 +2,22 @@ use std::collections::HashSet;
 use std::fs::{self, File, Metadata};
 use std::io::{BufReader, Read};
 use std::path::Path;
+use std::ptr::NonNull;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
 use colored::Colorize;
 use exif::{Error as ExifError, Exif, Field, Reader, Tag, Value};
+use rusqlite::{Connection, DatabaseName, params};
 
 pub mod cli;
 pub mod version;
 
 pub use cli::{Cli, Command, InspectArgs, InspectFormat, RunArgs};
+
+const GEONAMES_DATABASE: &[u8] = include_bytes!("../assets/geonames/cities1000.sqlite");
+const NEAREST_LOCATION_LIMIT: usize = 5;
+const EARTH_RADIUS_KM: f64 = 6_371.0088;
 
 pub fn run(cli: Cli) -> Result<(), String> {
     version::print_title();
@@ -181,6 +187,7 @@ fn format_inspect_output(
     format: InspectFormat,
 ) -> String {
     let mut output = String::new();
+    let mut warnings = metadata.warnings.clone();
     let mut rows = metadata
         .exif
         .fields()
@@ -193,9 +200,13 @@ fn format_inspect_output(
         sort_inspect_rows(&mut rows);
 
         match format {
-            InspectFormat::Pretty => {
-                append_pretty_inspect_rows(&mut output, &metadata.file_info.rows, &rows)
-            }
+            InspectFormat::Pretty => append_pretty_inspect_rows(
+                &mut output,
+                &metadata.file_info.rows,
+                &rows,
+                &metadata.exif,
+                &mut warnings,
+            ),
             InspectFormat::Raw => {
                 append_raw_inspect_rows(&mut output, &rows);
             }
@@ -204,9 +215,9 @@ fn format_inspect_output(
         output = output.trim_end().to_string();
     }
 
-    if !metadata.warnings.is_empty() {
+    if !warnings.is_empty() {
         output.push_str("\n\nWarnings:\n");
-        for warning in &metadata.warnings {
+        for warning in &warnings {
             output.push_str(&format!("warning: {warning}\n"));
         }
         output = output.trim_end().to_string();
@@ -249,8 +260,11 @@ fn append_pretty_inspect_rows(
     output: &mut String,
     info_rows: &[InspectInfoRow],
     rows: &[InspectRow],
+    exif: &Exif,
+    warnings: &mut Vec<String>,
 ) {
     let mut pretty_rows = pretty_inspect_rows(info_rows, rows);
+    append_nearest_location_rows(&mut pretty_rows, exif, warnings);
     pretty_rows.sort_by(|left, right| {
         left.group
             .output_order()
@@ -323,6 +337,48 @@ fn pretty_inspect_rows(info_rows: &[InspectInfoRow], rows: &[InspectRow]) -> Vec
     }
 
     pretty_rows
+}
+
+fn append_nearest_location_rows(
+    pretty_rows: &mut Vec<PrettyInspectRow>,
+    exif: &Exif,
+    warnings: &mut Vec<String>,
+) {
+    let Some((latitude, longitude)) = gps_coordinates(exif) else {
+        return;
+    };
+
+    match nearest_locations(latitude, longitude, NEAREST_LOCATION_LIMIT) {
+        Ok(locations) => {
+            for (index, location) in locations.into_iter().enumerate() {
+                pretty_rows.push(PrettyInspectRow {
+                    group: PrettyInspectGroup::Gps,
+                    label: format!("Nearest Location {}", index + 1),
+                    value: format!(
+                        "{}, {} ({})",
+                        location.name,
+                        location.country_code,
+                        format_distance(location.distance_km)
+                    ),
+                });
+            }
+        }
+        Err(error) => warnings.push(format!("failed to query nearest locations: {error}")),
+    }
+}
+
+fn gps_coordinates(exif: &Exif) -> Option<(f64, f64)> {
+    let latitude_field = exif.fields().find(|field| field.tag == Tag::GPSLatitude)?;
+    let longitude_field = exif.fields().find(|field| field.tag == Tag::GPSLongitude)?;
+
+    let latitude = decimal_gps_coordinate(latitude_field, exif)?;
+    let longitude = decimal_gps_coordinate(longitude_field, exif)?;
+
+    if latitude.is_finite() && longitude.is_finite() {
+        Some((latitude, longitude))
+    } else {
+        None
+    }
 }
 
 struct PrettyInspectRow {
@@ -877,6 +933,184 @@ fn format_decimal_coordinate(value: f64) -> String {
         .to_string()
 }
 
+struct GeoLocation {
+    name: String,
+    country_code: String,
+    latitude: f64,
+    longitude: f64,
+    distance_km: f64,
+}
+
+fn nearest_locations(
+    latitude: f64,
+    longitude: f64,
+    limit: usize,
+) -> Result<Vec<GeoLocation>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let connection = open_embedded_geonames_database()?;
+    let mut radius_km = 25.0;
+    let mut candidates = Vec::new();
+
+    while radius_km <= 20_000.0 {
+        candidates = candidate_locations(&connection, latitude, longitude, radius_km)?;
+
+        for location in &mut candidates {
+            location.distance_km =
+                haversine_distance_km(latitude, longitude, location.latitude, location.longitude);
+        }
+        sort_locations_by_distance(&mut candidates);
+
+        if candidates.len() >= limit && candidates[limit - 1].distance_km <= radius_km {
+            break;
+        }
+        radius_km *= 2.0;
+    }
+
+    sort_locations_by_distance(&mut candidates);
+    candidates.truncate(limit);
+
+    Ok(candidates)
+}
+
+fn sort_locations_by_distance(locations: &mut [GeoLocation]) {
+    locations.sort_by(|left, right| {
+        left.distance_km
+            .total_cmp(&right.distance_km)
+            .then(left.country_code.cmp(&right.country_code))
+            .then(left.name.cmp(&right.name))
+    });
+}
+
+fn open_embedded_geonames_database() -> Result<Connection, String> {
+    let mut connection = Connection::open_in_memory()
+        .map_err(|error| format!("failed to open in-memory SQLite database: {error}"))?;
+    let data = sqlite_owned_data(GEONAMES_DATABASE)?;
+
+    connection
+        .deserialize(DatabaseName::Main, data, true)
+        .map_err(|error| format!("failed to load embedded GeoNames database: {error}"))?;
+
+    Ok(connection)
+}
+
+fn sqlite_owned_data(bytes: &[u8]) -> Result<rusqlite::serialize::OwnedData, String> {
+    let allocation_size = bytes
+        .len()
+        .try_into()
+        .map_err(|_| "embedded GeoNames database is too large to load".to_string())?;
+    let pointer = unsafe { rusqlite::ffi::sqlite3_malloc(allocation_size) };
+    let pointer = NonNull::new(pointer.cast::<u8>()).ok_or_else(|| {
+        "failed to allocate SQLite memory for embedded GeoNames database".to_string()
+    })?;
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.as_ptr(), bytes.len());
+        Ok(rusqlite::serialize::OwnedData::from_raw_nonnull(
+            pointer,
+            bytes.len(),
+        ))
+    }
+}
+
+fn candidate_locations(
+    connection: &Connection,
+    latitude: f64,
+    longitude: f64,
+    radius_km: f64,
+) -> Result<Vec<GeoLocation>, String> {
+    let latitude_delta = radius_km / 111.0;
+    let longitude_delta = if latitude.abs() >= 89.0 {
+        180.0
+    } else {
+        (radius_km / (111.0 * latitude.to_radians().cos().abs())).min(180.0)
+    };
+    let minimum_latitude = (latitude - latitude_delta).max(-90.0);
+    let maximum_latitude = (latitude + latitude_delta).min(90.0);
+    let minimum_longitude = normalize_longitude(longitude - longitude_delta);
+    let maximum_longitude = normalize_longitude(longitude + longitude_delta);
+    let wraps_date_line = minimum_longitude > maximum_longitude;
+
+    let sql = if wraps_date_line {
+        "
+        SELECT name, country_code, latitude, longitude
+        FROM locations
+        WHERE latitude BETWEEN ?1 AND ?2
+          AND (longitude >= ?3 OR longitude <= ?4)
+        "
+    } else {
+        "
+        SELECT name, country_code, latitude, longitude
+        FROM locations
+        WHERE latitude BETWEEN ?1 AND ?2
+          AND longitude BETWEEN ?3 AND ?4
+        "
+    };
+
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| format!("failed to prepare GeoNames query: {error}"))?;
+    let rows = statement
+        .query_map(
+            params![
+                minimum_latitude,
+                maximum_latitude,
+                minimum_longitude,
+                maximum_longitude
+            ],
+            |row| {
+                Ok(GeoLocation {
+                    name: row.get(0)?,
+                    country_code: row.get(1)?,
+                    latitude: row.get(2)?,
+                    longitude: row.get(3)?,
+                    distance_km: 0.0,
+                })
+            },
+        )
+        .map_err(|error| format!("failed to query GeoNames database: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to read GeoNames row: {error}"))
+}
+
+fn normalize_longitude(longitude: f64) -> f64 {
+    let mut normalized = longitude;
+    while normalized < -180.0 {
+        normalized += 360.0;
+    }
+    while normalized > 180.0 {
+        normalized -= 360.0;
+    }
+    normalized
+}
+
+fn haversine_distance_km(
+    latitude: f64,
+    longitude: f64,
+    other_latitude: f64,
+    other_longitude: f64,
+) -> f64 {
+    let latitude_delta = (other_latitude - latitude).to_radians();
+    let longitude_delta = (other_longitude - longitude).to_radians();
+    let latitude = latitude.to_radians();
+    let other_latitude = other_latitude.to_radians();
+    let a = (latitude_delta / 2.0).sin().powi(2)
+        + latitude.cos() * other_latitude.cos() * (longitude_delta / 2.0).sin().powi(2);
+
+    2.0 * EARTH_RADIUS_KM * a.sqrt().asin()
+}
+
+fn format_distance(distance_km: f64) -> String {
+    if distance_km < 1.0 {
+        format!("{:.0} m", distance_km * 1_000.0)
+    } else {
+        format!("{distance_km:.1} km")
+    }
+}
+
 fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
     let mut details = Vec::new();
 
@@ -1251,23 +1485,7 @@ mod tests {
 
     #[test]
     fn appends_signed_decimal_gps_coordinates() {
-        let (latitude_entry, latitude_data) =
-            tiff_rational_entry(0x0002, [(52, 1), (21, 1), (101952, 10000)], 200);
-        let (longitude_entry, longitude_data) =
-            tiff_rational_entry(0x0004, [(1, 1), (18, 1), (1471968, 100000)], 224);
-        let metadata = InspectMetadata {
-            exif: parse_raw_exif_with_gps_entries(
-                &[
-                    tiff_ascii_entry(0x0001, b"N\0"),
-                    latitude_entry,
-                    tiff_ascii_entry(0x0003, b"W\0"),
-                    longitude_entry,
-                ],
-                &[(200, latitude_data), (224, longitude_data)],
-            ),
-            warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
-        };
+        let metadata = test_gps_metadata();
 
         let output =
             format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Pretty);
@@ -1276,6 +1494,41 @@ mod tests {
         assert!(output.contains("(52.352832)"));
         assert!(output.contains("GPS Longitude"));
         assert!(output.contains("(-1.304089)"));
+    }
+
+    #[test]
+    fn extracts_signed_gps_coordinates() {
+        let metadata = test_gps_metadata();
+
+        let (latitude, longitude) =
+            gps_coordinates(&metadata.exif).expect("GPS coordinates should be extracted");
+        assert!((latitude - 52.352832).abs() < 0.000001);
+        assert!((longitude + 1.3040888).abs() < 0.000001);
+    }
+
+    #[test]
+    fn pretty_inspect_output_appends_nearest_locations() {
+        let metadata = test_gps_metadata();
+
+        let output =
+            format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Pretty);
+        let plain_output = strip_ansi_codes(&output);
+
+        assert!(plain_output.contains("GPS\n---\n"));
+        assert_eq!(plain_output.matches("Nearest Location").count(), 5);
+        assert!(plain_output.contains("Nearest Location 1  Dunchurch, GB (1.9 km)"));
+        assert!(plain_output.contains("Nearest Location 2  Long Lawford, GB (3.2 km)"));
+    }
+
+    #[test]
+    fn raw_inspect_output_omits_nearest_locations() {
+        let metadata = test_gps_metadata();
+
+        let output = format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Raw);
+
+        assert!(output.contains("GPSLatitude"));
+        assert!(!output.contains("Nearest Location"));
+        assert!(!output.contains("Dunchurch"));
     }
 
     #[test]
@@ -1294,6 +1547,13 @@ mod tests {
         assert!(output.contains("GPS Latitude"));
         assert!(output.contains("[GPSLatitudeRef missing]"));
         assert!(output.contains("(10.5)"));
+        assert!(!output.contains("Nearest Location"));
+    }
+
+    #[test]
+    fn formats_metric_distances() {
+        assert_eq!(format_distance(0.0123), "12 m");
+        assert_eq!(format_distance(1.234), "1.2 km");
     }
 
     #[test]
@@ -1333,6 +1593,27 @@ mod tests {
             validate_image_path(Path::new(".")),
             Err("image path is not a file: .".to_string())
         );
+    }
+
+    fn test_gps_metadata() -> InspectMetadata {
+        let (latitude_entry, latitude_data) =
+            tiff_rational_entry(0x0002, [(52, 1), (21, 1), (101952, 10000)], 200);
+        let (longitude_entry, longitude_data) =
+            tiff_rational_entry(0x0004, [(1, 1), (18, 1), (1471968, 100000)], 224);
+
+        InspectMetadata {
+            exif: parse_raw_exif_with_gps_entries(
+                &[
+                    tiff_ascii_entry(0x0001, b"N\0"),
+                    latitude_entry,
+                    tiff_ascii_entry(0x0003, b"W\0"),
+                    longitude_entry,
+                ],
+                &[(200, latitude_data), (224, longitude_data)],
+            ),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        }
     }
 
     fn test_file_info() -> InspectFileInfo {
