@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File, Metadata};
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -96,10 +97,6 @@ impl InspectFileInfo {
         let file_kind = detect_file_kind(image);
         let mut rows = Vec::new();
 
-        rows.push(InspectInfoRow::new(
-            "Exifmeta Version Number",
-            version::get_version().version_number(),
-        ));
         rows.push(InspectInfoRow::new("File Name", file_name(image)));
         rows.push(InspectInfoRow::new("Directory", directory_name(image)));
         rows.push(InspectInfoRow::new(
@@ -225,19 +222,6 @@ fn format_empty_exif_message(format: InspectFormat) -> String {
     }
 }
 
-fn append_info_rows(output: &mut String, rows: &[InspectInfoRow], width: Option<usize>) {
-    if rows.is_empty() {
-        return;
-    }
-
-    let name_width =
-        width.unwrap_or_else(|| rows.iter().map(|row| row.name.len()).max().unwrap_or(0));
-
-    for row in rows {
-        output.push_str(&format!("{:<name_width$}  {}\n", row.name, row.value));
-    }
-}
-
 fn sort_inspect_rows(rows: &mut [InspectRow]) {
     rows.sort_by(|left, right| {
         left.is_unknown
@@ -266,19 +250,276 @@ fn append_pretty_inspect_rows(
     info_rows: &[InspectInfoRow],
     rows: &[InspectRow],
 ) {
-    let name_width = info_rows
+    let mut pretty_rows = pretty_inspect_rows(info_rows, rows);
+    pretty_rows.sort_by(|left, right| {
+        left.group
+            .output_order()
+            .cmp(&right.group.output_order())
+            .then(left.label.cmp(&right.label))
+            .then(left.value.cmp(&right.value))
+    });
+
+    let mut first_group = true;
+    for group in PrettyInspectGroup::OUTPUT_ORDER {
+        let group_rows = pretty_rows
+            .iter()
+            .filter(|row| row.group == group)
+            .collect::<Vec<_>>();
+
+        if group_rows.is_empty() {
+            continue;
+        }
+
+        if !first_group {
+            output.push('\n');
+        }
+        first_group = false;
+
+        append_pretty_group_heading(output, group);
+
+        let name_width = group_rows
+            .iter()
+            .map(|row| row.label.len())
+            .max()
+            .unwrap_or(0);
+        for row in group_rows {
+            output.push_str(&format!("{:<name_width$}  {}\n", row.label, row.value));
+        }
+    }
+}
+
+fn append_pretty_group_heading(output: &mut String, group: PrettyInspectGroup) {
+    let title = group.title();
+    output.push_str(&title.bright_blue().to_string());
+    output.push('\n');
+    output.push_str(&"-".repeat(title.len()).bright_blue().to_string());
+    output.push('\n');
+}
+
+fn pretty_inspect_rows(info_rows: &[InspectInfoRow], rows: &[InspectRow]) -> Vec<PrettyInspectRow> {
+    let mut pretty_rows = info_rows
         .iter()
-        .map(|row| row.name.len())
-        .chain(rows.iter().map(|row| row.pretty_name.len()))
-        .max()
-        .unwrap_or(0);
+        .map(|row| PrettyInspectRow {
+            group: classify_info_row(row),
+            label: row.name.clone(),
+            value: row.value.clone(),
+        })
+        .collect::<Vec<_>>();
 
-    append_info_rows(output, info_rows, Some(name_width));
-
+    let mut seen_ifd_0_1 = HashSet::new();
     for row in rows {
         let value = pretty_inspect_value(row);
-        output.push_str(&format!("{:<name_width$}  {}\n", row.pretty_name, value));
+        if matches!(row.ifd, 0 | 1)
+            && !seen_ifd_0_1.insert((row.name.clone(), row.context.clone(), value.clone()))
+        {
+            continue;
+        }
+
+        pretty_rows.push(PrettyInspectRow {
+            group: classify_exif_row(row),
+            label: row.pretty_name.clone(),
+            value,
+        });
     }
+
+    pretty_rows
+}
+
+struct PrettyInspectRow {
+    group: PrettyInspectGroup,
+    label: String,
+    value: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrettyInspectGroup {
+    File,
+    Camera,
+    Film,
+    Exposure,
+    Gps,
+    Misc,
+    Unknown,
+}
+
+impl PrettyInspectGroup {
+    const OUTPUT_ORDER: [Self; 7] = [
+        Self::File,
+        Self::Camera,
+        Self::Film,
+        Self::Exposure,
+        Self::Gps,
+        Self::Misc,
+        Self::Unknown,
+    ];
+
+    fn output_order(self) -> usize {
+        match self {
+            Self::File => 0,
+            Self::Camera => 1,
+            Self::Film => 2,
+            Self::Exposure => 3,
+            Self::Gps => 4,
+            Self::Misc => 5,
+            Self::Unknown => 6,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::File => "File",
+            Self::Camera => "Camera",
+            Self::Film => "Film",
+            Self::Exposure => "Exposure",
+            Self::Gps => "GPS",
+            Self::Misc => "MISC",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+fn classify_info_row(row: &InspectInfoRow) -> PrettyInspectGroup {
+    if matches!(
+        row.name.as_str(),
+        "File Name"
+            | "Directory"
+            | "File Size"
+            | "File Modification Date/Time"
+            | "File Access Date/Time"
+            | "File Creation Date/Time"
+            | "File Permissions"
+            | "File Type"
+            | "File Type Extension"
+    ) {
+        PrettyInspectGroup::File
+    } else {
+        PrettyInspectGroup::Misc
+    }
+}
+
+fn classify_exif_row(row: &InspectRow) -> PrettyInspectGroup {
+    if row.is_unknown {
+        return PrettyInspectGroup::Unknown;
+    }
+
+    if row.context == "Gps"
+        || starts_with_any(&row.name, &["GPS"])
+        || starts_with_any(&row.pretty_name, &["GPS"])
+    {
+        return PrettyInspectGroup::Gps;
+    }
+
+    if is_film_label(&row.name) || is_film_label(&row.pretty_name) {
+        return PrettyInspectGroup::Film;
+    }
+
+    if is_exposure_label(&row.name) || is_exposure_label(&row.pretty_name) {
+        return PrettyInspectGroup::Exposure;
+    }
+
+    if is_camera_label(&row.name) || is_camera_label(&row.pretty_name) {
+        return PrettyInspectGroup::Camera;
+    }
+
+    if is_file_label(&row.name) || is_file_label(&row.pretty_name) {
+        return PrettyInspectGroup::File;
+    }
+
+    PrettyInspectGroup::Misc
+}
+
+fn is_file_label(label: &str) -> bool {
+    label != "FileSource" && label != "File Source" && label.starts_with("File")
+}
+
+fn is_camera_label(label: &str) -> bool {
+    matches!(
+        label,
+        "Make"
+            | "Model"
+            | "FileSource"
+            | "File Source"
+            | "FocalLength"
+            | "Focal Length"
+            | "FocalLengthIn35mmFilm"
+            | "Focal Length In 35mm Film"
+            | "MaxApertureValue"
+            | "Max Aperture Value"
+            | "LensMake"
+            | "Lens Make"
+            | "LensModel"
+            | "Lens Model"
+    ) || starts_with_any(label, &["Camera", "Lens"])
+}
+
+fn is_film_label(label: &str) -> bool {
+    matches!(
+        label,
+        "FilmRoll"
+            | "Film Roll"
+            | "FilmMaker"
+            | "Film Maker"
+            | "FilmName"
+            | "Film Name"
+            | "FilmFormat"
+            | "Film Format"
+            | "FilmColor"
+            | "Film Color"
+            | "FilmNegative"
+            | "Film Negative"
+            | "FilmDevelopProcess"
+            | "Film Develop Process"
+            | "FilmDeveloper"
+            | "Film Developer"
+            | "FilmProcessLab"
+            | "Film Process Lab"
+            | "FilmProcessDate"
+            | "Film Process Date"
+            | "FilmScanner"
+            | "Film Scanner"
+    ) || starts_with_any(label, &["AnalogueData", "Analogue Data"])
+}
+
+fn is_exposure_label(label: &str) -> bool {
+    matches!(
+        label,
+        "ExposureTime"
+            | "Exposure Time"
+            | "FNumber"
+            | "F Number"
+            | "ISOSpeedRatings"
+            | "ISO Speed Ratings"
+            | "ISO"
+            | "ISOSpeed"
+            | "ISO Speed"
+            | "ShutterSpeedValue"
+            | "Shutter Speed Value"
+            | "ApertureValue"
+            | "Aperture Value"
+            | "BrightnessValue"
+            | "Brightness Value"
+            | "ExposureBiasValue"
+            | "Exposure Bias Value"
+            | "ExposureMode"
+            | "Exposure Mode"
+            | "ExposureProgram"
+            | "Exposure Program"
+            | "MaxApertureValue"
+            | "Max Aperture Value"
+            | "MeteringMode"
+            | "Metering Mode"
+            | "PhotographicSensitivity"
+            | "Photographic Sensitivity"
+            | "SensitivityType"
+            | "Sensitivity Type"
+            | "LightSource"
+            | "Light Source"
+            | "Flash"
+    )
+}
+
+fn starts_with_any(label: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| label.starts_with(prefix))
 }
 
 fn pretty_inspect_value(row: &InspectRow) -> String {
@@ -766,21 +1007,131 @@ mod tests {
 
         let output =
             format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+        let plain_output = strip_ansi_codes(&output);
 
-        assert!(output.contains("File Name         image.tif"));
-        assert!(output.contains("Make              \"Z\""));
-        assert!(output.contains("Model             \"E\""));
-        assert!(output.contains("Unknown Tiff Tag  Short([42])"));
+        assert!(plain_output.contains("File\n----\nFile Name  image.tif"));
+        assert!(plain_output.contains("Camera\n------\nMake   \"Z\"\nModel  \"E\""));
+        assert!(plain_output.contains("UNKNOWN\n-------\nUnknown Tiff Tag  Short([42])"));
         assert!(output.contains("Warnings:"));
         assert!(output.contains("warning: ignored malformed trailing field"));
-        assert!(output.find("File Name").unwrap() < output.find("Make").unwrap());
-        assert!(!output.contains("KNOWN"));
-        assert!(!output.contains("UNKNOWN"));
+        assert!(plain_output.find("File\n").unwrap() < plain_output.find("Camera\n").unwrap());
+        assert!(plain_output.find("Camera\n").unwrap() < plain_output.find("UNKNOWN\n").unwrap());
         assert!(!output.contains("IFD"));
         assert!(!output.contains("Tiff  "));
         assert!(!output.contains("0x010F"));
         assert!(!output.contains("0x0110"));
         assert!(!output.contains("0xFDE8"));
+    }
+
+    #[test]
+    fn pretty_inspect_output_omits_empty_groups() {
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif(&[tiff_ascii_entry(0x010f, b"Z\0")]),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        };
+
+        let output =
+            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+        let plain_output = strip_ansi_codes(&output);
+
+        assert!(plain_output.starts_with("Camera\n------\n"));
+        assert!(!plain_output.contains("File\n"));
+        assert!(!plain_output.contains("Film\n"));
+        assert!(!plain_output.contains("Exposure\n"));
+        assert!(!plain_output.contains("GPS\n"));
+        assert!(!plain_output.contains("MISC\n"));
+        assert!(!plain_output.contains("UNKNOWN\n"));
+    }
+
+    #[test]
+    fn pretty_inspect_group_heading_is_blue_and_underlined() {
+        colored::control::set_override(true);
+        let mut output = String::new();
+
+        append_pretty_group_heading(&mut output, PrettyInspectGroup::Camera);
+        colored::control::set_override(false);
+
+        assert_eq!(
+            output,
+            "\u{1b}[94mCamera\u{1b}[0m\n\u{1b}[94m------\u{1b}[0m\n"
+        );
+    }
+
+    #[test]
+    fn classifies_extra_file_info_rows_as_file() {
+        for name in [
+            "File Access Date/Time",
+            "File Creation Date/Time",
+            "File Permissions",
+            "File Type",
+            "File Type Extension",
+        ] {
+            let row = InspectInfoRow::new(name, "value");
+
+            assert!(matches!(classify_info_row(&row), PrettyInspectGroup::File));
+        }
+    }
+
+    #[test]
+    fn classifies_extra_camera_and_exposure_labels() {
+        for label in ["FocalLengthIn35mmFilm", "Focal Length In 35mm Film"] {
+            assert!(is_camera_label(label));
+        }
+
+        for label in [
+            "ExposureMode",
+            "Exposure Mode",
+            "ExposureProgram",
+            "Exposure Program",
+            "PhotographicSensitivity",
+            "Photographic Sensitivity",
+            "SensitivityType",
+            "Sensitivity Type",
+        ] {
+            assert!(is_exposure_label(label));
+        }
+    }
+
+    #[test]
+    fn pretty_inspect_output_deduplicates_identical_ifd_0_and_1_rows_only() {
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif_with_ifd1(
+                &[tiff_ascii_entry(0x010f, b"A\0")],
+                &[
+                    tiff_ascii_entry(0x010f, b"A\0"),
+                    tiff_ascii_entry(0x0110, b"B\0"),
+                ],
+            ),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        };
+
+        let output =
+            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+
+        assert_eq!(output.matches("Make").count(), 1);
+        assert_eq!(output.matches("\"A\"").count(), 1);
+        assert!(output.contains("Model  \"B\""));
+    }
+
+    #[test]
+    fn pretty_inspect_output_keeps_ifd_0_and_1_rows_with_different_values() {
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif_with_ifd1(
+                &[tiff_ascii_entry(0x010f, b"A\0")],
+                &[tiff_ascii_entry(0x010f, b"B\0")],
+            ),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        };
+
+        let output =
+            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+
+        assert_eq!(output.matches("Make").count(), 2);
+        assert!(output.contains("Make  \"A\""));
+        assert!(output.contains("Make  \"B\""));
     }
 
     #[test]
@@ -865,7 +1216,7 @@ mod tests {
             InspectFileInfo::from_path(&path, &exif).expect("file info should be collected");
         let rows = file_info.rows;
 
-        assert!(info_row_value(&rows, "Exifmeta Version Number").is_some());
+        assert!(info_row_value(&rows, "Exifmeta Version Number").is_none());
         let expected_file_name = path.file_name().and_then(|name| name.to_str());
         assert_eq!(info_row_value(&rows, "File Name"), expected_file_name);
         assert!(info_row_value(&rows, "Directory").is_some());
@@ -980,6 +1331,26 @@ mod tests {
             .map(|row| row.value.as_str())
     }
 
+    fn strip_ansi_codes(value: &str) -> String {
+        let mut output = String::new();
+        let mut chars = value.chars().peekable();
+
+        while let Some(char) = chars.next() {
+            if char == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next();
+                for char in chars.by_ref() {
+                    if char == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                output.push(char);
+            }
+        }
+
+        output
+    }
+
     fn temporary_test_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("exifmeta-{}-{name}", std::process::id()))
     }
@@ -1005,6 +1376,27 @@ mod tests {
             }
             data.extend_from_slice(&bytes);
         }
+
+        Reader::new()
+            .continue_on_error(true)
+            .read_raw(data)
+            .or_else(|error| error.distill_partial_result(|_| {}))
+            .expect("test EXIF should parse")
+    }
+
+    fn parse_raw_exif_with_ifd1(ifd0_entries: &[[u8; 12]], ifd1_entries: &[[u8; 12]]) -> Exif {
+        let mut data = vec![0x4d, 0x4d, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+        data.extend_from_slice(&(ifd0_entries.len() as u16).to_be_bytes());
+        for entry in ifd0_entries {
+            data.extend_from_slice(entry);
+        }
+        data.extend_from_slice(&100u32.to_be_bytes());
+        data.resize(100, 0);
+        data.extend_from_slice(&(ifd1_entries.len() as u16).to_be_bytes());
+        for entry in ifd1_entries {
+            data.extend_from_slice(entry);
+        }
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
         Reader::new()
             .continue_on_error(true)
