@@ -325,6 +325,10 @@ fn pretty_inspect_rows(info_rows: &[InspectInfoRow], rows: &[InspectRow]) -> Vec
 
     let mut seen_ifd_0_1 = HashSet::new();
     for row in rows {
+        if is_pretty_omitted_gps_reference(row) {
+            continue;
+        }
+
         let value = pretty_inspect_value(row);
         if matches!(row.ifd, 0 | 1)
             && !seen_ifd_0_1.insert((row.name.clone(), row.context.clone(), value.clone()))
@@ -341,6 +345,10 @@ fn pretty_inspect_rows(info_rows: &[InspectInfoRow], rows: &[InspectRow]) -> Vec
     }
 
     pretty_rows
+}
+
+fn is_pretty_omitted_gps_reference(row: &InspectRow) -> bool {
+    matches!(row.name.as_str(), "GPSLatitudeRef" | "GPSLongitudeRef")
 }
 
 fn append_nearest_location_rows(
@@ -821,7 +829,7 @@ impl InspectRow {
 
         if !is_unknown {
             if let Some(decimal) = decimal_gps_coordinate(field, exif) {
-                value.push_str(&format!(" ({})", format_decimal_coordinate(decimal)));
+                value = format!("({}) {value}", format_decimal_coordinate(decimal));
             }
         }
 
@@ -1511,9 +1519,11 @@ mod tests {
             format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Pretty);
 
         assert!(output.contains("GPS Latitude"));
-        assert!(output.contains("(52.352832)"));
+        assert!(output.contains("(52.352832) 52 deg 21 min 10.1952 sec N"));
         assert!(output.contains("GPS Longitude"));
-        assert!(output.contains("(-1.304089)"));
+        assert!(output.contains("(-1.304089) 1 deg 18 min 14.71968 sec W"));
+        assert!(!output.contains("GPS Latitude Ref"));
+        assert!(!output.contains("GPS Longitude Ref"));
     }
 
     #[test]
@@ -1550,6 +1560,8 @@ mod tests {
         let output = format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Raw);
 
         assert!(output.contains("GPSLatitude"));
+        assert!(output.contains("GPSLatitudeRef"));
+        assert!(output.contains("GPSLongitudeRef"));
         assert!(!output.contains("Nearest Location"));
         assert!(!output.contains("Dunchurch"));
     }
@@ -1569,7 +1581,7 @@ mod tests {
 
         assert!(output.contains("GPS Latitude"));
         assert!(output.contains("[GPSLatitudeRef missing]"));
-        assert!(output.contains("(10.5)"));
+        assert!(output.contains("(10.5) 10 deg 30 min 0 sec [GPSLatitudeRef missing]"));
         assert!(!output.contains("Nearest Location"));
     }
 
