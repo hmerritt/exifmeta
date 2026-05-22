@@ -15,5 +15,6 @@ fn main() -> ExitCode {
             eprintln!("warning: {warning}");
             ExitCode::FAILURE
         }
+        Err(exifmeta::CliError::Failure) => ExitCode::FAILURE,
     }
 }

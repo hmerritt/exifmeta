@@ -122,6 +122,7 @@ frames:
 pub enum CliError {
     Error(String),
     Warning(String),
+    Failure,
 }
 
 impl From<String> for CliError {
@@ -136,7 +137,7 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Run(args) => run_command(cli.dry_run, args).map_err(Into::into),
         Command::Init(args) => init_command(cli.dry_run, args),
-        Command::Validate(args) => validate_command(args).map_err(Into::into),
+        Command::Validate(args) => validate_command(args),
         Command::Inspect(args) => inspect_command(args).map_err(Into::into),
         Command::Interactive => stub_command(cli.dry_run, "interactive").map_err(Into::into),
         Command::Strip => stub_command(cli.dry_run, "strip").map_err(Into::into),
@@ -1472,32 +1473,213 @@ fn is_supported_image_file(path: &Path) -> bool {
     detect_file_kind(path).file_type != "Unknown"
 }
 
-fn validate_command(args: ValidateArgs) -> Result<(), String> {
-    let resolution = resolve_metadata_path(args.path.as_deref())?;
-    let contents = fs::read_to_string(&resolution.path)
-        .map_err(|error| format!("failed to read {}: {error}", resolution.path.display()))?;
-    let yaml = serde_yaml::from_str::<YamlValue>(&contents)
-        .map_err(|error| format!("failed to parse {}: {error}", resolution.path.display()))?;
-    let report = validate_metadata_yaml(&resolution.path, &yaml)?;
+fn validate_command(args: ValidateArgs) -> Result<(), CliError> {
+    let output = build_validate_output(args.path.as_deref());
+    print_validate_output(&output);
 
-    println!("validated {}", resolution.path.display());
-    println!("YAML: ok");
-    println!("exif: {}", format_tag_counts(&report.exif_tags));
-    println!("frames: {}", format_tag_counts(&report.frame_tags));
-    for location_match in &report.location_matches {
-        println!("{}", location_match.green());
+    if output.error_count() == 0 {
+        Ok(())
+    } else {
+        Err(CliError::Failure)
+    }
+}
+
+fn build_validate_output(path: Option<&Path>) -> ValidateOutput {
+    let mut output = ValidateOutput::default();
+    let resolution = match resolve_metadata_path(path) {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            output.file_errors.push(error);
+            return output;
+        }
+    };
+
+    output.metadata_path = Some(resolution.path.clone());
+    output.file_warnings = resolution.warnings;
+
+    let contents = match fs::read_to_string(&resolution.path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            output.file_errors.push(format!(
+                "failed to read {}: {error}",
+                resolution.path.display()
+            ));
+            return output;
+        }
+    };
+
+    let yaml = match serde_yaml::from_str::<YamlValue>(&contents) {
+        Ok(yaml) => {
+            output.yaml_ok = true;
+            yaml
+        }
+        Err(error) => {
+            output.file_errors.push(format!(
+                "failed to parse {}: {error}",
+                resolution.path.display()
+            ));
+            return output;
+        }
+    };
+
+    match validate_metadata_yaml(&resolution.path, &yaml) {
+        Ok(report) => {
+            output.exif = Some(TagStageReport {
+                tags: report.exif_tags,
+                warnings: report.exif_warnings,
+            });
+            output.frames = Some(report.frames);
+        }
+        Err(error) => output.file_errors.push(error),
     }
 
-    let warnings = resolution
-        .warnings
-        .iter()
-        .chain(report.warnings.iter())
-        .collect::<Vec<_>>();
-    for warning in warnings {
-        println!("{}", format_validate_warning(warning));
+    output
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ValidateOutput {
+    metadata_path: Option<PathBuf>,
+    yaml_ok: bool,
+    file_warnings: Vec<String>,
+    file_errors: Vec<String>,
+    exif: Option<TagStageReport>,
+    frames: Option<Vec<FrameReport>>,
+}
+
+impl ValidateOutput {
+    fn error_count(&self) -> usize {
+        self.file_errors.len()
     }
 
-    Ok(())
+    fn warning_count(&self) -> usize {
+        self.file_warnings.len()
+            + self.exif.as_ref().map_or(0, |report| report.warnings.len())
+            + self.frames.as_ref().map_or(0, |frames| {
+                frames.iter().map(|frame| frame.warnings.len()).sum()
+            })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TagStageReport {
+    tags: TagCounts,
+    warnings: Vec<String>,
+}
+
+fn print_validate_output(output: &ValidateOutput) {
+    print!("{}", format_validate_output(output));
+}
+
+fn format_validate_output(output: &ValidateOutput) -> String {
+    let mut rendered = String::new();
+
+    append_validate_file_group(&mut rendered, output);
+    append_validate_exif_group(&mut rendered, output);
+    append_validate_frames_group(&mut rendered, output);
+    append_validate_overview_group(&mut rendered, output);
+
+    rendered
+}
+
+fn append_validate_file_group(output: &mut String, report: &ValidateOutput) {
+    append_validate_heading(output, "file");
+
+    if let Some(path) = &report.metadata_path {
+        output.push_str(&format!(
+            "metadata file: {}\n",
+            format!("found {}", path.display()).green()
+        ));
+    } else {
+        output.push_str("metadata file: skipped\n");
+    }
+
+    if report.yaml_ok {
+        output.push_str(&format!("YAML format: {}\n", "ok".green()));
+    } else {
+        output.push_str("YAML format: skipped\n");
+    }
+
+    for warning in &report.file_warnings {
+        output.push_str(&format!("{}\n", format_validate_warning(warning)));
+    }
+    for error in &report.file_errors {
+        output.push_str(&format!("{}\n", format_validate_error(error)));
+    }
+}
+
+fn append_validate_exif_group(output: &mut String, report: &ValidateOutput) {
+    append_validate_heading(output, "exif");
+
+    let Some(exif) = &report.exif else {
+        output.push_str("skipped\n");
+        return;
+    };
+
+    append_validate_tag_counts(output, &exif.tags);
+    for warning in &exif.warnings {
+        output.push_str(&format!("{}\n", format_validate_warning(warning)));
+    }
+}
+
+fn append_validate_frames_group(output: &mut String, report: &ValidateOutput) {
+    append_validate_heading(output, "frames");
+
+    let Some(frames) = &report.frames else {
+        output.push_str("skipped\n");
+        return;
+    };
+
+    if frames.is_empty() {
+        output.push_str("skipped\n");
+        return;
+    }
+
+    for frame in frames {
+        output.push_str(&format!(
+            "{}\n",
+            format!("frame {}", frame.key).bright_cyan()
+        ));
+        append_validate_tag_counts(output, &frame.tags);
+        for location_match in &frame.location_matches {
+            output.push_str(&format!("{}\n", location_match.green()));
+        }
+        for warning in &frame.warnings {
+            output.push_str(&format!("{}\n", format_validate_warning(warning)));
+        }
+    }
+}
+
+fn append_validate_overview_group(output: &mut String, report: &ValidateOutput) {
+    append_validate_heading(output, "overview");
+
+    let errors = report.error_count();
+    let warnings = report.warning_count();
+    output.push_str(&format!("errors      {errors}\n"));
+    output.push_str(&format!("warnings    {warnings}\n"));
+
+    if errors == 0 {
+        output.push_str(&format!("validation: {}\n", "success".green()));
+    } else {
+        output.push_str(&format!("validation: {}\n", "error".red()));
+    }
+}
+
+fn append_validate_heading(output: &mut String, label: &str) {
+    const WIDTH: usize = 58;
+    let dash_count = WIDTH.saturating_sub(label.len() + 1);
+    output.push_str(&format!(
+        "{}\n",
+        format!("{label} {}", "─".repeat(dash_count)).bright_blue()
+    ));
+}
+
+fn append_validate_tag_counts(output: &mut String, counts: &TagCounts) {
+    output.push_str(&format!("standard tags: {}\n", counts.standard));
+    output.push_str(&format!("unknown tags: {}\n", counts.unknown));
+}
+
+fn format_validate_error(error: &str) -> String {
+    format!("error: {error}").red().to_string()
 }
 
 struct MetadataPathResolution {
@@ -1567,8 +1749,10 @@ fn resolve_metadata_path_in_directory(directory: &Path) -> Result<MetadataPathRe
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ValidateReport {
     exif_tags: TagCounts,
+    exif_warnings: Vec<String>,
     frame_tags: TagCounts,
     location_matches: Vec<String>,
+    frames: Vec<FrameReport>,
     warnings: Vec<String>,
 }
 
@@ -1593,6 +1777,7 @@ fn validate_metadata_yaml(
             .as_mapping()
             .ok_or_else(|| "metadata YAML `exif` key must be a mapping".to_string())?;
         report.exif_tags = validate_tag_mapping(exif, "exif")?;
+        report.exif_warnings = tag_warnings("exif", &report.exif_tags);
     }
 
     if let Some(frames) = yaml_mapping_get(root, "frames") {
@@ -1604,22 +1789,25 @@ fn validate_metadata_yaml(
         report
             .location_matches
             .extend(frame_report.location_matches);
+        report.frames = frame_report.frames;
         report.warnings.extend(frame_report.warnings);
     }
 
-    report
-        .warnings
-        .extend(tag_warnings("exif", &report.exif_tags));
-    report
-        .warnings
-        .extend(tag_warnings("frames", &report.frame_tags));
-
     Ok(report)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FrameReport {
+    key: String,
+    tags: TagCounts,
+    location_matches: Vec<String>,
+    warnings: Vec<String>,
 }
 
 struct FrameValidationReport {
     tags: TagCounts,
     location_matches: Vec<String>,
+    frames: Vec<FrameReport>,
     warnings: Vec<String>,
 }
 
@@ -1633,17 +1821,31 @@ fn validate_frames_mapping(
     let mut report = FrameValidationReport {
         tags: TagCounts::default(),
         location_matches: Vec::new(),
+        frames: Vec::new(),
         warnings: Vec::new(),
     };
 
     for (frame_key, frame_value) in frames {
+        let mut frame_report = FrameReport {
+            key: yaml_key_label(frame_key),
+            ..FrameReport::default()
+        };
         validate_frame_reference(
             frame_key,
             image_directory,
             &image_files,
-            &mut report.warnings,
+            &mut frame_report.warnings,
         );
-        collect_frame_tags(frame_value, &geonames, &mut report)?;
+        collect_frame_tags(frame_value, &geonames, &mut frame_report)?;
+        frame_report
+            .warnings
+            .extend(tag_warnings("exif", &frame_report.tags));
+        merge_tag_counts(&mut report.tags, frame_report.tags.clone());
+        report
+            .location_matches
+            .extend(frame_report.location_matches.clone());
+        report.warnings.extend(frame_report.warnings.clone());
+        report.frames.push(frame_report);
     }
 
     Ok(report)
@@ -1686,7 +1888,7 @@ fn validate_frame_reference(
 fn collect_frame_tags(
     frame_value: &YamlValue,
     geonames: &Connection,
-    report: &mut FrameValidationReport,
+    report: &mut FrameReport,
 ) -> Result<(), String> {
     match frame_value {
         YamlValue::Mapping(mapping) => {
@@ -1714,7 +1916,7 @@ fn collect_frame_tags(
 fn collect_frame_tag_mapping(
     mapping: &Mapping,
     geonames: &Connection,
-    report: &mut FrameValidationReport,
+    report: &mut FrameReport,
 ) -> Result<(), String> {
     merge_tag_counts(&mut report.tags, validate_tag_mapping(mapping, "frames")?);
 
@@ -1730,7 +1932,7 @@ fn collect_frame_tag_mapping(
 fn validate_location_value(
     value: &YamlValue,
     geonames: &Connection,
-    report: &mut FrameValidationReport,
+    report: &mut FrameReport,
 ) -> Result<(), String> {
     let Some(location_name) = location_name_from_yaml(value, &mut report.warnings) else {
         return Ok(());
@@ -1821,29 +2023,6 @@ fn tag_warnings(context: &str, counts: &TagCounts) -> Vec<String> {
         .iter()
         .map(|name| format!("{context} tag `{name}` is not a known EXIF tag"))
         .collect()
-}
-
-fn format_tag_counts(counts: &TagCounts) -> String {
-    let standard = format!(
-        "{} standard {}",
-        counts.standard,
-        pluralize(counts.standard, "tag", "tags")
-    );
-    let unknown = format!(
-        "{} unknown {}",
-        counts.unknown,
-        pluralize(counts.unknown, "tag", "tags")
-    );
-
-    if counts.unknown == 0 {
-        format!("{standard} + {unknown}")
-    } else {
-        format!("{standard} + {}", unknown.yellow())
-    }
-}
-
-fn pluralize(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
-    if count == 1 { singular } else { plural }
 }
 
 fn yaml_mapping_get<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a YamlValue> {
@@ -2289,7 +2468,7 @@ exif:
         assert_eq!(report.exif_tags.unknown_names, ["NotARealExifTag"]);
         assert!(
             report
-                .warnings
+                .exif_warnings
                 .iter()
                 .any(|warning| warning.contains("NotARealExifTag"))
         );
@@ -2367,7 +2546,6 @@ frames:
             "frames $Location `DefinitelyNotARealPlace` was not found in internal database",
         );
 
-        colored::control::set_override(false);
         assert!(output.starts_with("\u{1b}[31mwarning:"));
     }
 
@@ -2377,7 +2555,6 @@ frames:
 
         let output = format_validate_warning("frame file `missing.tif` does not exist");
 
-        colored::control::set_override(false);
         assert!(output.starts_with("\u{1b}[33mwarning\u{1b}[0m:"));
     }
 
@@ -2468,6 +2645,120 @@ frames:
                 .iter()
                 .any(|warning| warning.contains("missing.tif"))
         );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_output_groups_are_rendered_in_order() {
+        let directory = temporary_test_directory("validate-group-order");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(
+            &metadata,
+            r#"
+exif:
+  Make: Nikon
+frames:
+  "image.jpg":
+    - FNumber: 2.8
+"#,
+        )
+        .expect("metadata should be written");
+        std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
+
+        let output = build_validate_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_validate_output(&output));
+
+        let file = rendered.find("file ").expect("file group should render");
+        let exif = rendered.find("exif ").expect("exif group should render");
+        let frames = rendered
+            .find("frames ")
+            .expect("frames group should render");
+        let overview = rendered
+            .find("overview ")
+            .expect("overview group should render");
+        assert!(file < exif);
+        assert!(exif < frames);
+        assert!(frames < overview);
+        assert!(rendered.contains("metadata file: found "));
+        assert!(rendered.contains("YAML format: ok"));
+        assert!(rendered.contains("validation: success"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_output_renders_frame_blocks_in_yaml_order() {
+        let directory = temporary_test_directory("validate-frame-order");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(
+            &metadata,
+            r#"
+frames:
+  2:
+    - FNumber: 2.8
+  "image.jpg":
+    - ExposureTime: 1/500
+"#,
+        )
+        .expect("metadata should be written");
+        std::fs::write(directory.join("one.jpg"), []).expect("test image should be written");
+        std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
+
+        let output = build_validate_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_validate_output(&output));
+        let frame_two = rendered.find("frame 2").expect("frame 2 should render");
+        let frame_image = rendered
+            .find("frame image.jpg")
+            .expect("frame image.jpg should render");
+
+        assert!(frame_two < frame_image);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_output_skips_later_groups_after_parse_error() {
+        let directory = temporary_test_directory("validate-parse-error");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(&metadata, "exif: [").expect("metadata should be written");
+
+        let output = build_validate_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_validate_output(&output));
+
+        assert!(rendered.contains("YAML format: skipped"));
+        assert!(rendered.contains("exif "));
+        assert!(rendered.contains("frames "));
+        assert_eq!(rendered.matches("skipped").count(), 3);
+        assert!(rendered.contains("errors      1"));
+        assert!(rendered.contains("validation: error"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_output_uses_expected_colours() {
+        let directory = temporary_test_directory("validate-colours");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(
+            &metadata,
+            r#"
+frames:
+  "image.jpg":
+    - $Location: London
+"#,
+        )
+        .expect("metadata should be written");
+        std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
+        colored::control::set_override(true);
+
+        let output = build_validate_output(Some(&metadata));
+        let rendered = format_validate_output(&output);
+
+        assert!(rendered.contains("\u{1b}[94mfile "));
+        assert!(rendered.contains("\u{1b}[32mfound "));
+        assert!(rendered.contains("\u{1b}[96mframe image.jpg"));
+        assert!(rendered.contains("\u{1b}[32m$Location match found: London"));
 
         let _ = std::fs::remove_dir_all(directory);
     }
