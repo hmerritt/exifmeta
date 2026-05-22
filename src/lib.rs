@@ -8,7 +8,8 @@ use std::time::SystemTime;
 use chrono::{DateTime, Local};
 use colored::Colorize;
 use exif::{Error as ExifError, Exif, Field, Reader, Tag, Value};
-use rusqlite::{Connection, DatabaseName, params};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, DatabaseName, params_from_iter};
 
 pub mod cli;
 pub mod version;
@@ -17,6 +18,7 @@ pub use cli::{Cli, Command, InspectArgs, InspectFormat, RunArgs};
 
 const GEONAMES_DATABASE: &[u8] = include_bytes!("../assets/geonames/cities1000.sqlite");
 const NEAREST_LOCATION_LIMIT: usize = 5;
+const NEAREST_CITY_MINIMUM_POPULATION: i64 = 200_000;
 const EARTH_RADIUS_KM: f64 = 6_371.0088;
 
 pub fn run(cli: Cli) -> Result<(), String> {
@@ -269,7 +271,9 @@ fn append_pretty_inspect_rows(
         left.group
             .output_order()
             .cmp(&right.group.output_order())
-            .then(left.label.cmp(&right.label))
+            .then_with(|| {
+                pretty_inspect_row_sort_label(left).cmp(&pretty_inspect_row_sort_label(right))
+            })
             .then(left.value.cmp(&right.value))
     });
 
@@ -310,6 +314,16 @@ fn append_pretty_group_heading(output: &mut String, group: PrettyInspectGroup) {
     output.push('\n');
     output.push_str(&"-".repeat(title.len()).bright_blue().to_string());
     output.push('\n');
+}
+
+fn pretty_inspect_row_sort_label(row: &PrettyInspectRow) -> String {
+    if let Some(suffix) = row.label.strip_prefix("Nearest Location ") {
+        format!("Nearest 0 Location {suffix}")
+    } else if row.label == "Nearest City" {
+        "Nearest 1 City".to_string()
+    } else {
+        row.label.clone()
+    }
 }
 
 fn pretty_inspect_rows(info_rows: &[InspectInfoRow], rows: &[InspectRow]) -> Vec<PrettyInspectRow> {
@@ -360,24 +374,68 @@ fn append_nearest_location_rows(
         return;
     };
 
-    match nearest_locations(latitude, longitude, NEAREST_LOCATION_LIMIT) {
-        Ok(locations) => {
-            for (index, location) in locations.into_iter().enumerate() {
-                pretty_rows.push(PrettyInspectRow {
-                    group: PrettyInspectGroup::Gps,
-                    label: format!("Nearest Location {}", index + 1),
-                    label_color: Some(PrettyLabelColor::Green),
-                    value: format!(
-                        "({}) {}, {}",
-                        format_distance(location.distance_km),
-                        location.name,
-                        location.country_code
-                    ),
-                });
-            }
-        }
+    match nearest_locations(latitude, longitude, NEAREST_LOCATION_LIMIT, None) {
+        Ok(locations) => append_location_rows(pretty_rows, "Nearest Location", locations),
         Err(error) => warnings.push(format!("failed to query nearest locations: {error}")),
     }
+
+    match nearest_locations(
+        latitude,
+        longitude,
+        1,
+        Some(NEAREST_CITY_MINIMUM_POPULATION),
+    ) {
+        Ok(locations) => append_single_location_row(pretty_rows, "Nearest City", locations),
+        Err(error) => warnings.push(format!("failed to query nearest city: {error}")),
+    }
+}
+
+fn append_location_rows(
+    pretty_rows: &mut Vec<PrettyInspectRow>,
+    label_prefix: &str,
+    locations: Vec<GeoLocation>,
+) {
+    for (index, location) in locations.into_iter().enumerate() {
+        pretty_rows.push(PrettyInspectRow {
+            group: PrettyInspectGroup::Gps,
+            label: format!("{} {}", label_prefix, index + 1),
+            label_color: Some(PrettyLabelColor::Green),
+            value: format!(
+                "({}) {}, {}",
+                format_distance(location.distance_km),
+                location.name,
+                location.country_code
+            ),
+        });
+    }
+}
+
+fn append_single_location_row(
+    pretty_rows: &mut Vec<PrettyInspectRow>,
+    label: &str,
+    locations: Vec<GeoLocation>,
+) {
+    for location in locations {
+        append_location_row(pretty_rows, label, location);
+    }
+}
+
+fn append_location_row(
+    pretty_rows: &mut Vec<PrettyInspectRow>,
+    label: &str,
+    location: GeoLocation,
+) {
+    pretty_rows.push(PrettyInspectRow {
+        group: PrettyInspectGroup::Gps,
+        label: label.to_string(),
+        label_color: Some(PrettyLabelColor::Green),
+        value: format!(
+            "({}) {}, {}",
+            format_distance(location.distance_km),
+            location.name,
+            location.country_code
+        ),
+    });
 }
 
 fn gps_coordinates(exif: &Exif) -> Option<(f64, f64)> {
@@ -966,6 +1024,7 @@ struct GeoLocation {
     country_code: String,
     latitude: f64,
     longitude: f64,
+    population: i64,
     distance_km: f64,
 }
 
@@ -973,6 +1032,7 @@ fn nearest_locations(
     latitude: f64,
     longitude: f64,
     limit: usize,
+    minimum_population: Option<i64>,
 ) -> Result<Vec<GeoLocation>, String> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -983,7 +1043,13 @@ fn nearest_locations(
     let mut candidates = Vec::new();
 
     while radius_km <= 20_000.0 {
-        candidates = candidate_locations(&connection, latitude, longitude, radius_km)?;
+        candidates = candidate_locations(
+            &connection,
+            latitude,
+            longitude,
+            radius_km,
+            minimum_population,
+        )?;
 
         for location in &mut candidates {
             location.distance_km =
@@ -1009,6 +1075,7 @@ fn sort_locations_by_distance(locations: &mut [GeoLocation]) {
             .total_cmp(&right.distance_km)
             .then(left.country_code.cmp(&right.country_code))
             .then(left.name.cmp(&right.name))
+            .then(left.population.cmp(&right.population))
     });
 }
 
@@ -1048,6 +1115,7 @@ fn candidate_locations(
     latitude: f64,
     longitude: f64,
     radius_km: f64,
+    minimum_population: Option<i64>,
 ) -> Result<Vec<GeoLocation>, String> {
     let latitude_delta = radius_km / 111.0;
     let longitude_delta = if latitude.abs() >= 89.0 {
@@ -1061,43 +1129,59 @@ fn candidate_locations(
     let maximum_longitude = normalize_longitude(longitude + longitude_delta);
     let wraps_date_line = minimum_longitude > maximum_longitude;
 
+    let population_filter = if minimum_population.is_some() {
+        "          AND population > ?5\n"
+    } else {
+        ""
+    };
+
     let sql = if wraps_date_line {
-        "
-        SELECT name, country_code, latitude, longitude
+        format!(
+            "
+        SELECT name, country_code, latitude, longitude, population
         FROM locations
         WHERE latitude BETWEEN ?1 AND ?2
           AND (longitude >= ?3 OR longitude <= ?4)
-        "
+{}
+        ",
+            population_filter
+        )
     } else {
-        "
-        SELECT name, country_code, latitude, longitude
+        format!(
+            "
+        SELECT name, country_code, latitude, longitude, population
         FROM locations
         WHERE latitude BETWEEN ?1 AND ?2
           AND longitude BETWEEN ?3 AND ?4
-        "
+{}
+        ",
+            population_filter
+        )
     };
 
     let mut statement = connection
-        .prepare(sql)
+        .prepare(&sql)
         .map_err(|error| format!("failed to prepare GeoNames query: {error}"))?;
+    let mut parameters = vec![
+        SqlValue::Real(minimum_latitude),
+        SqlValue::Real(maximum_latitude),
+        SqlValue::Real(minimum_longitude),
+        SqlValue::Real(maximum_longitude),
+    ];
+    if let Some(minimum_population) = minimum_population {
+        parameters.push(SqlValue::Integer(minimum_population));
+    }
     let rows = statement
-        .query_map(
-            params![
-                minimum_latitude,
-                maximum_latitude,
-                minimum_longitude,
-                maximum_longitude
-            ],
-            |row| {
-                Ok(GeoLocation {
-                    name: row.get(0)?,
-                    country_code: row.get(1)?,
-                    latitude: row.get(2)?,
-                    longitude: row.get(3)?,
-                    distance_km: 0.0,
-                })
-            },
-        )
+        .query_map(params_from_iter(parameters), |row| {
+            Ok(GeoLocation {
+                name: row.get(0)?,
+                country_code: row.get(1)?,
+                latitude: row.get(2)?,
+                longitude: row.get(3)?,
+                population: row.get(4)?,
+                distance_km: 0.0,
+            })
+        })
         .map_err(|error| format!("failed to query GeoNames database: {error}"))?;
 
     rows.collect::<Result<Vec<_>, _>>()
@@ -1548,9 +1632,22 @@ mod tests {
 
         assert!(plain_output.contains("GPS\n---\n"));
         assert_eq!(plain_output.matches("Nearest Location").count(), 5);
+        assert_eq!(plain_output.matches("Nearest City").count(), 1);
+        assert_eq!(plain_output.matches("Nearest Large City").count(), 0);
         assert!(plain_output.contains("Nearest Location 1  (1.9 km) Dunchurch, GB"));
         assert!(plain_output.contains("Nearest Location 2  (3.2 km) Long Lawford, GB"));
+        assert!(plain_output.contains("Nearest City        (15.3 km) Coventry, GB"));
+        assert!(
+            plain_output
+                .find("Nearest Location 5")
+                .expect("nearest location rows should be present")
+                < plain_output
+                    .find("Nearest City")
+                    .expect("nearest city rows should be present")
+        );
         assert!(output.contains("\u{1b}[32mNearest Location 1\u{1b}[0m"));
+        assert!(output.contains("\u{1b}[32mNearest City\u{1b}[0m"));
+        assert!(!output.contains("\u{1b}[32mNearest Large City\u{1b}[0m"));
     }
 
     #[test]
@@ -1563,7 +1660,10 @@ mod tests {
         assert!(output.contains("GPSLatitudeRef"));
         assert!(output.contains("GPSLongitudeRef"));
         assert!(!output.contains("Nearest Location"));
+        assert!(!output.contains("Nearest City"));
+        assert!(!output.contains("Nearest Large City"));
         assert!(!output.contains("Dunchurch"));
+        assert!(!output.contains("Coventry"));
     }
 
     #[test]
@@ -1589,6 +1689,45 @@ mod tests {
     fn formats_metric_distances() {
         assert_eq!(format_distance(0.0123), "12 m");
         assert_eq!(format_distance(1.234), "1.2 km");
+    }
+
+    #[test]
+    fn candidate_locations_filters_by_strict_minimum_population() {
+        let connection = Connection::open_in_memory().expect("test database should open");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE locations (
+                    geoname_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    country_code TEXT NOT NULL,
+                    latitude REAL NOT NULL,
+                    longitude REAL NOT NULL,
+                    population INTEGER NOT NULL,
+                    elevation INTEGER
+                );
+                INSERT INTO locations VALUES
+                    (1, 'Small Place', 'AA', 0.0, 0.0, 199999, NULL),
+                    (2, 'Equal Place', 'AA', 0.0, 0.1, 200000, NULL),
+                    (3, 'City', 'AA', 0.0, 0.2, 200001, NULL),
+                    (4, 'Larger City', 'AA', 0.0, 0.3, 300000, NULL);
+                ",
+            )
+            .expect("test locations should be inserted");
+
+        let locations = candidate_locations(&connection, 0.0, 0.0, 50.0, Some(200_000))
+            .expect("population-filtered query should succeed");
+
+        let names = locations
+            .iter()
+            .map(|location| location.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["City", "Larger City"]);
+        assert!(
+            locations
+                .iter()
+                .all(|location| location.population > 200_000)
+        );
     }
 
     #[test]
