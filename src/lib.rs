@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::time::SystemTime;
 
@@ -10,17 +10,19 @@ use colored::Colorize;
 use exif::{Error as ExifError, Exif, Field, Reader, Tag, Value};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, DatabaseName, params_from_iter};
+use serde_yaml::{Mapping, Value as YamlValue};
 
 pub mod cli;
 pub mod version;
 
-pub use cli::{Cli, Command, InitArgs, InspectArgs, InspectFormat, RunArgs};
+pub use cli::{Cli, Command, InitArgs, InspectArgs, InspectFormat, RunArgs, ValidateArgs};
 
 const GEONAMES_DATABASE: &[u8] = include_bytes!("../assets/geonames/cities1000.sqlite");
 const NEAREST_LOCATION_LIMIT: usize = 5;
 const NEAREST_CITY_MINIMUM_POPULATION: i64 = 200_000;
 const EARTH_RADIUS_KM: f64 = 6_371.0088;
 const METADATA_FILE_NAME: &str = "metadata.yaml";
+const METADATA_YML_FILE_NAME: &str = "metadata.yml";
 const METADATA_TEMPLATE: &str = r#"# ───────────────────────────────────────────────
 # Metadata file for images in this directory. Used by exifmeta, https://github.com/hmerritt/exifmeta
 # ───────────────────────────────────────────────
@@ -134,7 +136,7 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Run(args) => run_command(cli.dry_run, args).map_err(Into::into),
         Command::Init(args) => init_command(cli.dry_run, args),
-        Command::Validate => stub_command(cli.dry_run, "validate").map_err(Into::into),
+        Command::Validate(args) => validate_command(args).map_err(Into::into),
         Command::Inspect(args) => inspect_command(args).map_err(Into::into),
         Command::Interactive => stub_command(cli.dry_run, "interactive").map_err(Into::into),
         Command::Strip => stub_command(cli.dry_run, "strip").map_err(Into::into),
@@ -1437,6 +1439,486 @@ fn is_supported_image_file(path: &Path) -> bool {
     detect_file_kind(path).file_type != "Unknown"
 }
 
+fn validate_command(args: ValidateArgs) -> Result<(), String> {
+    let resolution = resolve_metadata_path(args.path.as_deref())?;
+    let contents = fs::read_to_string(&resolution.path)
+        .map_err(|error| format!("failed to read {}: {error}", resolution.path.display()))?;
+    let yaml = serde_yaml::from_str::<YamlValue>(&contents)
+        .map_err(|error| format!("failed to parse {}: {error}", resolution.path.display()))?;
+    let report = validate_metadata_yaml(&resolution.path, &yaml)?;
+
+    println!("validated {}", resolution.path.display());
+    println!("YAML: ok");
+    println!("exif: {}", format_tag_counts(&report.exif_tags));
+    println!("frames: {}", format_tag_counts(&report.frame_tags));
+
+    let warnings = resolution
+        .warnings
+        .iter()
+        .chain(report.warnings.iter())
+        .collect::<Vec<_>>();
+    for warning in warnings {
+        println!("{}: {warning}", "warning".yellow());
+    }
+
+    Ok(())
+}
+
+struct MetadataPathResolution {
+    path: PathBuf,
+    warnings: Vec<String>,
+}
+
+fn resolve_metadata_path(path: Option<&Path>) -> Result<MetadataPathResolution, String> {
+    match path {
+        Some(path) if path.is_file() => Ok(MetadataPathResolution {
+            path: path.to_path_buf(),
+            warnings: Vec::new(),
+        }),
+        Some(path) if path.is_dir() => resolve_metadata_path_in_directory(path),
+        Some(path) => Err(format!("metadata path does not exist: {}", path.display())),
+        None => resolve_metadata_path_in_directory(Path::new(".")),
+    }
+}
+
+fn resolve_metadata_path_in_directory(directory: &Path) -> Result<MetadataPathResolution, String> {
+    let yaml_path = directory.join(METADATA_FILE_NAME);
+    let yml_path = directory.join(METADATA_YML_FILE_NAME);
+    let yaml_exists = yaml_path.is_file();
+    let yml_exists = yml_path.is_file();
+
+    if yaml_exists {
+        let mut warnings = Vec::new();
+        if yml_exists {
+            warnings.push(format!(
+                "{} also exists and was ignored",
+                yml_path.display()
+            ));
+        }
+        return Ok(MetadataPathResolution {
+            path: yaml_path,
+            warnings,
+        });
+    }
+
+    if yml_exists {
+        return Ok(MetadataPathResolution {
+            path: yml_path,
+            warnings: Vec::new(),
+        });
+    }
+
+    Err(format!(
+        "no metadata.yaml or metadata.yml found in {}",
+        directory.display()
+    ))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ValidateReport {
+    exif_tags: TagCounts,
+    frame_tags: TagCounts,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TagCounts {
+    standard: usize,
+    unknown: usize,
+    unknown_names: Vec<String>,
+}
+
+fn validate_metadata_yaml(
+    metadata_path: &Path,
+    yaml: &YamlValue,
+) -> Result<ValidateReport, String> {
+    let root = yaml
+        .as_mapping()
+        .ok_or_else(|| "metadata YAML root must be a mapping".to_string())?;
+    let mut report = ValidateReport::default();
+
+    if let Some(exif) = yaml_mapping_get(root, "exif") {
+        let exif = exif
+            .as_mapping()
+            .ok_or_else(|| "metadata YAML `exif` key must be a mapping".to_string())?;
+        report.exif_tags = validate_tag_mapping(exif, "exif")?;
+    }
+
+    if let Some(frames) = yaml_mapping_get(root, "frames") {
+        let frames = frames
+            .as_mapping()
+            .ok_or_else(|| "metadata YAML `frames` key must be a mapping".to_string())?;
+        let frame_report = validate_frames_mapping(metadata_path, frames)?;
+        report.frame_tags = frame_report.tags;
+        report.warnings.extend(frame_report.warnings);
+    }
+
+    report
+        .warnings
+        .extend(tag_warnings("exif", &report.exif_tags));
+    report
+        .warnings
+        .extend(tag_warnings("frames", &report.frame_tags));
+
+    Ok(report)
+}
+
+struct FrameValidationReport {
+    tags: TagCounts,
+    warnings: Vec<String>,
+}
+
+fn validate_frames_mapping(
+    metadata_path: &Path,
+    frames: &Mapping,
+) -> Result<FrameValidationReport, String> {
+    let image_directory = metadata_path.parent().unwrap_or_else(|| Path::new("."));
+    let image_files = supported_image_files_in_directory(image_directory)?;
+    let mut report = FrameValidationReport {
+        tags: TagCounts::default(),
+        warnings: Vec::new(),
+    };
+
+    for (frame_key, frame_value) in frames {
+        validate_frame_reference(
+            frame_key,
+            image_directory,
+            &image_files,
+            &mut report.warnings,
+        );
+        collect_frame_tags(frame_value, &mut report.tags)?;
+    }
+
+    Ok(report)
+}
+
+fn validate_frame_reference(
+    frame_key: &YamlValue,
+    image_directory: &Path,
+    image_files: &[PathBuf],
+    warnings: &mut Vec<String>,
+) {
+    match frame_key {
+        YamlValue::Number(number) => {
+            let Some(frame_number) = number.as_i64() else {
+                warnings.push(format!(
+                    "frame reference `{}` is not a valid frame number",
+                    yaml_key_label(frame_key)
+                ));
+                return;
+            };
+
+            if frame_number < 1 || frame_number as usize > image_files.len() {
+                warnings.push(format!(
+                    "frame reference `{frame_number}` does not match an image file"
+                ));
+            }
+        }
+        YamlValue::String(file_name) => {
+            if !image_directory.join(file_name).is_file() {
+                warnings.push(format!("frame file `{file_name}` does not exist"));
+            }
+        }
+        _ => warnings.push(format!(
+            "frame reference `{}` is not a valid frame key",
+            yaml_key_label(frame_key)
+        )),
+    }
+}
+
+fn collect_frame_tags(frame_value: &YamlValue, counts: &mut TagCounts) -> Result<(), String> {
+    match frame_value {
+        YamlValue::Mapping(mapping) => {
+            merge_tag_counts(counts, validate_tag_mapping(mapping, "frames")?);
+            Ok(())
+        }
+        YamlValue::Sequence(items) => {
+            for item in items {
+                let mapping = item
+                    .as_mapping()
+                    .ok_or_else(|| "metadata YAML frame entries must be mappings".to_string())?;
+                if mapping.len() != 1 {
+                    return Err(
+                        "metadata YAML frame sequence entries must contain one tag".to_string()
+                    );
+                }
+                merge_tag_counts(counts, validate_tag_mapping(mapping, "frames")?);
+            }
+            Ok(())
+        }
+        _ => Err("metadata YAML frame values must be mappings or sequences".to_string()),
+    }
+}
+
+fn validate_tag_mapping(mapping: &Mapping, context: &str) -> Result<TagCounts, String> {
+    let mut counts = TagCounts::default();
+
+    for (key, _) in mapping {
+        let Some(tag_name) = key.as_str() else {
+            return Err(format!(
+                "metadata YAML `{context}` tag keys must be strings"
+            ));
+        };
+        count_tag(tag_name, &mut counts);
+    }
+
+    Ok(counts)
+}
+
+fn count_tag(tag_name: &str, counts: &mut TagCounts) {
+    if is_known_metadata_tag(tag_name) {
+        counts.standard += 1;
+    } else {
+        counts.unknown += 1;
+        if !counts.unknown_names.iter().any(|name| name == tag_name) {
+            counts.unknown_names.push(tag_name.to_string());
+        }
+    }
+}
+
+fn merge_tag_counts(counts: &mut TagCounts, next: TagCounts) {
+    counts.standard += next.standard;
+    counts.unknown += next.unknown;
+    for name in next.unknown_names {
+        if !counts
+            .unknown_names
+            .iter()
+            .any(|existing| existing == &name)
+        {
+            counts.unknown_names.push(name);
+        }
+    }
+}
+
+fn tag_warnings(context: &str, counts: &TagCounts) -> Vec<String> {
+    counts
+        .unknown_names
+        .iter()
+        .map(|name| format!("{context} tag `{name}` is not a known EXIF tag"))
+        .collect()
+}
+
+fn format_tag_counts(counts: &TagCounts) -> String {
+    let standard = format!(
+        "{} standard {}",
+        counts.standard,
+        pluralize(counts.standard, "tag", "tags")
+    );
+    let unknown = format!(
+        "{} unknown {}",
+        counts.unknown,
+        pluralize(counts.unknown, "tag", "tags")
+    );
+
+    if counts.unknown == 0 {
+        format!("{standard} + {unknown}")
+    } else {
+        format!("{standard} + {}", unknown.yellow())
+    }
+}
+
+fn pluralize(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 { singular } else { plural }
+}
+
+fn yaml_mapping_get<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a YamlValue> {
+    mapping.get(YamlValue::String(key.to_string()))
+}
+
+fn yaml_key_label(value: &YamlValue) -> String {
+    match value {
+        YamlValue::String(value) => value.clone(),
+        YamlValue::Number(value) => value.to_string(),
+        YamlValue::Bool(value) => value.to_string(),
+        _ => format!("{value:?}"),
+    }
+}
+
+fn supported_image_files_in_directory(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("failed to read directory {}: {error}", directory.display()))?;
+    let mut paths = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read directory entry in {}: {error}",
+                directory.display()
+            )
+        })?;
+        let path = entry.path();
+        if path.is_file() && is_supported_image_file(&path) {
+            paths.push(path);
+        }
+    }
+
+    paths.sort_by_key(|path| file_name(path).to_ascii_lowercase());
+    Ok(paths)
+}
+
+fn is_known_metadata_tag(tag_name: &str) -> bool {
+    tag_name.starts_with('$') && matches!(tag_name, "$Location")
+        || STANDARD_EXIF_TAG_NAMES.contains(&tag_name)
+}
+
+const STANDARD_EXIF_TAG_NAMES: &[&str] = &[
+    "Acceleration",
+    "ApertureValue",
+    "Artist",
+    "BitsPerSample",
+    "BodySerialNumber",
+    "BrightnessValue",
+    "CFAPattern",
+    "CameraElevationAngle",
+    "CameraOwnerName",
+    "ColorSpace",
+    "ComponentsConfiguration",
+    "CompressedBitsPerPixel",
+    "Compression",
+    "CompositeImage",
+    "Contrast",
+    "Copyright",
+    "CreateDate",
+    "CustomRendered",
+    "DateTime",
+    "DateTimeDigitized",
+    "DateTimeOriginal",
+    "DeviceSettingDescription",
+    "DigitalZoomRatio",
+    "ExifVersion",
+    "ExposureBiasValue",
+    "ExposureIndex",
+    "ExposureMode",
+    "ExposureProgram",
+    "ExposureTime",
+    "FNumber",
+    "FileSource",
+    "Flash",
+    "FlashEnergy",
+    "FlashpixVersion",
+    "FocalLength",
+    "FocalLengthIn35mmFilm",
+    "FocalPlaneResolutionUnit",
+    "FocalPlaneXResolution",
+    "FocalPlaneYResolution",
+    "GPSAltitude",
+    "GPSAltitudeRef",
+    "GPSAreaInformation",
+    "GPSDateStamp",
+    "GPSDestBearing",
+    "GPSDestBearingRef",
+    "GPSDestDistance",
+    "GPSDestDistanceRef",
+    "GPSDestLatitude",
+    "GPSDestLatitudeRef",
+    "GPSDestLongitude",
+    "GPSDestLongitudeRef",
+    "GPSDifferential",
+    "GPSDOP",
+    "GPSHPositioningError",
+    "GPSImgDirection",
+    "GPSImgDirectionRef",
+    "GPSInfoIFDPointer",
+    "GPSLatitude",
+    "GPSLatitudeRef",
+    "GPSLongitude",
+    "GPSLongitudeRef",
+    "GPSMapDatum",
+    "GPSMeasureMode",
+    "GPSProcessingMethod",
+    "GPSSatellites",
+    "GPSSpeed",
+    "GPSSpeedRef",
+    "GPSStatus",
+    "GPSTimeStamp",
+    "GPSTrack",
+    "GPSTrackRef",
+    "GPSVersionID",
+    "GainControl",
+    "Gamma",
+    "Humidity",
+    "ISO",
+    "ISOSpeed",
+    "ISOSpeedLatitudezzz",
+    "ISOSpeedLatitudeyyy",
+    "ISOSpeedRatings",
+    "ImageDescription",
+    "ImageHeight",
+    "ImageLength",
+    "ImageUniqueID",
+    "ImageWidth",
+    "InteropIFDPointer",
+    "InteroperabilityIndex",
+    "InteroperabilityVersion",
+    "JPEGInterchangeFormat",
+    "JPEGInterchangeFormatLength",
+    "LensMake",
+    "LensModel",
+    "LensSerialNumber",
+    "LensSpecification",
+    "LightSource",
+    "Make",
+    "MakerNote",
+    "MaxApertureValue",
+    "MeteringMode",
+    "Model",
+    "OECF",
+    "OffsetTime",
+    "OffsetTimeDigitized",
+    "OffsetTimeOriginal",
+    "Orientation",
+    "PhotographicSensitivity",
+    "PhotometricInterpretation",
+    "PixelXDimension",
+    "PixelYDimension",
+    "PlanarConfiguration",
+    "Pressure",
+    "PrimaryChromaticities",
+    "RecommendedExposureIndex",
+    "ReferenceBlackWhite",
+    "RelatedImageFileFormat",
+    "RelatedImageLength",
+    "RelatedImageWidth",
+    "RelatedSoundFile",
+    "ResolutionUnit",
+    "RowsPerStrip",
+    "SamplesPerPixel",
+    "Saturation",
+    "SceneCaptureType",
+    "SceneType",
+    "SensingMethod",
+    "Sharpness",
+    "ShutterSpeedValue",
+    "Software",
+    "SourceExposureTimesOfCompositeImage",
+    "SourceImageNumberOfCompositeImage",
+    "SpatialFrequencyResponse",
+    "SpectralSensitivity",
+    "StandardOutputSensitivity",
+    "StripByteCounts",
+    "StripOffsets",
+    "SubSecTime",
+    "SubSecTimeDigitized",
+    "SubSecTimeOriginal",
+    "SubjectArea",
+    "SubjectDistance",
+    "SubjectDistanceRange",
+    "SubjectLocation",
+    "Temperature",
+    "TileByteCounts",
+    "TileOffsets",
+    "TransferFunction",
+    "UserComment",
+    "WaterDepth",
+    "WhiteBalance",
+    "WhitePoint",
+    "XResolution",
+    "YCbCrCoefficients",
+    "YCbCrPositioning",
+    "YCbCrSubSampling",
+    "YResolution",
+];
+
 fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
     let mut details = Vec::new();
 
@@ -1603,6 +2085,152 @@ mod tests {
         .expect("dry-run init should succeed");
 
         assert!(!directory.join(METADATA_FILE_NAME).exists());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn resolve_metadata_path_prefers_yaml_over_yml() {
+        let directory = temporary_test_directory("validate-prefers-yaml");
+        let yaml = directory.join(METADATA_FILE_NAME);
+        let yml = directory.join(METADATA_YML_FILE_NAME);
+        std::fs::write(&yaml, "exif: {}").expect("yaml metadata should be written");
+        std::fs::write(&yml, "exif: {}").expect("yml metadata should be written");
+
+        let resolution =
+            resolve_metadata_path(Some(&directory)).expect("metadata path should resolve");
+
+        assert_eq!(resolution.path, yaml);
+        assert_eq!(resolution.warnings.len(), 1);
+        assert!(resolution.warnings[0].contains("metadata.yml"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn resolve_metadata_path_falls_back_to_yml() {
+        let directory = temporary_test_directory("validate-fallback-yml");
+        let yml = directory.join(METADATA_YML_FILE_NAME);
+        std::fs::write(&yml, "exif: {}").expect("yml metadata should be written");
+
+        let resolution =
+            resolve_metadata_path(Some(&directory)).expect("metadata path should resolve");
+
+        assert_eq!(resolution.path, yml);
+        assert!(resolution.warnings.is_empty());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn resolve_metadata_path_errors_when_missing() {
+        let directory = temporary_test_directory("validate-missing");
+
+        let result = resolve_metadata_path(Some(&directory));
+
+        assert!(matches!(result, Err(message) if message.contains("no metadata.yaml")));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_metadata_rejects_bad_structure() {
+        let yaml = serde_yaml::from_str::<YamlValue>("- not\n- a mapping")
+            .expect("test YAML should parse");
+
+        let result = validate_metadata_yaml(Path::new("metadata.yaml"), &yaml);
+
+        assert!(matches!(result, Err(message) if message.contains("root must be a mapping")));
+    }
+
+    #[test]
+    fn validate_metadata_counts_standard_and_unknown_exif_tags() {
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+exif:
+  Make: Nikon
+  ISOSpeedRatings: 400
+  CreateDate: 2026-05-22
+  NotARealExifTag: value
+"#,
+        )
+        .expect("test YAML should parse");
+
+        let report = validate_metadata_yaml(Path::new("metadata.yaml"), &yaml)
+            .expect("metadata should validate");
+
+        assert_eq!(report.exif_tags.standard, 3);
+        assert_eq!(report.exif_tags.unknown, 1);
+        assert_eq!(report.exif_tags.unknown_names, ["NotARealExifTag"]);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("NotARealExifTag"))
+        );
+    }
+
+    #[test]
+    fn validate_metadata_counts_frame_tags_and_location_special_key() {
+        let directory = temporary_test_directory("validate-frame-tags");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+frames:
+  1:
+    - ExposureTime: 1/500
+    - $Location: Betws-y-Coed
+    - NotARealExifTag: value
+"#,
+        )
+        .expect("test YAML should parse");
+        std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
+
+        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+
+        assert_eq!(report.frame_tags.standard, 2);
+        assert_eq!(report.frame_tags.unknown, 1);
+        assert_eq!(report.frame_tags.unknown_names, ["NotARealExifTag"]);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("$Location"))
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_metadata_warns_for_missing_frame_references() {
+        let directory = temporary_test_directory("validate-missing-frames");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+frames:
+  2:
+    - ExposureTime: 1/500
+  "missing.tif":
+    - FNumber: 2.8
+"#,
+        )
+        .expect("test YAML should parse");
+        std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
+
+        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("frame reference `2`"))
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("missing.tif"))
+        );
 
         let _ = std::fs::remove_dir_all(directory);
     }

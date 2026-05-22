@@ -23,7 +23,7 @@ pub enum Command {
     Init(InitArgs),
 
     #[command(about = "Check metadata.yaml is valid")]
-    Validate,
+    Validate(ValidateArgs),
 
     #[command(about = "Read and pretty-print the current EXIF data of an image file")]
     Inspect(InspectArgs),
@@ -39,6 +39,12 @@ pub enum Command {
 pub struct InitArgs {
     #[arg(value_name = "DIRECTORY", default_value = ".")]
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct ValidateArgs {
+    #[arg(value_name = "PATH")]
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -190,7 +196,30 @@ mod tests {
             .expect("global dry-run should parse after subcommands");
 
         assert!(cli.dry_run);
-        assert_eq!(cli.command, Command::Validate);
+        assert_eq!(cli.command, Command::Validate(ValidateArgs { path: None }));
+    }
+
+    #[test]
+    fn parses_validate_default_path() {
+        let cli = Cli::try_parse_from(["exifmeta", "validate"]).expect("validate should parse");
+
+        let Command::Validate(args) = cli.command else {
+            panic!("expected validate command");
+        };
+
+        assert_eq!(args.path, None);
+    }
+
+    #[test]
+    fn parses_validate_path() {
+        let cli = Cli::try_parse_from(["exifmeta", "validate", "some/metadata.yaml"])
+            .expect("validate path should parse");
+
+        let Command::Validate(args) = cli.command else {
+            panic!("expected validate command");
+        };
+
+        assert_eq!(args.path, Some(PathBuf::from("some/metadata.yaml")));
     }
 
     #[test]
