@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 
@@ -32,7 +33,7 @@ def convert(input_path: Path, output_path: Path) -> int:
     if output_path.exists():
         output_path.unlink()
 
-    with sqlite3.connect(output_path) as connection:
+    with closing(sqlite3.connect(output_path)) as connection:
         connection.execute("PRAGMA journal_mode = OFF")
         connection.execute("PRAGMA synchronous = OFF")
         create_schema(connection)
@@ -57,7 +58,9 @@ def create_schema(connection: sqlite3.Connection) -> None:
             name TEXT NOT NULL,
             country_code TEXT NOT NULL,
             latitude REAL NOT NULL,
-            longitude REAL NOT NULL
+            longitude REAL NOT NULL,
+            population INTEGER NOT NULL,
+            elevation INTEGER
         )
         """
     )
@@ -84,6 +87,8 @@ def import_rows(connection: sqlite3.Connection, input_path: Path) -> int:
                     fields[8],
                     parse_float(fields[4], "latitude", line_number),
                     parse_float(fields[5], "longitude", line_number),
+                    parse_int(fields[14], "population", line_number),
+                    parse_optional_int(fields[15], "elevation", line_number),
                 )
             )
 
@@ -107,8 +112,10 @@ def insert_records(connection: sqlite3.Connection, records: list[tuple]) -> None
             name,
             country_code,
             latitude,
-            longitude
-        ) VALUES (?, ?, ?, ?, ?)
+            longitude,
+            population,
+            elevation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         records,
     )
@@ -119,6 +126,13 @@ def parse_int(value: str, field: str, line_number: int) -> int:
         return int(value)
     except ValueError as error:
         raise ValueError(f"line {line_number}: invalid {field}: {error}") from error
+
+
+def parse_optional_int(value: str, field: str, line_number: int) -> int | None:
+    if value == "":
+        return None
+
+    return parse_int(value, field, line_number)
 
 
 def parse_float(value: str, field: str, line_number: int) -> float:
