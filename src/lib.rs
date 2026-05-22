@@ -9,7 +9,7 @@ use chrono::{DateTime, Local};
 use colored::Colorize;
 use exif::{Error as ExifError, Exif, Field, Reader, Tag, Value};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, DatabaseName, params_from_iter};
+use rusqlite::{Connection, DatabaseName, params, params_from_iter};
 use serde_yaml::{Mapping, Value as YamlValue};
 
 pub mod cli;
@@ -1134,6 +1134,8 @@ struct GeoLocation {
     latitude: f64,
     longitude: f64,
     population: i64,
+    #[allow(dead_code)]
+    elevation: Option<i64>,
     distance_km: f64,
 }
 
@@ -1186,6 +1188,36 @@ fn sort_locations_by_distance(locations: &mut [GeoLocation]) {
             .then(left.name.cmp(&right.name))
             .then(left.population.cmp(&right.population))
     });
+}
+
+fn locations_by_name(connection: &Connection, name: &str) -> Result<Vec<GeoLocation>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+        SELECT name, country_code, latitude, longitude, population, elevation
+        FROM locations
+        WHERE name = ?1 COLLATE NOCASE
+        ORDER BY population DESC, country_code ASC, name ASC
+        ",
+        )
+        .map_err(|error| format!("failed to prepare GeoNames location lookup: {error}"))?;
+
+    let rows = statement
+        .query_map(params![name], |row| {
+            Ok(GeoLocation {
+                name: row.get(0)?,
+                country_code: row.get(1)?,
+                latitude: row.get(2)?,
+                longitude: row.get(3)?,
+                population: row.get(4)?,
+                elevation: row.get(5)?,
+                distance_km: 0.0,
+            })
+        })
+        .map_err(|error| format!("failed to query GeoNames location lookup: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to read GeoNames location row: {error}"))
 }
 
 fn open_embedded_geonames_database() -> Result<Connection, String> {
@@ -1247,7 +1279,7 @@ fn candidate_locations(
     let sql = if wraps_date_line {
         format!(
             "
-        SELECT name, country_code, latitude, longitude, population
+        SELECT name, country_code, latitude, longitude, population, elevation
         FROM locations
         WHERE latitude BETWEEN ?1 AND ?2
           AND (longitude >= ?3 OR longitude <= ?4)
@@ -1258,7 +1290,7 @@ fn candidate_locations(
     } else {
         format!(
             "
-        SELECT name, country_code, latitude, longitude, population
+        SELECT name, country_code, latitude, longitude, population, elevation
         FROM locations
         WHERE latitude BETWEEN ?1 AND ?2
           AND longitude BETWEEN ?3 AND ?4
@@ -1288,6 +1320,7 @@ fn candidate_locations(
                 latitude: row.get(2)?,
                 longitude: row.get(3)?,
                 population: row.get(4)?,
+                elevation: row.get(5)?,
                 distance_km: 0.0,
             })
         })
@@ -1451,6 +1484,9 @@ fn validate_command(args: ValidateArgs) -> Result<(), String> {
     println!("YAML: ok");
     println!("exif: {}", format_tag_counts(&report.exif_tags));
     println!("frames: {}", format_tag_counts(&report.frame_tags));
+    for location_match in &report.location_matches {
+        println!("{}", location_match.green());
+    }
 
     let warnings = resolution
         .warnings
@@ -1458,7 +1494,7 @@ fn validate_command(args: ValidateArgs) -> Result<(), String> {
         .chain(report.warnings.iter())
         .collect::<Vec<_>>();
     for warning in warnings {
-        println!("{}: {warning}", "warning".yellow());
+        println!("{}", format_validate_warning(warning));
     }
 
     Ok(())
@@ -1479,6 +1515,20 @@ fn resolve_metadata_path(path: Option<&Path>) -> Result<MetadataPathResolution, 
         Some(path) => Err(format!("metadata path does not exist: {}", path.display())),
         None => resolve_metadata_path_in_directory(Path::new(".")),
     }
+}
+
+fn format_validate_warning(warning: &str) -> String {
+    let output = format!("warning: {warning}");
+
+    if is_location_lookup_warning(warning) {
+        output.red().to_string()
+    } else {
+        format!("{}: {warning}", "warning".yellow())
+    }
+}
+
+fn is_location_lookup_warning(warning: &str) -> bool {
+    warning.contains("frames $Location") && warning.contains("was not found in internal database")
 }
 
 fn resolve_metadata_path_in_directory(directory: &Path) -> Result<MetadataPathResolution, String> {
@@ -1518,6 +1568,7 @@ fn resolve_metadata_path_in_directory(directory: &Path) -> Result<MetadataPathRe
 struct ValidateReport {
     exif_tags: TagCounts,
     frame_tags: TagCounts,
+    location_matches: Vec<String>,
     warnings: Vec<String>,
 }
 
@@ -1550,6 +1601,9 @@ fn validate_metadata_yaml(
             .ok_or_else(|| "metadata YAML `frames` key must be a mapping".to_string())?;
         let frame_report = validate_frames_mapping(metadata_path, frames)?;
         report.frame_tags = frame_report.tags;
+        report
+            .location_matches
+            .extend(frame_report.location_matches);
         report.warnings.extend(frame_report.warnings);
     }
 
@@ -1565,6 +1619,7 @@ fn validate_metadata_yaml(
 
 struct FrameValidationReport {
     tags: TagCounts,
+    location_matches: Vec<String>,
     warnings: Vec<String>,
 }
 
@@ -1574,8 +1629,10 @@ fn validate_frames_mapping(
 ) -> Result<FrameValidationReport, String> {
     let image_directory = metadata_path.parent().unwrap_or_else(|| Path::new("."));
     let image_files = supported_image_files_in_directory(image_directory)?;
+    let geonames = open_embedded_geonames_database()?;
     let mut report = FrameValidationReport {
         tags: TagCounts::default(),
+        location_matches: Vec::new(),
         warnings: Vec::new(),
     };
 
@@ -1586,7 +1643,7 @@ fn validate_frames_mapping(
             &image_files,
             &mut report.warnings,
         );
-        collect_frame_tags(frame_value, &mut report.tags)?;
+        collect_frame_tags(frame_value, &geonames, &mut report)?;
     }
 
     Ok(report)
@@ -1626,10 +1683,14 @@ fn validate_frame_reference(
     }
 }
 
-fn collect_frame_tags(frame_value: &YamlValue, counts: &mut TagCounts) -> Result<(), String> {
+fn collect_frame_tags(
+    frame_value: &YamlValue,
+    geonames: &Connection,
+    report: &mut FrameValidationReport,
+) -> Result<(), String> {
     match frame_value {
         YamlValue::Mapping(mapping) => {
-            merge_tag_counts(counts, validate_tag_mapping(mapping, "frames")?);
+            collect_frame_tag_mapping(mapping, geonames, report)?;
             Ok(())
         }
         YamlValue::Sequence(items) => {
@@ -1642,11 +1703,75 @@ fn collect_frame_tags(frame_value: &YamlValue, counts: &mut TagCounts) -> Result
                         "metadata YAML frame sequence entries must contain one tag".to_string()
                     );
                 }
-                merge_tag_counts(counts, validate_tag_mapping(mapping, "frames")?);
+                collect_frame_tag_mapping(mapping, geonames, report)?;
             }
             Ok(())
         }
         _ => Err("metadata YAML frame values must be mappings or sequences".to_string()),
+    }
+}
+
+fn collect_frame_tag_mapping(
+    mapping: &Mapping,
+    geonames: &Connection,
+    report: &mut FrameValidationReport,
+) -> Result<(), String> {
+    merge_tag_counts(&mut report.tags, validate_tag_mapping(mapping, "frames")?);
+
+    for (key, value) in mapping {
+        if key.as_str() == Some("$Location") {
+            validate_location_value(value, geonames, report)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_location_value(
+    value: &YamlValue,
+    geonames: &Connection,
+    report: &mut FrameValidationReport,
+) -> Result<(), String> {
+    let Some(location_name) = location_name_from_yaml(value, &mut report.warnings) else {
+        return Ok(());
+    };
+
+    let locations = locations_by_name(geonames, location_name)?;
+    if let Some(location) = locations.first() {
+        report.location_matches.push(format!(
+            "$Location match found: {}, {} ({}, {})",
+            location.name,
+            location.country_code,
+            format_decimal_coordinate(location.latitude),
+            format_decimal_coordinate(location.longitude)
+        ));
+    } else {
+        report.warnings.push(format!(
+            "frames $Location `{location_name}` was not found in internal database"
+        ));
+    }
+
+    Ok(())
+}
+
+fn location_name_from_yaml<'a>(
+    value: &'a YamlValue,
+    warnings: &mut Vec<String>,
+) -> Option<&'a str> {
+    match value {
+        YamlValue::Null => None,
+        YamlValue::String(location_name) => {
+            let location_name = location_name.trim();
+            if location_name.is_empty() {
+                None
+            } else {
+                Some(location_name)
+            }
+        }
+        _ => {
+            warnings.push("frames $Location value must be a string".to_string());
+            None
+        }
     }
 }
 
@@ -2179,7 +2304,7 @@ exif:
 frames:
   1:
     - ExposureTime: 1/500
-    - $Location: Betws-y-Coed
+    - $Location: London
     - NotARealExifTag: value
 "#,
         )
@@ -2192,10 +2317,122 @@ frames:
         assert_eq!(report.frame_tags.unknown, 1);
         assert_eq!(report.frame_tags.unknown_names, ["NotARealExifTag"]);
         assert!(
+            report
+                .location_matches
+                .iter()
+                .any(|location_match| location_match.contains("$Location match found: London"))
+        );
+        assert!(
             !report
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("$Location"))
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_metadata_warns_when_location_is_not_found() {
+        let directory = temporary_test_directory("validate-missing-location");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+frames:
+  1:
+    - $Location: DefinitelyNotARealPlace
+"#,
+        )
+        .expect("test YAML should parse");
+        std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
+
+        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+
+        assert!(report.location_matches.is_empty());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("DefinitelyNotARealPlace"))
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn formats_missing_location_warning_in_red() {
+        colored::control::set_override(true);
+
+        let output = format_validate_warning(
+            "frames $Location `DefinitelyNotARealPlace` was not found in internal database",
+        );
+
+        colored::control::set_override(false);
+        assert!(output.starts_with("\u{1b}[31mwarning:"));
+    }
+
+    #[test]
+    fn formats_other_validate_warnings_with_yellow_label() {
+        colored::control::set_override(true);
+
+        let output = format_validate_warning("frame file `missing.tif` does not exist");
+
+        colored::control::set_override(false);
+        assert!(output.starts_with("\u{1b}[33mwarning\u{1b}[0m:"));
+    }
+
+    #[test]
+    fn validate_metadata_ignores_blank_and_null_locations() {
+        let directory = temporary_test_directory("validate-empty-locations");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+frames:
+  1:
+    - $Location:
+  2:
+    - $Location: " "
+"#,
+        )
+        .expect("test YAML should parse");
+        std::fs::write(directory.join("one.jpg"), []).expect("test image should be written");
+        std::fs::write(directory.join("two.jpg"), []).expect("test image should be written");
+
+        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+
+        assert!(report.location_matches.is_empty());
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("$Location"))
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_metadata_warns_when_location_value_is_not_a_string() {
+        let directory = temporary_test_directory("validate-invalid-location");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+frames:
+  1:
+    - $Location: [London]
+"#,
+        )
+        .expect("test YAML should parse");
+        std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
+
+        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+
+        assert!(report.location_matches.is_empty());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("$Location value must be a string"))
         );
 
         let _ = std::fs::remove_dir_all(directory);
@@ -2695,6 +2932,44 @@ frames:
     }
 
     #[test]
+    fn locations_by_name_matches_case_insensitively() {
+        let connection = test_geonames_connection();
+
+        let locations =
+            locations_by_name(&connection, "london").expect("location lookup should succeed");
+
+        assert_eq!(locations.len(), 2);
+        assert_eq!(locations[0].name, "London");
+        assert_eq!(locations[0].country_code, "GB");
+        assert_eq!(locations[0].latitude, 51.50853);
+        assert_eq!(locations[0].longitude, -0.12574);
+    }
+
+    #[test]
+    fn locations_by_name_sorts_matches_by_population_descending() {
+        let connection = test_geonames_connection();
+
+        let locations =
+            locations_by_name(&connection, "London").expect("location lookup should succeed");
+        let countries = locations
+            .iter()
+            .map(|location| location.country_code.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(countries, ["GB", "CA"]);
+    }
+
+    #[test]
+    fn locations_by_name_returns_empty_list_when_no_match_exists() {
+        let connection = test_geonames_connection();
+
+        let locations =
+            locations_by_name(&connection, "Nowhere").expect("location lookup should succeed");
+
+        assert!(locations.is_empty());
+    }
+
+    #[test]
     fn reads_jpeg_without_exif_as_empty_metadata() {
         colored::control::set_override(true);
 
@@ -2795,6 +3070,30 @@ frames:
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir(&path).expect("test directory should be created");
         path
+    }
+
+    fn test_geonames_connection() -> Connection {
+        let connection = Connection::open_in_memory().expect("test database should open");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE locations (
+                    geoname_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    country_code TEXT NOT NULL,
+                    latitude REAL NOT NULL,
+                    longitude REAL NOT NULL,
+                    population INTEGER NOT NULL,
+                    elevation INTEGER
+                );
+                INSERT INTO locations VALUES
+                    (1, 'London', 'GB', 51.50853, -0.12574, 8961989, 25),
+                    (2, 'London', 'CA', 42.98339, -81.23304, 383822, 251),
+                    (3, 'Paris', 'FR', 48.85341, 2.3488, 2138551, 42);
+                ",
+            )
+            .expect("test locations should be inserted");
+        connection
     }
 
     fn parse_raw_exif(entries: &[[u8; 12]]) -> Exif {
