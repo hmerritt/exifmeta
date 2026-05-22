@@ -20,7 +20,7 @@ pub enum Command {
     Run(RunArgs),
 
     #[command(about = "Create a template metadata.yaml file")]
-    Init,
+    Init(InitArgs),
 
     #[command(about = "Check metadata.yaml is valid")]
     Validate,
@@ -33,6 +33,12 @@ pub enum Command {
 
     #[command(about = "Remove all existing EXIF metadata from target image files")]
     Strip,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct InitArgs {
+    #[arg(value_name = "DIRECTORY", default_value = ".")]
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -90,6 +96,29 @@ mod tests {
         }
 
         assert!(Cli::try_parse_from(["exifmeta", "inspect", "image.jpg"]).is_ok());
+    }
+
+    #[test]
+    fn parses_init_default_path() {
+        let cli = Cli::try_parse_from(["exifmeta", "init"]).expect("init should parse");
+
+        let Command::Init(args) = cli.command else {
+            panic!("expected init command");
+        };
+
+        assert_eq!(args.path, PathBuf::from("."));
+    }
+
+    #[test]
+    fn parses_init_path() {
+        let cli = Cli::try_parse_from(["exifmeta", "init", "some/other/directory"])
+            .expect("init path should parse");
+
+        let Command::Init(args) = cli.command else {
+            panic!("expected init command");
+        };
+
+        assert_eq!(args.path, PathBuf::from("some/other/directory"));
     }
 
     #[test]

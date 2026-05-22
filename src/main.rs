@@ -7,8 +7,12 @@ fn main() -> ExitCode {
 
     match exifmeta::run(cli) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
+        Err(exifmeta::CliError::Error(error)) => {
             eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+        Err(exifmeta::CliError::Warning(warning)) => {
+            eprintln!("warning: {warning}");
             ExitCode::FAILURE
         }
     }

@@ -1,6 +1,11 @@
 # ───────────────────────────────────────────────
+# Metadata file for images in this directory. Used by exifmeta, https://github.com/hmerritt/exifmeta
+# ───────────────────────────────────────────────
+
+# ───────────────────────────────────────────────
 # Custom Properties
-# These values will not be written as EXIF, and are meant for personal organisational purposes — e.g. private metadata for your shoot
+# These values will not be written as EXIF, and are meant for personal organisational
+# purposes — e.g. private metadata for your shoot
 # ───────────────────────────────────────────────
 roll: 35
 date: 2026-04-28
@@ -8,17 +13,6 @@ date_end: 2026-04-29
 frame_count: 15
 notable_frames: [5, 9, 15]
 locations: [Wales]
-
-lenses:
-    - make: Zenza Bronica
-      model: Zenzanon 75mm f/2.8
-      focal_length: 75mm
-
-scans:
-    - lab: true
-      frames: []
-      scanner: Noritsu
-      resolution: 2796x2048
 
 # ───────────────────────────────────────────────
 # Global EXIF Properties
@@ -42,7 +36,6 @@ exif:
     # 3 = Digital Camera
     FileSource: 1
 
-    # AnalogueData
     # Film
     FilmRoll: 35
     FilmMaker: CineStill Kodak
@@ -61,14 +54,10 @@ exif:
     Artist: Harry Merritt
     Photographer: Harry Merritt
 
-    # Image Description (note: this gets applied to ALL images)
-    ImageDescription:
-    UserComment:
-
 # ───────────────────────────────────────────────
 # Per Frame/File EXIF Properties
-# Use this to set EXIF tags for individual files, like ExposureTime, FNumber, or GPS data.
-# Values set here will override the above `exif` values.
+# Use this to set EXIF tags for individual files, like ExposureTime, FNumber, or
+# GPS data. Values set here will override the above `exif` values.
 # ───────────────────────────────────────────────
 frames:
     # Frame number (first file when sorted alphabetically, useful when shooting film and files are in-order)
@@ -76,8 +65,9 @@ frames:
         - ImageDescription:
         - ExposureTime: 1/500
         - FNumber: 2.8
-        # Special key (`$` prefix) that will match city/town names to GPS long/lat values automatically,
-        # uses an embeded database, no internet requried.
+        # Special key (`$` prefix) that will match city/town names to GPS long/lat
+        # values automatically, and set EXIF acordingly. This uses an embeded locations
+        # database, no internet requried.
         - $Location: Betws-y-Coed
 
     # Filename (direct but more verbose)

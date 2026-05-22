@@ -1,6 +1,6 @@
 use std::collections::HashSet;
-use std::fs::{self, File, Metadata};
-use std::io::{BufReader, Read};
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::time::SystemTime;
@@ -14,23 +14,130 @@ use rusqlite::{Connection, DatabaseName, params_from_iter};
 pub mod cli;
 pub mod version;
 
-pub use cli::{Cli, Command, InspectArgs, InspectFormat, RunArgs};
+pub use cli::{Cli, Command, InitArgs, InspectArgs, InspectFormat, RunArgs};
 
 const GEONAMES_DATABASE: &[u8] = include_bytes!("../assets/geonames/cities1000.sqlite");
 const NEAREST_LOCATION_LIMIT: usize = 5;
 const NEAREST_CITY_MINIMUM_POPULATION: i64 = 200_000;
 const EARTH_RADIUS_KM: f64 = 6_371.0088;
+const METADATA_FILE_NAME: &str = "metadata.yaml";
+const METADATA_TEMPLATE: &str = r#"# ───────────────────────────────────────────────
+# Metadata file for images in this directory. Used by exifmeta, https://github.com/hmerritt/exifmeta
+# ───────────────────────────────────────────────
 
-pub fn run(cli: Cli) -> Result<(), String> {
+# ───────────────────────────────────────────────
+# Custom Properties
+# These values will not be written as EXIF, and are meant for personal organisational
+# purposes — e.g. private metadata for your shoot
+# ───────────────────────────────────────────────
+roll: 1
+date: <today>
+date_end: <today>
+frame_count: <image-count-in-directory>
+notable_frames: []
+locations: []
+
+# ───────────────────────────────────────────────
+# Global EXIF Properties
+# Any valid EXIF tag can be set here. These tags will be written to ALL images.
+# ───────────────────────────────────────────────
+exif:
+    # Camera & Lens
+    Make:
+    Model:
+    LensMake:
+    LensModel:
+    FocalLength:
+    MaxApertureValue:
+
+    # Film / Capture
+    ISOSpeedRatings:
+    DateTimeOriginal:
+    CreateDate:
+    # 1 = Film Scanner
+    # 2 = Reflection Print Scanner
+    # 3 = Digital Camera
+    FileSource: 1
+
+    # Film
+    FilmRoll:
+    FilmMaker:
+    FilmName:
+    FilmFormat:
+    FilmColor:
+    FilmNegative:
+    # Film Development
+    FilmDevelopProcess:
+    FilmDeveloper:
+    FilmProcessLab:
+    FilmProcessDate:
+    FilmScanner:
+
+    # Attribution
+    Artist:
+    Photographer:
+
+# ───────────────────────────────────────────────
+# Per Frame/File EXIF Properties
+# Use this to set EXIF tags for individual files, like ExposureTime, FNumber, or
+# GPS data. Values set here will override the above `exif` values.
+# ───────────────────────────────────────────────
+frames:
+    # Frame number (first file when sorted alphabetically, useful when shooting film and files are in-order)
+    1:
+        - ImageDescription:
+        - ExposureTime:
+        - FNumber:
+        # Special key (`$` prefix) that will match city/town names to GPS long/lat
+        # values automatically, and set EXIF acordingly. This uses an embeded locations
+        # database, no internet requried.
+        - $Location:
+
+    # Filename (direct but more verbose)
+    "image-file.tif":
+        - ExposureTime:
+        - FNumber:
+        # 0 = Unknown
+        # 1 = Average
+        # 2 = Center-weighted average
+        # 3 = Spot
+        # 4 = Multi-spot
+        # 5 = Multi-segment
+        # 6 = Partial
+        # 255 = Other
+        - MeteringMode: 2
+        # Manually setting  GPS, all of the following values must be set!
+        - GPSLatitude:
+        - GPSLatitudeRef:
+        - GPSLongitude:
+        - GPSLongitudeRef:
+        - GPSAltitude:
+        - GPSAltitudeRef: 0 # 0 = above sea level
+        - GPSMapDatum:
+"#;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliError {
+    Error(String),
+    Warning(String),
+}
+
+impl From<String> for CliError {
+    fn from(error: String) -> Self {
+        Self::Error(error)
+    }
+}
+
+pub fn run(cli: Cli) -> Result<(), CliError> {
     version::print_title();
 
     match cli.command {
-        Command::Run(args) => run_command(cli.dry_run, args),
-        Command::Init => stub_command(cli.dry_run, "init"),
-        Command::Validate => stub_command(cli.dry_run, "validate"),
-        Command::Inspect(args) => inspect_command(args),
-        Command::Interactive => stub_command(cli.dry_run, "interactive"),
-        Command::Strip => stub_command(cli.dry_run, "strip"),
+        Command::Run(args) => run_command(cli.dry_run, args).map_err(Into::into),
+        Command::Init(args) => init_command(cli.dry_run, args),
+        Command::Validate => stub_command(cli.dry_run, "validate").map_err(Into::into),
+        Command::Inspect(args) => inspect_command(args).map_err(Into::into),
+        Command::Interactive => stub_command(cli.dry_run, "interactive").map_err(Into::into),
+        Command::Strip => stub_command(cli.dry_run, "strip").map_err(Into::into),
     }
 }
 
@@ -1223,6 +1330,113 @@ fn format_distance(distance_km: f64) -> String {
     }
 }
 
+fn init_command(dry_run: bool, args: InitArgs) -> Result<(), CliError> {
+    let directory = args.path;
+
+    if !directory.exists() {
+        return Err(CliError::Error(format!(
+            "init path does not exist: {}",
+            directory.display()
+        )));
+    }
+
+    if !directory.is_dir() {
+        return Err(CliError::Error(format!(
+            "init path is not a directory: {}",
+            directory.display()
+        )));
+    }
+
+    let metadata_path = directory.join(METADATA_FILE_NAME);
+
+    if metadata_path.exists() {
+        return Err(CliError::Warning(format!(
+            "{} already exists: {}",
+            METADATA_FILE_NAME,
+            metadata_path.display()
+        )));
+    }
+
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let image_count = count_supported_images_in_directory(&directory)?;
+    let contents = render_metadata_template(&today, image_count);
+
+    if dry_run {
+        println!(
+            "init: would create {} (date={today}, frame_count={image_count})",
+            metadata_path.display()
+        );
+        return Ok(());
+    }
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&metadata_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                CliError::Warning(format!(
+                    "{} already exists: {}",
+                    METADATA_FILE_NAME,
+                    metadata_path.display()
+                ))
+            } else {
+                CliError::Error(format!(
+                    "failed to create {}: {error}",
+                    metadata_path.display()
+                ))
+            }
+        })?;
+
+    file.write_all(contents.as_bytes()).map_err(|error| {
+        CliError::Error(format!(
+            "failed to write {}: {error}",
+            metadata_path.display()
+        ))
+    })?;
+
+    println!("created {}", metadata_path.display());
+
+    Ok(())
+}
+
+fn render_metadata_template(today: &str, image_count: usize) -> String {
+    METADATA_TEMPLATE
+        .replace("<today>", today)
+        .replace("<image-count-in-directory>", &image_count.to_string())
+}
+
+fn count_supported_images_in_directory(directory: &Path) -> Result<usize, CliError> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        CliError::Error(format!(
+            "failed to read directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+
+    let mut count = 0;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            CliError::Error(format!(
+                "failed to read directory entry in {}: {error}",
+                directory.display()
+            ))
+        })?;
+        let path = entry.path();
+
+        if path.is_file() && is_supported_image_file(&path) {
+            count += 1;
+        }
+    }
+
+    Ok(count)
+}
+
+fn is_supported_image_file(path: &Path) -> bool {
+    detect_file_kind(path).file_type != "Unknown"
+}
+
 fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
     let mut details = Vec::new();
 
@@ -1270,6 +1484,128 @@ mod tests {
     use super::*;
 
     use exif::{Context, Tag};
+
+    #[test]
+    fn renders_metadata_template_values() {
+        let output = render_metadata_template("2026-05-22", 12);
+
+        assert!(output.contains("date: 2026-05-22"));
+        assert!(output.contains("date_end: 2026-05-22"));
+        assert!(output.contains("frame_count: 12"));
+        assert!(!output.contains("<today>"));
+        assert!(!output.contains("<image-count-in-directory>"));
+    }
+
+    #[test]
+    fn init_creates_metadata_file() {
+        let directory = temporary_test_directory("init-creates");
+
+        init_command(
+            false,
+            InitArgs {
+                path: directory.clone(),
+            },
+        )
+        .expect("init should create metadata file");
+
+        let output = std::fs::read_to_string(directory.join(METADATA_FILE_NAME))
+            .expect("metadata file should be readable");
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        assert!(output.contains(&format!("date: {today}")));
+        assert!(output.contains("frame_count: 0"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn init_creates_metadata_file_in_target_directory() {
+        let parent = temporary_test_directory("init-target-parent");
+        let directory = parent.join("nested");
+        std::fs::create_dir(&directory).expect("nested test directory should be created");
+
+        init_command(
+            false,
+            InitArgs {
+                path: directory.clone(),
+            },
+        )
+        .expect("init should create metadata file in target directory");
+
+        assert!(directory.join(METADATA_FILE_NAME).exists());
+        assert!(!parent.join(METADATA_FILE_NAME).exists());
+
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn init_refuses_to_overwrite_existing_metadata_file() {
+        let directory = temporary_test_directory("init-existing");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(&metadata, "existing").expect("metadata file should be written");
+
+        let result = init_command(
+            false,
+            InitArgs {
+                path: directory.clone(),
+            },
+        );
+
+        assert!(
+            matches!(result, Err(CliError::Warning(message)) if message.contains("metadata.yaml already exists"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&metadata).expect("metadata file should be readable"),
+            "existing"
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn init_counts_supported_images_non_recursively() {
+        let directory = temporary_test_directory("init-image-count");
+        let nested = directory.join("nested");
+        std::fs::create_dir(&nested).expect("nested test directory should be created");
+        for file_name in [
+            "a.JPG", "b.jpeg", "c.jxl", "d.heif", "e.hif", "f.heic", "g.avif", "h.png", "i.tiff",
+            "j.webp",
+        ] {
+            std::fs::write(directory.join(file_name), []).expect("test image should be written");
+        }
+        std::fs::write(directory.join("notes.txt"), []).expect("test text file should be written");
+        std::fs::write(nested.join("nested.jpg"), []).expect("nested image should be written");
+
+        init_command(
+            false,
+            InitArgs {
+                path: directory.clone(),
+            },
+        )
+        .expect("init should create metadata file");
+
+        let output = std::fs::read_to_string(directory.join(METADATA_FILE_NAME))
+            .expect("metadata file should be readable");
+        assert!(output.contains("frame_count: 10"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn init_dry_run_does_not_create_metadata_file() {
+        let directory = temporary_test_directory("init-dry-run");
+
+        init_command(
+            true,
+            InitArgs {
+                path: directory.clone(),
+            },
+        )
+        .expect("dry-run init should succeed");
+
+        assert!(!directory.join(METADATA_FILE_NAME).exists());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn formats_empty_pretty_inspect_output() {
@@ -1824,6 +2160,13 @@ mod tests {
 
     fn temporary_test_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("exifmeta-{}-{name}", std::process::id()))
+    }
+
+    fn temporary_test_directory(name: &str) -> std::path::PathBuf {
+        let path = temporary_test_path(name);
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).expect("test directory should be created");
+        path
     }
 
     fn parse_raw_exif(entries: &[[u8; 12]]) -> Exif {
