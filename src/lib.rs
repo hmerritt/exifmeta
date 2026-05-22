@@ -1543,19 +1543,31 @@ struct ValidateOutput {
     file_warnings: Vec<String>,
     file_errors: Vec<String>,
     exif: Option<TagStageReport>,
-    frames: Option<Vec<FrameReport>>,
+    frames: Option<FramesStageReport>,
 }
 
 impl ValidateOutput {
     fn error_count(&self) -> usize {
         self.file_errors.len()
+            + self.frames.as_ref().map_or(0, |frames| {
+                frames
+                    .frames
+                    .iter()
+                    .map(|frame| frame.errors.len())
+                    .sum::<usize>()
+            })
     }
 
     fn warning_count(&self) -> usize {
         self.file_warnings.len()
             + self.exif.as_ref().map_or(0, |report| report.warnings.len())
             + self.frames.as_ref().map_or(0, |frames| {
-                frames.iter().map(|frame| frame.warnings.len()).sum()
+                frames.warnings.len()
+                    + frames
+                        .frames
+                        .iter()
+                        .map(|frame| frame.warnings.len())
+                        .sum::<usize>()
             })
     }
 }
@@ -1564,6 +1576,14 @@ impl ValidateOutput {
 struct TagStageReport {
     tags: TagCounts,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FramesStageReport {
+    frame_number_count: usize,
+    file_count: usize,
+    warnings: Vec<String>,
+    frames: Vec<FrameReport>,
 }
 
 fn print_validate_output(output: &ValidateOutput) {
@@ -1629,22 +1649,36 @@ fn append_validate_frames_group(output: &mut String, report: &ValidateOutput) {
         return;
     };
 
-    if frames.is_empty() {
+    if frames.frames.is_empty() {
         output.push_str("skipped\n");
         return;
     }
 
-    for frame in frames {
+    if frames.frame_number_count > 0 {
+        output.push_str(&format!("frame numbers: {}\n", frames.frame_number_count));
+        output.push_str(&format!("files: {}\n", frames.file_count));
+        for warning in &frames.warnings {
+            output.push_str(&format!("{}\n", format_validate_warning(warning)));
+        }
+    }
+
+    for frame in &frames.frames {
         output.push_str(&format!(
             "{}\n",
             format!("frame {}", frame.key).bright_cyan()
         ));
         append_validate_tag_counts(output, &frame.tags);
+        if let Some(file) = &frame.file {
+            output.push_str(&format!("file: {}\n", file.display()));
+        }
         for location_match in &frame.location_matches {
-            output.push_str(&format!("{}\n", location_match.green()));
+            output.push_str(&format!("{}\n", format_location_match(location_match)));
         }
         for warning in &frame.warnings {
             output.push_str(&format!("{}\n", format_validate_warning(warning)));
+        }
+        for error in &frame.errors {
+            output.push_str(&format!("{}\n", format_validate_frame_error(error)));
         }
     }
 }
@@ -1657,10 +1691,16 @@ fn append_validate_overview_group(output: &mut String, report: &ValidateOutput) 
     output.push_str(&format!("errors      {errors}\n"));
     output.push_str(&format!("warnings    {warnings}\n"));
 
-    if errors == 0 {
-        output.push_str(&format!("validation: {}\n", "success".green()));
-    } else {
+    if errors > 0 {
         output.push_str(&format!("validation: {}\n", "error".red()));
+    } else if warnings > 0 {
+        output.push_str(&format!(
+            "validation: {} {}\n",
+            "success".green(),
+            "(with warnings)"
+        ));
+    } else {
+        output.push_str(&format!("validation: {}\n", "success".green()));
     }
 }
 
@@ -1678,8 +1718,27 @@ fn append_validate_tag_counts(output: &mut String, counts: &TagCounts) {
     output.push_str(&format!("unknown tags: {}\n", counts.unknown));
 }
 
+fn format_location_match(location_match: &LocationMatch) -> String {
+    format!(
+        "location: {} [{}, {} ({}, {})]",
+        "match found".green(),
+        location_match.name,
+        location_match.country_code,
+        format_decimal_coordinate(location_match.latitude),
+        format_decimal_coordinate(location_match.longitude)
+    )
+}
+
 fn format_validate_error(error: &str) -> String {
     format!("error: {error}").red().to_string()
+}
+
+fn format_validate_frame_error(error: &str) -> String {
+    if is_missing_frame_file_error(error) {
+        format!("file: {}", "does not exist".red())
+    } else {
+        format_validate_error(error)
+    }
 }
 
 struct MetadataPathResolution {
@@ -1710,7 +1769,11 @@ fn format_validate_warning(warning: &str) -> String {
 }
 
 fn is_location_lookup_warning(warning: &str) -> bool {
-    warning.contains("frames $Location") && warning.contains("was not found in internal database")
+    warning.contains("$Location: no match found in database")
+}
+
+fn is_missing_frame_file_error(error: &str) -> bool {
+    error == "file: does not exist"
 }
 
 fn resolve_metadata_path_in_directory(directory: &Path) -> Result<MetadataPathResolution, String> {
@@ -1751,8 +1814,8 @@ struct ValidateReport {
     exif_tags: TagCounts,
     exif_warnings: Vec<String>,
     frame_tags: TagCounts,
-    location_matches: Vec<String>,
-    frames: Vec<FrameReport>,
+    location_matches: Vec<LocationMatch>,
+    frames: FramesStageReport,
     warnings: Vec<String>,
 }
 
@@ -1799,15 +1862,28 @@ fn validate_metadata_yaml(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct FrameReport {
     key: String,
+    is_numeric: bool,
+    file: Option<PathBuf>,
     tags: TagCounts,
-    location_matches: Vec<String>,
+    location_matches: Vec<LocationMatch>,
     warnings: Vec<String>,
+    errors: Vec<String>,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+struct LocationMatch {
+    name: String,
+    country_code: String,
+    latitude: f64,
+    longitude: f64,
+}
+
+impl Eq for LocationMatch {}
 
 struct FrameValidationReport {
     tags: TagCounts,
-    location_matches: Vec<String>,
-    frames: Vec<FrameReport>,
+    location_matches: Vec<LocationMatch>,
+    frames: FramesStageReport,
     warnings: Vec<String>,
 }
 
@@ -1818,16 +1894,29 @@ fn validate_frames_mapping(
     let image_directory = metadata_path.parent().unwrap_or_else(|| Path::new("."));
     let image_files = supported_image_files_in_directory(image_directory)?;
     let geonames = open_embedded_geonames_database()?;
+    let frame_number_count = frames
+        .keys()
+        .filter(|key| frame_number_from_key(key).is_some())
+        .count();
+    let file_count = image_files.len();
     let mut report = FrameValidationReport {
         tags: TagCounts::default(),
         location_matches: Vec::new(),
-        frames: Vec::new(),
+        frames: FramesStageReport {
+            frame_number_count,
+            file_count,
+            warnings: frame_summary_warnings(frame_number_count, file_count),
+            frames: Vec::new(),
+        },
         warnings: Vec::new(),
     };
 
     for (frame_key, frame_value) in frames {
+        let frame_number = frame_number_from_key(frame_key);
         let mut frame_report = FrameReport {
             key: yaml_key_label(frame_key),
+            is_numeric: frame_number.is_some(),
+            file: frame_number.and_then(|number| resolved_frame_file(number, &image_files)),
             ..FrameReport::default()
         };
         validate_frame_reference(
@@ -1835,6 +1924,7 @@ fn validate_frames_mapping(
             image_directory,
             &image_files,
             &mut frame_report.warnings,
+            &mut frame_report.errors,
         );
         collect_frame_tags(frame_value, &geonames, &mut frame_report)?;
         frame_report
@@ -1845,10 +1935,36 @@ fn validate_frames_mapping(
             .location_matches
             .extend(frame_report.location_matches.clone());
         report.warnings.extend(frame_report.warnings.clone());
-        report.frames.push(frame_report);
+        report.frames.frames.push(frame_report);
     }
 
     Ok(report)
+}
+
+fn frame_summary_warnings(frame_number_count: usize, file_count: usize) -> Vec<String> {
+    if frame_number_count == 0 {
+        return Vec::new();
+    }
+
+    if frame_number_count > file_count {
+        vec![format!(
+            "there are more frame numbers ({frame_number_count}) than image files ({file_count})"
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+fn frame_number_from_key(frame_key: &YamlValue) -> Option<usize> {
+    let YamlValue::Number(number) = frame_key else {
+        return None;
+    };
+    let number = number.as_i64()?;
+    usize::try_from(number).ok().filter(|number| *number > 0)
+}
+
+fn resolved_frame_file(frame_number: usize, image_files: &[PathBuf]) -> Option<PathBuf> {
+    image_files.get(frame_number.checked_sub(1)?).cloned()
 }
 
 fn validate_frame_reference(
@@ -1856,6 +1972,7 @@ fn validate_frame_reference(
     image_directory: &Path,
     image_files: &[PathBuf],
     warnings: &mut Vec<String>,
+    errors: &mut Vec<String>,
 ) {
     match frame_key {
         YamlValue::Number(number) => {
@@ -1875,7 +1992,7 @@ fn validate_frame_reference(
         }
         YamlValue::String(file_name) => {
             if !image_directory.join(file_name).is_file() {
-                warnings.push(format!("frame file `{file_name}` does not exist"));
+                errors.push("file: does not exist".to_string());
             }
         }
         _ => warnings.push(format!(
@@ -1940,16 +2057,15 @@ fn validate_location_value(
 
     let locations = locations_by_name(geonames, location_name)?;
     if let Some(location) = locations.first() {
-        report.location_matches.push(format!(
-            "$Location match found: {}, {} ({}, {})",
-            location.name,
-            location.country_code,
-            format_decimal_coordinate(location.latitude),
-            format_decimal_coordinate(location.longitude)
-        ));
+        report.location_matches.push(LocationMatch {
+            name: location.name.clone(),
+            country_code: location.country_code.clone(),
+            latitude: location.latitude,
+            longitude: location.longitude,
+        });
     } else {
         report.warnings.push(format!(
-            "frames $Location `{location_name}` was not found in internal database"
+            "$Location: no match found in database [for <{location_name}>]"
         ));
     }
 
@@ -2021,7 +2137,7 @@ fn tag_warnings(context: &str, counts: &TagCounts) -> Vec<String> {
     counts
         .unknown_names
         .iter()
-        .map(|name| format!("{context} tag `{name}` is not a known EXIF tag"))
+        .map(|name| format!("{context} tag is non-standard `{name}`"))
         .collect()
 }
 
@@ -2470,7 +2586,7 @@ exif:
             report
                 .exif_warnings
                 .iter()
-                .any(|warning| warning.contains("NotARealExifTag"))
+                .any(|warning| warning == "exif tag is non-standard `NotARealExifTag`")
         );
     }
 
@@ -2499,7 +2615,7 @@ frames:
             report
                 .location_matches
                 .iter()
-                .any(|location_match| location_match.contains("$Location match found: London"))
+                .any(|location_match| location_match.name == "London")
         );
         assert!(
             !report
@@ -2543,17 +2659,26 @@ frames:
         colored::control::set_override(true);
 
         let output = format_validate_warning(
-            "frames $Location `DefinitelyNotARealPlace` was not found in internal database",
+            "$Location: no match found in database [for <DefinitelyNotARealPlace>]",
         );
 
         assert!(output.starts_with("\u{1b}[31mwarning:"));
     }
 
     #[test]
+    fn formats_missing_frame_file_error_without_error_label() {
+        colored::control::set_override(true);
+
+        let output = format_validate_frame_error("file: does not exist");
+
+        assert_eq!(output, "file: \u{1b}[31mdoes not exist\u{1b}[0m");
+    }
+
+    #[test]
     fn formats_other_validate_warnings_with_yellow_label() {
         colored::control::set_override(true);
 
-        let output = format_validate_warning("frame file `missing.tif` does not exist");
+        let output = format_validate_warning("ignored metadata.yml");
 
         assert!(output.starts_with("\u{1b}[33mwarning\u{1b}[0m:"));
     }
@@ -2640,11 +2765,17 @@ frames:
                 .any(|warning| warning.contains("frame reference `2`"))
         );
         assert!(
-            report
+            !report
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("missing.tif"))
+                .any(|warning| warning == "file: does not exist")
         );
+        assert!(report.frames.frames.iter().any(|frame| {
+            frame
+                .errors
+                .iter()
+                .any(|error| error == "file: does not exist")
+        }));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -2688,6 +2819,85 @@ frames:
     }
 
     #[test]
+    fn validate_overview_renders_success_without_warnings() {
+        let rendered = strip_ansi_codes(&format_validate_output(&ValidateOutput::default()));
+
+        assert!(rendered.contains("errors      0"));
+        assert!(rendered.contains("warnings    0"));
+        assert!(rendered.contains("validation: success"));
+        assert!(!rendered.contains("(with warnings)"));
+    }
+
+    #[test]
+    fn validate_overview_renders_success_with_warnings() {
+        let output = ValidateOutput {
+            file_warnings: vec!["metadata.yml ignored because metadata.yaml exists".to_string()],
+            ..ValidateOutput::default()
+        };
+        let rendered = strip_ansi_codes(&format_validate_output(&output));
+
+        assert!(rendered.contains("errors      0"));
+        assert!(rendered.contains("warnings    1"));
+        assert!(rendered.contains("validation: success (with warnings)"));
+    }
+
+    #[test]
+    fn validate_overview_renders_error_when_errors_exist() {
+        let output = ValidateOutput {
+            file_errors: vec!["failed to parse metadata.yaml".to_string()],
+            file_warnings: vec!["metadata.yml ignored because metadata.yaml exists".to_string()],
+            ..ValidateOutput::default()
+        };
+        let rendered = strip_ansi_codes(&format_validate_output(&output));
+
+        assert!(rendered.contains("errors      1"));
+        assert!(rendered.contains("warnings    1"));
+        assert!(rendered.contains("validation: error"));
+        assert!(!rendered.contains("validation: success"));
+    }
+
+    #[test]
+    fn validate_overview_counts_missing_frame_file_as_error() {
+        let directory = temporary_test_directory("validate-missing-frame-file-error");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(
+            &metadata,
+            r#"
+frames:
+  "missing.tif":
+    - FNumber: 2.8
+"#,
+        )
+        .expect("metadata should be written");
+        std::fs::write(directory.join("image.jpg"), []).expect("image should be written");
+
+        let output = build_validate_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_validate_output(&output));
+
+        assert!(rendered.contains("errors      1"));
+        assert!(rendered.contains("warnings    0"));
+        assert!(rendered.contains("file: does not exist"));
+        assert!(rendered.contains("validation: error"));
+        assert!(!rendered.contains("warning: file: does not exist"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_overview_colours_success_with_warnings() {
+        colored::control::set_override(true);
+
+        let output = ValidateOutput {
+            file_warnings: vec!["metadata.yml ignored because metadata.yaml exists".to_string()],
+            ..ValidateOutput::default()
+        };
+        let rendered = format_validate_output(&output);
+
+        assert!(rendered.contains("validation: \u{1b}[32msuccess\u{1b}[0m"));
+        assert!(rendered.contains("\u{1b}[32msuccess\u{1b}[0m (with warnings)"));
+    }
+
+    #[test]
     fn validate_output_renders_frame_blocks_in_yaml_order() {
         let directory = temporary_test_directory("validate-frame-order");
         let metadata = directory.join(METADATA_FILE_NAME);
@@ -2713,6 +2923,129 @@ frames:
             .expect("frame image.jpg should render");
 
         assert!(frame_two < frame_image);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_output_prints_numeric_frame_summary_and_resolved_file() {
+        let directory = temporary_test_directory("validate-numeric-frame-file");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(
+            &metadata,
+            r#"
+frames:
+  1:
+    - FNumber: 2.8
+"#,
+        )
+        .expect("metadata should be written");
+        let first = directory.join("01.jpg");
+        std::fs::write(&first, []).expect("first image should be written");
+
+        let output = build_validate_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_validate_output(&output));
+
+        assert!(rendered.contains("frame numbers: 1"));
+        assert!(rendered.contains("files: 1"));
+        let frame = rendered.find("frame 1").expect("frame should render");
+        let standard_tags = rendered[frame..]
+            .find("standard tags:")
+            .map(|index| frame + index)
+            .expect("standard tags should render");
+        let unknown_tags = rendered[frame..]
+            .find("unknown tags:")
+            .map(|index| frame + index)
+            .expect("unknown tags should render");
+        let file = rendered[frame..]
+            .find(&format!("file: {}", first.display()))
+            .map(|index| frame + index)
+            .expect("resolved frame file should render");
+
+        assert!(frame < standard_tags);
+        assert!(standard_tags < unknown_tags);
+        assert!(unknown_tags < file);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_output_warns_when_numeric_frames_exceed_files() {
+        let directory = temporary_test_directory("validate-more-frame-numbers");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(
+            &metadata,
+            r#"
+frames:
+  1:
+    - FNumber: 2.8
+  2:
+    - ExposureTime: 1/500
+"#,
+        )
+        .expect("metadata should be written");
+        std::fs::write(directory.join("01.jpg"), []).expect("image should be written");
+
+        let output = build_validate_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_validate_output(&output));
+
+        assert!(rendered.contains("frame numbers: 2"));
+        assert!(rendered.contains("files: 1"));
+        assert!(
+            rendered.contains("warning: there are more frame numbers (2) than image files (1)")
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_output_does_not_warn_when_files_exceed_numeric_frames() {
+        let directory = temporary_test_directory("validate-more-files");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(
+            &metadata,
+            r#"
+frames:
+  1:
+    - FNumber: 2.8
+"#,
+        )
+        .expect("metadata should be written");
+        std::fs::write(directory.join("01.jpg"), []).expect("first image should be written");
+        std::fs::write(directory.join("02.jpg"), []).expect("second image should be written");
+
+        let output = build_validate_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_validate_output(&output));
+
+        assert!(rendered.contains("frame numbers: 1"));
+        assert!(rendered.contains("files: 2"));
+        assert!(!rendered.contains("warning: supported image files"));
+        assert!(!rendered.contains("warning: there are more frame numbers"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_output_omits_numeric_summary_for_filename_frames() {
+        let directory = temporary_test_directory("validate-filename-only");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(
+            &metadata,
+            r#"
+frames:
+  "image.jpg":
+    - FNumber: 2.8
+"#,
+        )
+        .expect("metadata should be written");
+        std::fs::write(directory.join("image.jpg"), []).expect("image should be written");
+
+        let output = build_validate_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_validate_output(&output));
+
+        assert!(!rendered.contains("frame numbers:"));
+        assert!(!rendered.contains("files:"));
+        assert!(!rendered.contains("\nfile: "));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -2758,7 +3091,7 @@ frames:
         assert!(rendered.contains("\u{1b}[94mfile "));
         assert!(rendered.contains("\u{1b}[32mfound "));
         assert!(rendered.contains("\u{1b}[96mframe image.jpg"));
-        assert!(rendered.contains("\u{1b}[32m$Location match found: London"));
+        assert!(rendered.contains("location: \u{1b}[32mmatch found\u{1b}[0m [London"));
 
         let _ = std::fs::remove_dir_all(directory);
     }
