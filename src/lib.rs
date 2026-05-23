@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -8,6 +8,9 @@ use std::time::SystemTime;
 use chrono::{DateTime, Local};
 use colored::Colorize;
 use exif::{Error as ExifError, Exif, Field, Reader, Tag, Value};
+use little_exif::exif_tag::ExifTag as WritableExifTag;
+use little_exif::metadata::Metadata as WritableMetadata;
+use little_exif::rational::uR64;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, DatabaseName, params, params_from_iter};
 use serde_yaml::{Mapping, Value as YamlValue};
@@ -1891,7 +1894,7 @@ fn validate_frames_mapping(
     metadata_path: &Path,
     frames: &Mapping,
 ) -> Result<FrameValidationReport, String> {
-    let image_directory = metadata_path.parent().unwrap_or_else(|| Path::new("."));
+    let image_directory = path_parent_or_current(metadata_path);
     let image_files = supported_image_files_in_directory(image_directory)?;
     let geonames = open_embedded_geonames_database()?;
     let frame_number_count = frames
@@ -2340,35 +2343,747 @@ const STANDARD_EXIF_TAG_NAMES: &[&str] = &[
 ];
 
 fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
-    let mut details = Vec::new();
-
-    if dry_run {
-        details.push("dry-run".to_string());
+    let request = RunRequest::from_args(&args);
+    let resolution = resolve_metadata_path(request.metadata.as_deref())?;
+    for warning in &resolution.warnings {
+        println!("{}", format_validate_warning(warning));
     }
 
-    if args.strip {
-        details.push("strip".to_string());
+    let metadata_dir = path_parent_or_current(&resolution.path);
+    let targets = resolve_run_targets(
+        metadata_dir,
+        request.targets.as_deref(),
+        args.recursive,
+        &args.extensions,
+    )?;
+
+    if targets.is_empty() {
+        return Err("no target images matched".to_string());
     }
 
-    if args.no_overwrite {
-        details.push("no-overwrite".to_string());
+    let contents = fs::read_to_string(&resolution.path)
+        .map_err(|error| format!("failed to read {}: {error}", resolution.path.display()))?;
+    let yaml = serde_yaml::from_str::<YamlValue>(&contents)
+        .map_err(|error| format!("failed to parse {}: {error}", resolution.path.display()))?;
+    validate_metadata_yaml(&resolution.path, &yaml)?;
+
+    let plan = build_run_plan(&resolution.path, &yaml, &targets)?;
+    let mut summary = RunSummary::default();
+
+    println!(
+        "run: metadata={} targets={}{}",
+        resolution.path.display(),
+        targets.len(),
+        if dry_run { " dry-run" } else { "" }
+    );
+
+    for image in targets {
+        let Some(tags) = plan.tags_for_image(&image) else {
+            summary.skipped_files += 1;
+            println!("skip {} (no metadata)", image.display());
+            continue;
+        };
+
+        let result = apply_tags_to_image(&image, &tags, dry_run, &args);
+        summary.add(&result);
+        print_run_file_result(&image, &result);
     }
 
-    if args.recursive {
-        details.push("recursive".to_string());
-    }
+    println!(
+        "run: wrote={} skipped_tags={} skipped_files={} warnings={} errors={}",
+        summary.written_tags,
+        summary.skipped_tags,
+        summary.skipped_files,
+        summary.warnings,
+        summary.errors
+    );
 
-    if !args.extensions.is_empty() {
-        details.push(format!("extensions={}", args.extensions.join(",")));
-    }
-
-    if details.is_empty() {
-        println!("run: not implemented yet");
+    if summary.errors > 0 {
+        Err("one or more target images failed".to_string())
     } else {
-        println!("run: not implemented yet ({})", details.join(", "));
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct RunRequest {
+    metadata: Option<PathBuf>,
+    targets: Option<String>,
+}
+
+impl RunRequest {
+    fn from_args(args: &RunArgs) -> Self {
+        match (&args.metadata_or_targets, &args.targets) {
+            (Some(metadata), Some(targets)) => Self {
+                metadata: Some(metadata.clone()),
+                targets: Some(targets.clone()),
+            },
+            (Some(single), None) if looks_like_metadata_path(single) => Self {
+                metadata: Some(single.clone()),
+                targets: None,
+            },
+            (Some(single), None) => Self {
+                metadata: None,
+                targets: Some(path_to_pattern(single)),
+            },
+            (None, Some(targets)) => Self {
+                metadata: None,
+                targets: Some(targets.clone()),
+            },
+            (None, None) => Self::default(),
+        }
+    }
+}
+
+fn looks_like_metadata_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some(extension) if extension.eq_ignore_ascii_case("yaml") || extension.eq_ignore_ascii_case("yml")
+    ) || path.is_dir()
+}
+
+fn path_to_pattern(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn path_parent_or_current(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn resolve_run_targets(
+    metadata_dir: &Path,
+    target_pattern: Option<&str>,
+    recursive: bool,
+    extensions: &[String],
+) -> Result<Vec<PathBuf>, String> {
+    let allowed_extensions = normalized_extensions(extensions);
+    let mut targets = if let Some(pattern) = target_pattern {
+        resolve_explicit_targets(metadata_dir, pattern)?
+    } else {
+        supported_image_files(metadata_dir, recursive)?
+    };
+
+    targets.retain(|path| {
+        is_supported_image_file(path)
+            && (allowed_extensions.is_empty()
+                || file_extension(path)
+                    .is_some_and(|extension| allowed_extensions.contains(&extension)))
+    });
+    targets.sort_by_key(|path| path_to_pattern(path));
+    targets.dedup();
+    Ok(targets)
+}
+
+fn normalized_extensions(extensions: &[String]) -> HashSet<String> {
+    extensions
+        .iter()
+        .filter_map(|extension| {
+            let normalized = extension
+                .trim()
+                .trim_start_matches('.')
+                .to_ascii_lowercase();
+            (!normalized.is_empty()).then_some(normalized)
+        })
+        .collect()
+}
+
+fn resolve_explicit_targets(metadata_dir: &Path, pattern: &str) -> Result<Vec<PathBuf>, String> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let candidate = PathBuf::from(pattern);
+    let absolute_candidate = if candidate.is_absolute() {
+        candidate.clone()
+    } else {
+        metadata_dir.join(&candidate)
+    };
+
+    if !contains_glob(pattern) {
+        if absolute_candidate.is_dir() {
+            return supported_image_files(&absolute_candidate, false);
+        }
+        return Ok(absolute_candidate
+            .is_file()
+            .then_some(absolute_candidate)
+            .into_iter()
+            .collect());
+    }
+
+    let recursive = pattern.split(['/', '\\']).any(|part| part == "**");
+    let candidates = supported_image_files(metadata_dir, recursive)?;
+    let normalized_pattern = pattern.replace('\\', "/");
+
+    Ok(candidates
+        .into_iter()
+        .filter(|path| {
+            let subject = if Path::new(pattern).is_absolute() {
+                path_to_pattern(path)
+            } else {
+                path.strip_prefix(metadata_dir)
+                    .map(path_to_pattern)
+                    .unwrap_or_else(|_| path_to_pattern(path))
+            };
+            glob_matches(&normalized_pattern, &subject)
+        })
+        .collect())
+}
+
+fn contains_glob(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
+}
+
+fn supported_image_files(directory: &Path, recursive: bool) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    collect_supported_image_files(directory, recursive, &mut paths)?;
+    paths.sort_by_key(|path| file_name(path).to_ascii_lowercase());
+    Ok(paths)
+}
+
+fn collect_supported_image_files(
+    directory: &Path,
+    recursive: bool,
+    paths: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("failed to read directory {}: {error}", directory.display()))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read directory entry in {}: {error}",
+                directory.display()
+            )
+        })?;
+        let path = entry.path();
+        if path.is_file() && is_supported_image_file(&path) {
+            paths.push(path);
+        } else if recursive && path.is_dir() {
+            collect_supported_image_files(&path, recursive, paths)?;
+        }
     }
 
     Ok(())
+}
+
+fn glob_matches(pattern: &str, subject: &str) -> bool {
+    let pattern_parts = pattern.split('/').collect::<Vec<_>>();
+    let subject_parts = subject.split('/').collect::<Vec<_>>();
+    glob_parts_match(&pattern_parts, &subject_parts)
+}
+
+fn glob_parts_match(pattern: &[&str], subject: &[&str]) -> bool {
+    if pattern.is_empty() {
+        return subject.is_empty();
+    }
+
+    if pattern[0] == "**" {
+        return glob_parts_match(&pattern[1..], subject)
+            || (!subject.is_empty() && glob_parts_match(pattern, &subject[1..]));
+    }
+
+    !subject.is_empty()
+        && wildcard_match(pattern[0].as_bytes(), subject[0].as_bytes())
+        && glob_parts_match(&pattern[1..], &subject[1..])
+}
+
+fn wildcard_match(pattern: &[u8], subject: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return subject.is_empty();
+    }
+
+    match pattern[0] {
+        b'*' => {
+            wildcard_match(&pattern[1..], subject)
+                || (!subject.is_empty() && wildcard_match(pattern, &subject[1..]))
+        }
+        b'?' => !subject.is_empty() && wildcard_match(&pattern[1..], &subject[1..]),
+        byte => {
+            !subject.is_empty()
+                && byte.eq_ignore_ascii_case(&subject[0])
+                && wildcard_match(&pattern[1..], &subject[1..])
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RunTag {
+    name: String,
+    value: YamlValue,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RunPlan {
+    global: Vec<RunTag>,
+    frames: BTreeMap<PathBuf, Vec<RunTag>>,
+}
+
+impl RunPlan {
+    fn tags_for_image(&self, image: &Path) -> Option<Vec<RunTag>> {
+        let frame_tags = self.frames.get(image);
+        if self.global.is_empty() && frame_tags.is_none_or(Vec::is_empty) {
+            return None;
+        }
+
+        let mut merged = self.global.clone();
+        if let Some(frame_tags) = frame_tags {
+            for tag in frame_tags {
+                if let Some(existing) = merged.iter_mut().find(|existing| existing.name == tag.name)
+                {
+                    *existing = tag.clone();
+                } else {
+                    merged.push(tag.clone());
+                }
+            }
+        }
+        Some(merged)
+    }
+}
+
+fn build_run_plan(
+    metadata_path: &Path,
+    yaml: &YamlValue,
+    targets: &[PathBuf],
+) -> Result<RunPlan, String> {
+    let root = yaml
+        .as_mapping()
+        .ok_or_else(|| "metadata YAML root must be a mapping".to_string())?;
+    let mut plan = RunPlan::default();
+
+    if let Some(exif) = yaml_mapping_get(root, "exif") {
+        plan.global = collect_run_tags_from_mapping(
+            exif.as_mapping()
+                .ok_or_else(|| "metadata YAML `exif` key must be a mapping".to_string())?,
+        )?;
+    }
+
+    if let Some(frames) = yaml_mapping_get(root, "frames") {
+        let frames = frames
+            .as_mapping()
+            .ok_or_else(|| "metadata YAML `frames` key must be a mapping".to_string())?;
+        let image_directory = path_parent_or_current(metadata_path);
+        for (frame_key, frame_value) in frames {
+            let Some(image) = resolve_run_frame_target(frame_key, image_directory, targets) else {
+                continue;
+            };
+            plan.frames
+                .insert(image, collect_run_tags_from_frame_value(frame_value)?);
+        }
+    }
+
+    Ok(plan)
+}
+
+fn resolve_run_frame_target(
+    frame_key: &YamlValue,
+    image_directory: &Path,
+    targets: &[PathBuf],
+) -> Option<PathBuf> {
+    if let Some(frame_number) = frame_number_from_key(frame_key) {
+        return targets.get(frame_number.checked_sub(1)?).cloned();
+    }
+
+    let file_name = frame_key.as_str()?;
+    let absolute = image_directory.join(file_name);
+    targets.iter().find(|target| **target == absolute).cloned()
+}
+
+fn collect_run_tags_from_frame_value(value: &YamlValue) -> Result<Vec<RunTag>, String> {
+    match value {
+        YamlValue::Mapping(mapping) => collect_run_tags_from_mapping(mapping),
+        YamlValue::Sequence(items) => {
+            let mut tags = Vec::new();
+            for item in items {
+                let mapping = item
+                    .as_mapping()
+                    .ok_or_else(|| "metadata YAML frame entries must be mappings".to_string())?;
+                if mapping.len() != 1 {
+                    return Err(
+                        "metadata YAML frame sequence entries must contain one tag".to_string()
+                    );
+                }
+                tags.extend(collect_run_tags_from_mapping(mapping)?);
+            }
+            Ok(tags)
+        }
+        _ => Err("metadata YAML frame values must be mappings or sequences".to_string()),
+    }
+}
+
+fn collect_run_tags_from_mapping(mapping: &Mapping) -> Result<Vec<RunTag>, String> {
+    let mut tags = Vec::new();
+    for (key, value) in mapping {
+        let Some(name) = key.as_str() else {
+            return Err("metadata YAML tag keys must be strings".to_string());
+        };
+        tags.push(RunTag {
+            name: name.to_string(),
+            value: value.clone(),
+        });
+    }
+    Ok(tags)
+}
+
+#[derive(Debug, Clone, Default)]
+struct RunFileResult {
+    written: usize,
+    skipped: Vec<String>,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RunSummary {
+    written_tags: usize,
+    skipped_tags: usize,
+    skipped_files: usize,
+    warnings: usize,
+    errors: usize,
+}
+
+impl RunSummary {
+    fn add(&mut self, result: &RunFileResult) {
+        self.written_tags += result.written;
+        self.skipped_tags += result.skipped.len();
+        self.warnings += result.warnings.len();
+        self.errors += result.errors.len();
+    }
+}
+
+fn apply_tags_to_image(
+    image: &Path,
+    tags: &[RunTag],
+    dry_run: bool,
+    args: &RunArgs,
+) -> RunFileResult {
+    let mut result = RunFileResult::default();
+    let mut writable_tags = Vec::new();
+
+    for tag in tags {
+        match expand_run_tag(tag) {
+            Ok(expanded) => writable_tags.extend(expanded),
+            Err(RunTagError::Ignored) => {}
+            Err(RunTagError::Warning(message)) => result.warnings.push(message),
+        }
+    }
+
+    if dry_run {
+        result.written = writable_tags.len();
+        return result;
+    }
+
+    if args.strip {
+        if let Err(error) = WritableMetadata::file_clear_metadata(image) {
+            result
+                .errors
+                .push(format!("failed to strip EXIF metadata: {error}"));
+            return result;
+        }
+    }
+
+    let mut metadata =
+        WritableMetadata::new_from_path(image).unwrap_or_else(|_| WritableMetadata::new());
+    for tag in writable_tags {
+        if args.no_overwrite && metadata.get_tag(&tag).next().is_some() {
+            result.skipped.push(format!(
+                "{} already exists",
+                writable_tag_name(&tag).unwrap_or("EXIF tag")
+            ));
+            continue;
+        }
+
+        metadata.set_tag(tag);
+        result.written += 1;
+    }
+
+    if result.written > 0 {
+        if let Err(error) = metadata.write_to_file(image) {
+            result
+                .errors
+                .push(format!("failed to write EXIF metadata: {error}"));
+        }
+    }
+
+    result
+}
+
+fn print_run_file_result(image: &Path, result: &RunFileResult) {
+    if result.errors.is_empty() {
+        println!(
+            "write {} tags={} skipped={}",
+            image.display(),
+            result.written,
+            result.skipped.len()
+        );
+    } else {
+        println!(
+            "error {} tags={} errors={}",
+            image.display(),
+            result.written,
+            result.errors.len()
+        );
+    }
+
+    for warning in &result.warnings {
+        println!("{}", format_validate_warning(warning));
+    }
+    for skipped in &result.skipped {
+        println!("{}", format_validate_warning(&format!("skipped {skipped}")));
+    }
+    for error in &result.errors {
+        println!("{}", format_validate_error(error));
+    }
+}
+
+enum RunTagError {
+    Ignored,
+    Warning(String),
+}
+
+fn expand_run_tag(tag: &RunTag) -> Result<Vec<WritableExifTag>, RunTagError> {
+    if tag.value.is_null() {
+        return Err(RunTagError::Ignored);
+    }
+
+    if tag.name == "$Location" {
+        return expand_location_tag(&tag.value);
+    }
+
+    writable_exif_tag(&tag.name, &tag.value)
+        .map(|tag| vec![tag])
+        .ok_or_else(|| RunTagError::Warning(format!("unsupported writer tag `{}`", tag.name)))
+}
+
+fn expand_location_tag(value: &YamlValue) -> Result<Vec<WritableExifTag>, RunTagError> {
+    let Some(location_name) = location_name_from_yaml(value, &mut Vec::new()) else {
+        return Err(RunTagError::Ignored);
+    };
+    let geonames = open_embedded_geonames_database()
+        .map_err(|error| RunTagError::Warning(format!("$Location lookup failed: {error}")))?;
+    let locations = locations_by_name(&geonames, location_name)
+        .map_err(|error| RunTagError::Warning(format!("$Location lookup failed: {error}")))?;
+    let Some(location) = locations.first() else {
+        return Err(RunTagError::Warning(format!(
+            "$Location: no match found in database [for <{location_name}>]"
+        )));
+    };
+
+    Ok(gps_tags(location.latitude, location.longitude, None))
+}
+
+fn gps_tags(latitude: f64, longitude: f64, altitude: Option<f64>) -> Vec<WritableExifTag> {
+    let mut tags = vec![
+        WritableExifTag::GPSLatitudeRef(if latitude < 0.0 { "S" } else { "N" }.to_string()),
+        WritableExifTag::GPSLatitude(decimal_to_dms_rational(latitude.abs())),
+        WritableExifTag::GPSLongitudeRef(if longitude < 0.0 { "W" } else { "E" }.to_string()),
+        WritableExifTag::GPSLongitude(decimal_to_dms_rational(longitude.abs())),
+        WritableExifTag::GPSMapDatum("WGS-84".to_string()),
+    ];
+
+    if let Some(altitude) = altitude {
+        tags.push(WritableExifTag::GPSAltitudeRef(vec![if altitude < 0.0 {
+            1
+        } else {
+            0
+        }]));
+        tags.push(WritableExifTag::GPSAltitude(vec![rational(altitude.abs())]));
+    }
+
+    tags
+}
+
+fn decimal_to_dms_rational(decimal: f64) -> Vec<uR64> {
+    let degrees = decimal.trunc();
+    let minutes_float = (decimal - degrees) * 60.0;
+    let minutes = minutes_float.trunc();
+    let seconds = (minutes_float - minutes) * 60.0;
+
+    vec![
+        rational(degrees),
+        rational(minutes),
+        rational_with_denominator(seconds, 10_000),
+    ]
+}
+
+fn writable_exif_tag(name: &str, value: &YamlValue) -> Option<WritableExifTag> {
+    let tag = match name {
+        "Artist" | "Photographer" => WritableExifTag::Artist(yaml_string(value)?),
+        "Copyright" => WritableExifTag::Copyright(yaml_string(value)?),
+        "CreateDate" => WritableExifTag::CreateDate(yaml_datetime(value)?),
+        "DateTimeOriginal" => WritableExifTag::DateTimeOriginal(yaml_datetime(value)?),
+        "ExposureProgram" => WritableExifTag::ExposureProgram(vec![yaml_u16(value)?]),
+        "ExposureTime" => WritableExifTag::ExposureTime(vec![yaml_rational(value)?]),
+        "FNumber" => WritableExifTag::FNumber(vec![yaml_rational(value)?]),
+        "FileSource" => WritableExifTag::FileSource(vec![yaml_u8(value)?]),
+        "Flash" => WritableExifTag::Flash(vec![yaml_u16(value)?]),
+        "FocalLength" => WritableExifTag::FocalLength(vec![yaml_rational(value)?]),
+        "GPSAltitude" => WritableExifTag::GPSAltitude(vec![yaml_rational(value)?]),
+        "GPSAltitudeRef" => WritableExifTag::GPSAltitudeRef(vec![yaml_u8(value)?]),
+        "GPSLatitude" => {
+            WritableExifTag::GPSLatitude(decimal_to_dms_rational(yaml_f64(value)?.abs()))
+        }
+        "GPSLatitudeRef" => WritableExifTag::GPSLatitudeRef(yaml_string(value)?),
+        "GPSLongitude" => {
+            WritableExifTag::GPSLongitude(decimal_to_dms_rational(yaml_f64(value)?.abs()))
+        }
+        "GPSLongitudeRef" => WritableExifTag::GPSLongitudeRef(yaml_string(value)?),
+        "GPSMapDatum" => WritableExifTag::GPSMapDatum(yaml_string(value)?),
+        "ISO" | "ISOSpeedRatings" => WritableExifTag::ISO(vec![yaml_u16(value)?]),
+        "ISOSpeed" => WritableExifTag::ISOSpeed(vec![yaml_u32(value)?]),
+        "ImageDescription" => WritableExifTag::ImageDescription(yaml_string(value)?),
+        "LensMake" => WritableExifTag::LensMake(yaml_string(value)?),
+        "LensModel" => WritableExifTag::LensModel(yaml_string(value)?),
+        "LightSource" => WritableExifTag::LightSource(vec![yaml_u16(value)?]),
+        "Make" => WritableExifTag::Make(yaml_string(value)?),
+        "MaxApertureValue" => WritableExifTag::MaxApertureValue(vec![yaml_rational(value)?]),
+        "MeteringMode" => WritableExifTag::MeteringMode(vec![yaml_u16(value)?]),
+        "Model" => WritableExifTag::Model(yaml_string(value)?),
+        "ModifyDate" => WritableExifTag::ModifyDate(yaml_datetime(value)?),
+        "Orientation" => WritableExifTag::Orientation(vec![yaml_u16(value)?]),
+        "Software" => WritableExifTag::Software(yaml_string(value)?),
+        "WhiteBalance" => WritableExifTag::WhiteBalance(vec![yaml_u16(value)?]),
+        _ => return None,
+    };
+
+    Some(tag)
+}
+
+fn writable_tag_name(tag: &WritableExifTag) -> Option<&'static str> {
+    match tag {
+        WritableExifTag::Artist(_) => Some("Artist"),
+        WritableExifTag::Copyright(_) => Some("Copyright"),
+        WritableExifTag::CreateDate(_) => Some("CreateDate"),
+        WritableExifTag::DateTimeOriginal(_) => Some("DateTimeOriginal"),
+        WritableExifTag::ExposureProgram(_) => Some("ExposureProgram"),
+        WritableExifTag::ExposureTime(_) => Some("ExposureTime"),
+        WritableExifTag::FNumber(_) => Some("FNumber"),
+        WritableExifTag::FileSource(_) => Some("FileSource"),
+        WritableExifTag::Flash(_) => Some("Flash"),
+        WritableExifTag::FocalLength(_) => Some("FocalLength"),
+        WritableExifTag::GPSAltitude(_) => Some("GPSAltitude"),
+        WritableExifTag::GPSAltitudeRef(_) => Some("GPSAltitudeRef"),
+        WritableExifTag::GPSLatitude(_) => Some("GPSLatitude"),
+        WritableExifTag::GPSLatitudeRef(_) => Some("GPSLatitudeRef"),
+        WritableExifTag::GPSLongitude(_) => Some("GPSLongitude"),
+        WritableExifTag::GPSLongitudeRef(_) => Some("GPSLongitudeRef"),
+        WritableExifTag::GPSMapDatum(_) => Some("GPSMapDatum"),
+        WritableExifTag::ISO(_) => Some("ISO"),
+        WritableExifTag::ISOSpeed(_) => Some("ISOSpeed"),
+        WritableExifTag::ImageDescription(_) => Some("ImageDescription"),
+        WritableExifTag::LensMake(_) => Some("LensMake"),
+        WritableExifTag::LensModel(_) => Some("LensModel"),
+        WritableExifTag::LightSource(_) => Some("LightSource"),
+        WritableExifTag::Make(_) => Some("Make"),
+        WritableExifTag::MaxApertureValue(_) => Some("MaxApertureValue"),
+        WritableExifTag::MeteringMode(_) => Some("MeteringMode"),
+        WritableExifTag::Model(_) => Some("Model"),
+        WritableExifTag::ModifyDate(_) => Some("ModifyDate"),
+        WritableExifTag::Orientation(_) => Some("Orientation"),
+        WritableExifTag::Software(_) => Some("Software"),
+        WritableExifTag::WhiteBalance(_) => Some("WhiteBalance"),
+        _ => None,
+    }
+}
+
+fn yaml_string(value: &YamlValue) -> Option<String> {
+    match value {
+        YamlValue::Null => None,
+        YamlValue::String(value) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        }
+        YamlValue::Number(value) => Some(value.to_string()),
+        YamlValue::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn yaml_datetime(value: &YamlValue) -> Option<String> {
+    let value = yaml_string(value)?;
+    if value.len() == 10 && value.as_bytes().get(4) == Some(&b'-') {
+        Some(format!(
+            "{}:{}:{} 00:00:00",
+            &value[0..4],
+            &value[5..7],
+            &value[8..10]
+        ))
+    } else {
+        Some(value.replace('-', ":"))
+    }
+}
+
+fn yaml_u8(value: &YamlValue) -> Option<u8> {
+    u8::try_from(yaml_u32(value)?).ok()
+}
+
+fn yaml_u16(value: &YamlValue) -> Option<u16> {
+    u16::try_from(yaml_u32(value)?).ok()
+}
+
+fn yaml_u32(value: &YamlValue) -> Option<u32> {
+    match value {
+        YamlValue::Number(number) => number.as_u64().and_then(|value| u32::try_from(value).ok()),
+        YamlValue::String(value) => clean_numeric_string(value).parse::<u32>().ok(),
+        YamlValue::Bool(value) => Some(u32::from(*value)),
+        _ => None,
+    }
+}
+
+fn yaml_f64(value: &YamlValue) -> Option<f64> {
+    match value {
+        YamlValue::Number(number) => number.as_f64(),
+        YamlValue::String(value) => parse_number_or_fraction(value),
+        _ => None,
+    }
+}
+
+fn yaml_rational(value: &YamlValue) -> Option<uR64> {
+    if let YamlValue::String(value) = value {
+        if let Some((numerator, denominator)) = value.split_once('/') {
+            let numerator = clean_numeric_string(numerator).parse::<u32>().ok()?;
+            let denominator = clean_numeric_string(denominator).parse::<u32>().ok()?;
+            return (denominator != 0).then_some(uR64 {
+                nominator: numerator,
+                denominator,
+            });
+        }
+    }
+
+    yaml_f64(value).map(rational)
+}
+
+fn clean_numeric_string(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches("mm")
+        .trim_end_matches("MM")
+        .trim()
+        .to_string()
+}
+
+fn parse_number_or_fraction(value: &str) -> Option<f64> {
+    let value = clean_numeric_string(value);
+    if let Some((numerator, denominator)) = value.split_once('/') {
+        let numerator = numerator.trim().parse::<f64>().ok()?;
+        let denominator = denominator.trim().parse::<f64>().ok()?;
+        return (denominator != 0.0).then_some(numerator / denominator);
+    }
+    value.parse::<f64>().ok()
+}
+
+fn rational(value: f64) -> uR64 {
+    rational_with_denominator(value, 1_000_000)
+}
+
+fn rational_with_denominator(value: f64, denominator: u32) -> uR64 {
+    let value = value.max(0.0);
+    uR64 {
+        nominator: (value * f64::from(denominator)).round() as u32,
+        denominator,
+    }
 }
 
 fn stub_command(dry_run: bool, command: &str) -> Result<(), String> {
@@ -2551,6 +3266,91 @@ mod tests {
         assert!(matches!(result, Err(message) if message.contains("no metadata.yaml")));
 
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn run_request_treats_single_non_metadata_argument_as_targets() {
+        let args = RunArgs {
+            metadata_or_targets: Some(PathBuf::from("*.jpg")),
+            targets: None,
+            strip: false,
+            no_overwrite: false,
+            extensions: Vec::new(),
+            recursive: false,
+        };
+
+        let request = RunRequest::from_args(&args);
+
+        assert_eq!(request.metadata, None);
+        assert_eq!(request.targets, Some("*.jpg".to_string()));
+    }
+
+    #[test]
+    fn run_targets_filter_default_images_by_extension() {
+        let directory = temporary_test_directory("run-target-extensions");
+        std::fs::write(directory.join("a.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+        std::fs::write(directory.join("b.tif"), [0x49, 0x49, 0x2a, 0x00])
+            .expect("tif should be written");
+
+        let targets = resolve_run_targets(&directory, None, false, &["jpg".to_string()])
+            .expect("targets should resolve");
+
+        assert_eq!(targets, [directory.join("a.jpg")]);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn run_plan_merges_global_and_frame_tags() {
+        let directory = temporary_test_directory("run-plan-merge");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        let image = directory.join("one.jpg");
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+exif:
+  Make: Nikon
+  Model: F3
+frames:
+  1:
+    - Model: FM2
+    - ExposureTime: 1/500
+"#,
+        )
+        .expect("test YAML should parse");
+
+        let plan = build_run_plan(&metadata, &yaml, std::slice::from_ref(&image))
+            .expect("run plan should build");
+        let tags = plan
+            .tags_for_image(&image)
+            .expect("image should have merged tags");
+
+        assert_eq!(tags.len(), 3);
+        assert!(
+            tags.iter()
+                .any(|tag| tag.name == "Make" && tag.value.as_str() == Some("Nikon"))
+        );
+        assert!(
+            tags.iter()
+                .any(|tag| tag.name == "Model" && tag.value.as_str() == Some("FM2"))
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn run_tag_parser_supports_fraction_and_unit_values() {
+        let exposure = writable_exif_tag("ExposureTime", &YamlValue::String("1/500".to_string()))
+            .expect("exposure tag should parse");
+        let focal_length = writable_exif_tag("FocalLength", &YamlValue::String("75mm".to_string()))
+            .expect("focal length tag should parse");
+
+        assert!(
+            matches!(exposure, WritableExifTag::ExposureTime(values) if values[0].nominator == 1 && values[0].denominator == 500)
+        );
+        assert!(
+            matches!(focal_length, WritableExifTag::FocalLength(values) if values[0].nominator == 75_000_000 && values[0].denominator == 1_000_000)
+        );
     }
 
     #[test]

@@ -49,6 +49,12 @@ pub struct ValidateArgs {
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 pub struct RunArgs {
+    #[arg(value_name = "METADATA_OR_TARGETS")]
+    pub metadata_or_targets: Option<PathBuf>,
+
+    #[arg(value_name = "TARGETS")]
+    pub targets: Option<String>,
+
     #[arg(long, help = "Remove existing EXIF data before adding new data")]
     pub strip: bool,
 
