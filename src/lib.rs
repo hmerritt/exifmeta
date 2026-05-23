@@ -26,7 +26,9 @@ const NEAREST_CITY_MINIMUM_POPULATION: i64 = 200_000;
 const EARTH_RADIUS_KM: f64 = 6_371.0088;
 const METADATA_FILE_NAME: &str = "metadata.yaml";
 const METADATA_YML_FILE_NAME: &str = "metadata.yml";
-const CUSTOM_TAG_PAYLOAD_PREFIX: &[u8] = b"exifmeta-custom-tags-v1\n";
+const CUSTOM_TAG_PAYLOAD_MARKER: &str = concat!("exifmeta-v", env!("CARGO_PKG_VERSION"), "\n");
+const LEGACY_CUSTOM_TAG_PAYLOAD_PREFIX: &[u8] = b"exifmeta-custom-tags-v1\n";
+const USER_COMMENT_ASCII_PREFIX: &[u8] = b"ASCII\0\0\0";
 const METADATA_TEMPLATE: &str = r#"# ───────────────────────────────────────────────
 # Metadata file for images in this directory. Used by exifmeta, https://github.com/hmerritt/exifmeta
 # ───────────────────────────────────────────────
@@ -411,7 +413,7 @@ fn append_pretty_inspect_rows(
         }
         first_group = false;
 
-        append_pretty_group_heading(output, group);
+        append_validate_heading(output, group.label());
 
         let name_width = group_rows
             .iter()
@@ -424,14 +426,6 @@ fn append_pretty_inspect_rows(
             output.push_str(&format!("  {}\n", row.value));
         }
     }
-}
-
-fn append_pretty_group_heading(output: &mut String, group: PrettyInspectGroup) {
-    let title = group.title();
-    output.push_str(&title.bright_blue().to_string());
-    output.push('\n');
-    output.push_str(&"-".repeat(title.len()).bright_blue().to_string());
-    output.push('\n');
 }
 
 fn pretty_inspect_row_sort_label(row: &PrettyInspectRow) -> String {
@@ -505,10 +499,15 @@ fn append_nearest_location_rows(
         return;
     };
 
-    match nearest_locations(latitude, longitude, NEAREST_LOCATION_LIMIT, None) {
-        Ok(locations) => append_location_rows(pretty_rows, "Nearest Location", locations),
-        Err(error) => warnings.push(format!("failed to query nearest locations: {error}")),
-    }
+    let nearest_location_rows =
+        match nearest_locations(latitude, longitude, NEAREST_LOCATION_LIMIT, None) {
+            Ok(locations) => locations,
+            Err(error) => {
+                warnings.push(format!("failed to query nearest locations: {error}"));
+                Vec::new()
+            }
+        };
+    append_location_rows(pretty_rows, "Nearest Location", &nearest_location_rows);
 
     match nearest_locations(
         latitude,
@@ -516,7 +515,12 @@ fn append_nearest_location_rows(
         1,
         Some(NEAREST_CITY_MINIMUM_POPULATION),
     ) {
-        Ok(locations) => append_single_location_row(pretty_rows, "Nearest City", locations),
+        Ok(locations) => append_non_duplicate_location_rows(
+            pretty_rows,
+            "Nearest City",
+            locations,
+            &nearest_location_rows,
+        ),
         Err(error) => warnings.push(format!("failed to query nearest city: {error}")),
     }
 }
@@ -524,9 +528,9 @@ fn append_nearest_location_rows(
 fn append_location_rows(
     pretty_rows: &mut Vec<PrettyInspectRow>,
     label_prefix: &str,
-    locations: Vec<GeoLocation>,
+    locations: &[GeoLocation],
 ) {
-    for (index, location) in locations.into_iter().enumerate() {
+    for (index, location) in locations.iter().enumerate() {
         pretty_rows.push(PrettyInspectRow {
             group: PrettyInspectGroup::Gps,
             label: format!("{} {}", label_prefix, index + 1),
@@ -541,20 +545,26 @@ fn append_location_rows(
     }
 }
 
-fn append_single_location_row(
+fn append_non_duplicate_location_rows(
     pretty_rows: &mut Vec<PrettyInspectRow>,
     label: &str,
     locations: Vec<GeoLocation>,
+    existing_locations: &[GeoLocation],
 ) {
     for location in locations {
-        append_location_row(pretty_rows, label, location);
+        if existing_locations
+            .iter()
+            .all(|existing| !is_same_geo_location(existing, &location))
+        {
+            append_location_row(pretty_rows, label, &location);
+        }
     }
 }
 
 fn append_location_row(
     pretty_rows: &mut Vec<PrettyInspectRow>,
     label: &str,
-    location: GeoLocation,
+    location: &GeoLocation,
 ) {
     pretty_rows.push(PrettyInspectRow {
         group: PrettyInspectGroup::Gps,
@@ -567,6 +577,14 @@ fn append_location_row(
             location.country_code
         ),
     });
+}
+
+fn is_same_geo_location(left: &GeoLocation, right: &GeoLocation) -> bool {
+    left.name == right.name
+        && left.country_code == right.country_code
+        && left.latitude.to_bits() == right.latitude.to_bits()
+        && left.longitude.to_bits() == right.longitude.to_bits()
+        && left.population == right.population
 }
 
 fn gps_coordinates(exif: &Exif) -> Option<(f64, f64)> {
@@ -621,9 +639,9 @@ impl PrettyInspectGroup {
         Self::File,
         Self::Camera,
         Self::Film,
-        Self::Custom,
         Self::Exposure,
         Self::Gps,
+        Self::Custom,
         Self::Misc,
         Self::Unknown,
     ];
@@ -633,24 +651,24 @@ impl PrettyInspectGroup {
             Self::File => 0,
             Self::Camera => 1,
             Self::Film => 2,
-            Self::Custom => 3,
-            Self::Exposure => 4,
-            Self::Gps => 5,
+            Self::Exposure => 3,
+            Self::Gps => 4,
+            Self::Custom => 5,
             Self::Misc => 6,
             Self::Unknown => 7,
         }
     }
 
-    fn title(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
-            Self::File => "File",
-            Self::Camera => "Camera",
-            Self::Film => "Film",
-            Self::Custom => "Custom",
-            Self::Exposure => "Exposure",
-            Self::Gps => "GPS",
-            Self::Misc => "MISC",
-            Self::Unknown => "UNKNOWN",
+            Self::File => "file",
+            Self::Camera => "camera",
+            Self::Film => "film",
+            Self::Custom => "custom",
+            Self::Exposure => "exposure",
+            Self::Gps => "gps",
+            Self::Misc => "misc",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -1039,6 +1057,12 @@ impl InspectRow {
 }
 
 fn format_known_field_value(field: &Field, exif: &Exif, name: &str) -> String {
+    if name == "UserComment" {
+        if let Some(value) = visible_user_comment_text(field) {
+            return value;
+        }
+    }
+
     let value = field.display_value().with_unit(exif).to_string();
 
     if name == "ExposureTime" {
@@ -1048,6 +1072,14 @@ fn format_known_field_value(field: &Field, exif: &Exif, name: &str) -> String {
     }
 
     value
+}
+
+fn visible_user_comment_text(field: &Field) -> Option<String> {
+    let bytes = user_comment_bytes(field)?;
+    let body = bytes
+        .strip_prefix(USER_COMMENT_ASCII_PREFIX)
+        .unwrap_or(bytes);
+    std::str::from_utf8(body).ok().map(ToString::to_string)
 }
 
 fn title_case_tag_name(name: &str) -> String {
@@ -1185,8 +1217,34 @@ fn is_exifmeta_custom_payload_field(field: &Field) -> bool {
 }
 
 fn custom_tags_from_bytes(bytes: &[u8]) -> Option<Vec<CustomTag>> {
-    let body = bytes.strip_prefix(CUSTOM_TAG_PAYLOAD_PREFIX)?;
-    let mapping = serde_yaml::from_slice::<Mapping>(body).ok()?;
+    let body = if let Some(body) = bytes.strip_prefix(LEGACY_CUSTOM_TAG_PAYLOAD_PREFIX) {
+        return custom_tags_from_yaml_bytes(body);
+    } else if let Some(body) = bytes.strip_prefix(USER_COMMENT_ASCII_PREFIX) {
+        body
+    } else {
+        bytes
+    };
+
+    custom_tags_from_json_bytes(body)
+}
+
+fn custom_tag_json_body(bytes: &[u8]) -> &[u8] {
+    bytes
+        .strip_prefix(CUSTOM_TAG_PAYLOAD_MARKER.as_bytes())
+        .unwrap_or(bytes)
+}
+
+fn custom_tags_from_yaml_bytes(bytes: &[u8]) -> Option<Vec<CustomTag>> {
+    let mapping = serde_yaml::from_slice::<Mapping>(bytes).ok()?;
+    custom_tags_from_mapping(mapping)
+}
+
+fn custom_tags_from_json_bytes(bytes: &[u8]) -> Option<Vec<CustomTag>> {
+    let mapping = serde_json::from_slice::<Mapping>(custom_tag_json_body(bytes)).ok()?;
+    custom_tags_from_mapping(mapping)
+}
+
+fn custom_tags_from_mapping(mapping: Mapping) -> Option<Vec<CustomTag>> {
     let mut tags = Vec::new();
 
     for (key, value) in mapping {
@@ -1199,7 +1257,7 @@ fn custom_tags_from_bytes(bytes: &[u8]) -> Option<Vec<CustomTag>> {
         });
     }
 
-    Some(tags)
+    if tags.is_empty() { None } else { Some(tags) }
 }
 
 fn encode_custom_tags(tags: &[CustomTag]) -> Result<Vec<u8>, String> {
@@ -1208,8 +1266,9 @@ fn encode_custom_tags(tags: &[CustomTag]) -> Result<Vec<u8>, String> {
         mapping.insert(YamlValue::String(tag.name.clone()), tag.value.clone());
     }
 
-    let mut bytes = CUSTOM_TAG_PAYLOAD_PREFIX.to_vec();
-    let body = serde_yaml::to_string(&mapping)
+    let mut bytes = USER_COMMENT_ASCII_PREFIX.to_vec();
+    bytes.extend_from_slice(CUSTOM_TAG_PAYLOAD_MARKER.as_bytes());
+    let body = serde_json::to_string(&mapping)
         .map_err(|error| format!("failed to encode custom tags: {error}"))?;
     bytes.extend_from_slice(body.as_bytes());
     Ok(bytes)
@@ -1691,17 +1750,22 @@ fn print_validate_output(output: &ValidateOutput) {
 
 fn format_validate_output(output: &ValidateOutput) -> String {
     let mut rendered = String::new();
+    let mut first_group = true;
 
-    append_validate_file_group(&mut rendered, output);
-    append_validate_exif_group(&mut rendered, output);
-    append_validate_frames_group(&mut rendered, output);
-    append_validate_overview_group(&mut rendered, output);
+    append_validate_file_group(&mut rendered, &mut first_group, output);
+    append_validate_exif_group(&mut rendered, &mut first_group, output);
+    append_validate_frames_group(&mut rendered, &mut first_group, output);
+    append_validate_overview_group(&mut rendered, &mut first_group, output);
 
     rendered
 }
 
-fn append_validate_file_group(output: &mut String, report: &ValidateOutput) {
-    append_validate_heading(output, "file");
+fn append_validate_file_group(
+    output: &mut String,
+    first_group: &mut bool,
+    report: &ValidateOutput,
+) {
+    append_spaced_validate_heading(output, first_group, "file");
 
     if let Some(path) = &report.metadata_path {
         output.push_str(&format!(
@@ -1726,8 +1790,12 @@ fn append_validate_file_group(output: &mut String, report: &ValidateOutput) {
     }
 }
 
-fn append_validate_exif_group(output: &mut String, report: &ValidateOutput) {
-    append_validate_heading(output, "exif");
+fn append_validate_exif_group(
+    output: &mut String,
+    first_group: &mut bool,
+    report: &ValidateOutput,
+) {
+    append_spaced_validate_heading(output, first_group, "exif");
 
     let Some(exif) = &report.exif else {
         output.push_str("skipped\n");
@@ -1740,8 +1808,12 @@ fn append_validate_exif_group(output: &mut String, report: &ValidateOutput) {
     }
 }
 
-fn append_validate_frames_group(output: &mut String, report: &ValidateOutput) {
-    append_validate_heading(output, "frames");
+fn append_validate_frames_group(
+    output: &mut String,
+    first_group: &mut bool,
+    report: &ValidateOutput,
+) {
+    append_spaced_validate_heading(output, first_group, "frames");
 
     let Some(frames) = &report.frames else {
         output.push_str("skipped\n");
@@ -1782,8 +1854,12 @@ fn append_validate_frames_group(output: &mut String, report: &ValidateOutput) {
     }
 }
 
-fn append_validate_overview_group(output: &mut String, report: &ValidateOutput) {
-    append_validate_heading(output, "overview");
+fn append_validate_overview_group(
+    output: &mut String,
+    first_group: &mut bool,
+    report: &ValidateOutput,
+) {
+    append_spaced_validate_heading(output, first_group, "overview");
 
     let errors = report.error_count();
     let warnings = report.warning_count();
@@ -1810,6 +1886,15 @@ fn append_validate_heading(output: &mut String, label: &str) {
         "{}\n",
         format!("{label} {}", "─".repeat(dash_count)).bright_blue()
     ));
+}
+
+fn append_spaced_validate_heading(output: &mut String, first_group: &mut bool, label: &str) {
+    if *first_group {
+        *first_group = false;
+    } else {
+        output.push('\n');
+    }
+    append_validate_heading(output, label);
 }
 
 fn append_validate_tag_counts(output: &mut String, counts: &TagCounts) {
@@ -3006,21 +3091,22 @@ fn writable_tag_identity(tag: &WritableExifTag) -> (u16, String) {
 
 fn format_run_output(output: &RunOutput, summary: &RunSummary) -> String {
     let mut rendered = String::new();
+    let mut first_group = true;
 
-    append_run_metadata_group(&mut rendered, output);
+    append_run_metadata_group(&mut rendered, &mut first_group, output);
     for file in &output.files {
-        append_run_file_group(&mut rendered, file);
+        append_run_file_group(&mut rendered, &mut first_group, file);
     }
     for skipped in &output.skipped_files {
-        append_run_skipped_file_group(&mut rendered, skipped);
+        append_run_skipped_file_group(&mut rendered, &mut first_group, skipped);
     }
-    append_run_overview_group(&mut rendered, summary);
+    append_run_overview_group(&mut rendered, &mut first_group, summary);
 
     rendered
 }
 
-fn append_run_metadata_group(rendered: &mut String, output: &RunOutput) {
-    append_validate_heading(rendered, "run");
+fn append_run_metadata_group(rendered: &mut String, first_group: &mut bool, output: &RunOutput) {
+    append_spaced_validate_heading(rendered, first_group, "run");
     rendered.push_str(&format!(
         "metadata file: {}\n",
         output.metadata_path.display()
@@ -3034,8 +3120,8 @@ fn append_run_metadata_group(rendered: &mut String, output: &RunOutput) {
     }
 }
 
-fn append_run_file_group(rendered: &mut String, file: &RunFileOutput) {
-    append_validate_heading(rendered, &run_file_heading(&file.image));
+fn append_run_file_group(rendered: &mut String, first_group: &mut bool, file: &RunFileOutput) {
+    append_spaced_validate_heading(rendered, first_group, &run_file_heading(&file.image));
     append_run_file_path(rendered, &file.image);
     rendered.push_str(&format!("tags: {}\n", file.result.written));
     rendered.push_str(&format!("skipped: {}\n", file.result.skipped.len()));
@@ -3053,8 +3139,8 @@ fn append_run_file_group(rendered: &mut String, file: &RunFileOutput) {
     }
 }
 
-fn append_run_skipped_file_group(rendered: &mut String, image: &Path) {
-    append_validate_heading(rendered, &run_file_heading(image));
+fn append_run_skipped_file_group(rendered: &mut String, first_group: &mut bool, image: &Path) {
+    append_spaced_validate_heading(rendered, first_group, &run_file_heading(image));
     append_run_file_path(rendered, image);
     rendered.push_str("skipped: no metadata\n");
 }
@@ -3075,8 +3161,8 @@ fn is_current_directory_file(image: &Path) -> bool {
         .is_none_or(|parent| parent.as_os_str().is_empty() || parent == Path::new("."))
 }
 
-fn append_run_overview_group(rendered: &mut String, summary: &RunSummary) {
-    append_validate_heading(rendered, "overview");
+fn append_run_overview_group(rendered: &mut String, first_group: &mut bool, summary: &RunSummary) {
+    append_spaced_validate_heading(rendered, first_group, "overview");
     rendered.push_str(&format!("errors      {}\n", summary.errors));
     rendered.push_str(&format!("warnings    {}\n", summary.warnings));
     rendered.push_str(&format!("written     {}\n", summary.written_tags));
@@ -3638,18 +3724,25 @@ frames:
                     ..RunFileResult::default()
                 },
             }],
-            skipped_files: Vec::new(),
+            skipped_files: vec![PathBuf::from("missing.jpg")],
         };
         let mut summary = RunSummary::default();
         summary.add(&output.files[0].result);
+        summary.skipped_files = output.skipped_files.len();
         summary.elapsed_ms = 42;
 
         let rendered = format_run_output(&output, &summary);
         let plain = strip_ansi_codes(&rendered);
 
+        assert!(plain.starts_with("run "));
+        assert!(plain.contains("mode: dry-run\n\nimage.jpg "));
         assert!(rendered.contains("\u{1b}[94mimage.jpg"));
         assert!(!plain.contains("file: image.jpg"));
         assert!(plain.contains("warning: skipping unsupported writer tag `FilmRoll`"));
+        assert!(
+            plain.contains("warning: skipping unsupported writer tag `FilmRoll`\n\nmissing.jpg ")
+        );
+        assert!(plain.contains("skipped: no metadata\n\noverview "));
         assert!(rendered.contains("\u{1b}[94moverview"));
         assert!(plain.contains("errors      0"));
         assert!(plain.contains("warnings    1"));
@@ -3705,8 +3798,56 @@ frames:
 
         let payload = encode_custom_tags(&tags).expect("custom tags should encode");
         let decoded = custom_tags_from_bytes(&payload).expect("custom tags should decode");
+        let json = std::str::from_utf8(
+            payload
+                .strip_prefix(USER_COMMENT_ASCII_PREFIX)
+                .expect("custom tags should use the EXIF ASCII UserComment prefix"),
+        )
+        .expect("custom tag JSON should be UTF-8");
 
         assert_eq!(decoded, tags);
+        assert!(!payload.starts_with(LEGACY_CUSTOM_TAG_PAYLOAD_PREFIX));
+        assert!(json.starts_with(CUSTOM_TAG_PAYLOAD_MARKER));
+        assert!(json.contains("exifmeta-v0.1.0"));
+        assert!(json.contains(r#""FilmRoll":35"#));
+        assert!(json.contains(r#""FilmName":"Kodak Double-X""#));
+        assert!(json.contains(r#""FilmNegative":true"#));
+    }
+
+    #[test]
+    fn custom_tag_payload_decodes_marker_bare_json_and_legacy_yaml() {
+        let bare_json = br#"{"FilmRoll":35,"FilmName":"Kodak Double-X"}"#;
+        let mut marked_json = CUSTOM_TAG_PAYLOAD_MARKER.as_bytes().to_vec();
+        marked_json.extend_from_slice(bare_json);
+        let mut ascii_prefixed_json = USER_COMMENT_ASCII_PREFIX.to_vec();
+        ascii_prefixed_json.extend_from_slice(bare_json);
+        let mut legacy = LEGACY_CUSTOM_TAG_PAYLOAD_PREFIX.to_vec();
+        legacy.extend_from_slice(b"FilmRoll: 35\nFilmName: Kodak Double-X\n");
+
+        let bare_decoded = custom_tags_from_bytes(bare_json).expect("bare JSON should decode");
+        let marked_decoded =
+            custom_tags_from_bytes(&marked_json).expect("marked JSON should decode");
+        let ascii_prefixed_decoded = custom_tags_from_bytes(&ascii_prefixed_json)
+            .expect("ASCII-prefixed JSON should decode");
+        let legacy_decoded =
+            custom_tags_from_bytes(&legacy).expect("legacy YAML payload should decode");
+
+        assert_eq!(
+            bare_decoded,
+            vec![
+                CustomTag {
+                    name: "FilmRoll".to_string(),
+                    value: YamlValue::Number(35.into()),
+                },
+                CustomTag {
+                    name: "FilmName".to_string(),
+                    value: YamlValue::String("Kodak Double-X".to_string()),
+                },
+            ]
+        );
+        assert_eq!(marked_decoded, bare_decoded);
+        assert_eq!(ascii_prefixed_decoded, bare_decoded);
+        assert_eq!(legacy_decoded, bare_decoded);
     }
 
     #[test]
@@ -3755,7 +3896,9 @@ frames:
         let metadata = InspectMetadata {
             exif: parse_raw_exif_with_exif_entries(&[entry], &[(200, payload)]),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: InspectFileInfo {
+                rows: vec![InspectInfoRow::new("Image Width", "100 px")],
+            },
         };
 
         let pretty = strip_ansi_codes(&format_inspect_output(
@@ -3769,12 +3912,18 @@ frames:
             InspectFormat::Raw,
         ));
 
-        assert!(pretty.contains("Custom\n------\n"));
+        assert!(pretty.contains("custom "));
         assert!(pretty.contains("Film Roll  35"));
         assert!(pretty.contains("Film Name  Kodak Double-X"));
+        assert!(pretty.contains("misc "));
+        assert!(pretty.contains("Image Width  100 px"));
+        assert!(pretty.find("custom ").unwrap() < pretty.find("misc ").unwrap());
         assert!(!pretty.contains("User Comment"));
         assert!(raw.contains("0x9286"));
         assert!(raw.contains("UserComment"));
+        assert!(raw.contains("exifmeta-v0.1.0"));
+        assert!(raw.contains("FilmRoll"));
+        assert!(raw.contains("Kodak Double-X"));
         assert!(!raw.contains("IFD exifmeta  Custom  0x0000"));
     }
 
@@ -4056,6 +4205,10 @@ frames:
         assert!(file < exif);
         assert!(exif < frames);
         assert!(frames < overview);
+        assert!(rendered.starts_with("file "));
+        assert!(rendered.contains("YAML format: ok\n\nexif "));
+        assert!(rendered.contains("standard tags: 1\nunknown tags: 0\n\nframes "));
+        assert!(rendered.contains("unknown tags: 0\n\noverview "));
         assert!(rendered.contains("metadata file: found "));
         assert!(rendered.contains("YAML format: ok"));
         assert!(rendered.contains("validation: success"));
@@ -4417,13 +4570,16 @@ frames:
             format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
         let plain_output = strip_ansi_codes(&output);
 
-        assert!(plain_output.contains("File\n----\nFile Name  image.tif"));
-        assert!(plain_output.contains("Camera\n------\nMake   \"Z\"\nModel  \"E\""));
-        assert!(plain_output.contains("UNKNOWN\n-------\nUnknown Tiff Tag  Short([42])"));
+        assert!(plain_output.contains("file "));
+        assert!(plain_output.contains("File Name  image.tif"));
+        assert!(plain_output.contains("camera "));
+        assert!(plain_output.contains("Make   \"Z\"\nModel  \"E\""));
+        assert!(plain_output.contains("unknown "));
+        assert!(plain_output.contains("Unknown Tiff Tag  Short([42])"));
         assert!(output.contains("Warnings:"));
         assert!(output.contains("warning: ignored malformed trailing field"));
-        assert!(plain_output.find("File\n").unwrap() < plain_output.find("Camera\n").unwrap());
-        assert!(plain_output.find("Camera\n").unwrap() < plain_output.find("UNKNOWN\n").unwrap());
+        assert!(plain_output.find("file ").unwrap() < plain_output.find("camera ").unwrap());
+        assert!(plain_output.find("camera ").unwrap() < plain_output.find("unknown ").unwrap());
         assert!(!output.contains("IFD"));
         assert!(!output.contains("Tiff  "));
         assert!(!output.contains("0x010F"));
@@ -4443,27 +4599,30 @@ frames:
             format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
         let plain_output = strip_ansi_codes(&output);
 
-        assert!(plain_output.starts_with("Camera\n------\n"));
-        assert!(!plain_output.contains("File\n"));
-        assert!(!plain_output.contains("Film\n"));
-        assert!(!plain_output.contains("Exposure\n"));
-        assert!(!plain_output.contains("GPS\n"));
-        assert!(!plain_output.contains("MISC\n"));
-        assert!(!plain_output.contains("UNKNOWN\n"));
+        assert!(plain_output.starts_with("camera "));
+        assert!(!plain_output.contains("file "));
+        assert!(!plain_output.contains("film "));
+        assert!(!plain_output.contains("exposure "));
+        assert!(!plain_output.contains("gps "));
+        assert!(!plain_output.contains("misc "));
+        assert!(!plain_output.contains("unknown "));
     }
 
     #[test]
-    fn pretty_inspect_group_heading_is_blue_and_underlined() {
+    fn pretty_inspect_group_heading_uses_validate_style_blue_rule() {
         colored::control::set_override(true);
-        let mut output = String::new();
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif(&[tiff_ascii_entry(0x010f, b"Z\0")]),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        };
 
-        append_pretty_group_heading(&mut output, PrettyInspectGroup::Camera);
+        let output =
+            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
         colored::control::set_override(false);
+        let expected = format!("\u{1b}[94mcamera {}\u{1b}[0m", "─".repeat(51));
 
-        assert_eq!(
-            output,
-            "\u{1b}[94mCamera\u{1b}[0m\n\u{1b}[94m------\u{1b}[0m\n"
-        );
+        assert_eq!(output.lines().next(), Some(expected.as_str()));
     }
 
     #[test]
@@ -4700,7 +4859,7 @@ frames:
         colored::control::set_override(false);
         let plain_output = strip_ansi_codes(&output);
 
-        assert!(plain_output.contains("GPS\n---\n"));
+        assert!(plain_output.contains("gps "));
         assert_eq!(plain_output.matches("Nearest Location").count(), 5);
         assert_eq!(plain_output.matches("Nearest City").count(), 1);
         assert_eq!(plain_output.matches("Nearest Large City").count(), 0);
@@ -4718,6 +4877,20 @@ frames:
         assert!(output.contains("\u{1b}[32mNearest Location 1\u{1b}[0m"));
         assert!(output.contains("\u{1b}[32mNearest City\u{1b}[0m"));
         assert!(!output.contains("\u{1b}[32mNearest Large City\u{1b}[0m"));
+    }
+
+    #[test]
+    fn pretty_inspect_output_omits_nearest_city_when_it_duplicates_nearest_location() {
+        let metadata = test_coventry_gps_metadata();
+
+        let output =
+            format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Pretty);
+        let plain_output = strip_ansi_codes(&output);
+
+        assert_eq!(plain_output.matches("Nearest Location").count(), 5);
+        assert_eq!(plain_output.matches("Nearest City").count(), 0);
+        assert_eq!(plain_output.matches("Coventry, GB").count(), 1);
+        assert!(plain_output.contains("Nearest Location 1  (0 m) Coventry, GB"));
     }
 
     #[test]
@@ -4882,6 +5055,27 @@ frames:
             tiff_rational_entry(0x0002, [(52, 1), (21, 1), (101952, 10000)], 200);
         let (longitude_entry, longitude_data) =
             tiff_rational_entry(0x0004, [(1, 1), (18, 1), (1471968, 100000)], 224);
+
+        InspectMetadata {
+            exif: parse_raw_exif_with_gps_entries(
+                &[
+                    tiff_ascii_entry(0x0001, b"N\0"),
+                    latitude_entry,
+                    tiff_ascii_entry(0x0003, b"W\0"),
+                    longitude_entry,
+                ],
+                &[(200, latitude_data), (224, longitude_data)],
+            ),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        }
+    }
+
+    fn test_coventry_gps_metadata() -> InspectMetadata {
+        let (latitude_entry, latitude_data) =
+            tiff_rational_entry(0x0002, [(52, 1), (24, 1), (23616, 1000)], 200);
+        let (longitude_entry, longitude_data) =
+            tiff_rational_entry(0x0004, [(1, 1), (30, 1), (43812, 1000)], 224);
 
         InspectMetadata {
             exif: parse_raw_exif_with_gps_entries(
