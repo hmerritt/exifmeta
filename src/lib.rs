@@ -2345,9 +2345,6 @@ const STANDARD_EXIF_TAG_NAMES: &[&str] = &[
 fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
     let request = RunRequest::from_args(&args);
     let resolution = resolve_metadata_path(request.metadata.as_deref())?;
-    for warning in &resolution.warnings {
-        println!("{}", format_validate_warning(warning));
-    }
 
     let metadata_dir = path_parent_or_current(&resolution.path);
     let targets = resolve_run_targets(
@@ -2369,34 +2366,29 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
 
     let plan = build_run_plan(&resolution.path, &yaml, &targets)?;
     let mut summary = RunSummary::default();
-
-    println!(
-        "run: metadata={} targets={}{}",
-        resolution.path.display(),
-        targets.len(),
-        if dry_run { " dry-run" } else { "" }
-    );
+    let mut output = RunOutput {
+        metadata_path: resolution.path.clone(),
+        dry_run,
+        target_count: targets.len(),
+        file_warnings: resolution.warnings,
+        files: Vec::new(),
+        skipped_files: Vec::new(),
+    };
+    summary.warnings += output.file_warnings.len();
 
     for image in targets {
         let Some(tags) = plan.tags_for_image(&image) else {
             summary.skipped_files += 1;
-            println!("skip {} (no metadata)", image.display());
+            output.skipped_files.push(image);
             continue;
         };
 
         let result = apply_tags_to_image(&image, &tags, dry_run, &args);
         summary.add(&result);
-        print_run_file_result(&image, &result);
+        output.files.push(RunFileOutput { image, result });
     }
 
-    println!(
-        "run: wrote={} skipped_tags={} skipped_files={} warnings={} errors={}",
-        summary.written_tags,
-        summary.skipped_tags,
-        summary.skipped_files,
-        summary.warnings,
-        summary.errors
-    );
+    print!("{}", format_run_output(&output, &summary));
 
     if summary.errors > 0 {
         Err("one or more target images failed".to_string())
@@ -2639,8 +2631,32 @@ impl RunPlan {
                 }
             }
         }
+        normalize_iso_aliases(&mut merged);
         Some(merged)
     }
+}
+
+fn normalize_iso_aliases(tags: &mut Vec<RunTag>) {
+    let Some(value) = tags
+        .iter()
+        .rev()
+        .find(|tag| is_iso_alias(&tag.name))
+        .map(|tag| tag.value.clone())
+    else {
+        return;
+    };
+
+    tags.retain(|tag| !is_iso_alias(&tag.name));
+    for name in ["ISO", "ISOSpeed", "ISOSpeedRatings"] {
+        tags.push(RunTag {
+            name: name.to_string(),
+            value: value.clone(),
+        });
+    }
+}
+
+fn is_iso_alias(name: &str) -> bool {
+    matches!(name, "ISO" | "ISOSpeed" | "ISOSpeedRatings")
 }
 
 fn build_run_plan(
@@ -2748,9 +2764,25 @@ impl RunSummary {
     fn add(&mut self, result: &RunFileResult) {
         self.written_tags += result.written;
         self.skipped_tags += result.skipped.len();
-        self.warnings += result.warnings.len();
+        self.warnings += result.warnings.len() + result.skipped.len();
         self.errors += result.errors.len();
     }
+}
+
+#[derive(Debug, Clone)]
+struct RunOutput {
+    metadata_path: PathBuf,
+    dry_run: bool,
+    target_count: usize,
+    file_warnings: Vec<String>,
+    files: Vec<RunFileOutput>,
+    skipped_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct RunFileOutput {
+    image: PathBuf,
+    result: RunFileResult,
 }
 
 fn apply_tags_to_image(
@@ -2769,6 +2801,7 @@ fn apply_tags_to_image(
             Err(RunTagError::Warning(message)) => result.warnings.push(message),
         }
     }
+    dedupe_writable_tags(&mut writable_tags);
 
     if dry_run {
         result.written = writable_tags.len();
@@ -2810,31 +2843,92 @@ fn apply_tags_to_image(
     result
 }
 
-fn print_run_file_result(image: &Path, result: &RunFileResult) {
-    if result.errors.is_empty() {
-        println!(
-            "write {} tags={} skipped={}",
-            image.display(),
-            result.written,
-            result.skipped.len()
-        );
-    } else {
-        println!(
-            "error {} tags={} errors={}",
-            image.display(),
-            result.written,
-            result.errors.len()
-        );
+fn dedupe_writable_tags(tags: &mut Vec<WritableExifTag>) {
+    let mut deduped: Vec<WritableExifTag> = Vec::new();
+    for tag in tags.drain(..) {
+        if let Some(existing) = deduped
+            .iter_mut()
+            .find(|existing| writable_tag_identity(existing) == writable_tag_identity(&tag))
+        {
+            *existing = tag;
+        } else {
+            deduped.push(tag);
+        }
     }
+    *tags = deduped;
+}
 
-    for warning in &result.warnings {
-        println!("{}", format_validate_warning(warning));
+fn writable_tag_identity(tag: &WritableExifTag) -> (u16, String) {
+    (tag.as_u16(), format!("{:?}", tag.get_group()))
+}
+
+fn format_run_output(output: &RunOutput, summary: &RunSummary) -> String {
+    let mut rendered = String::new();
+
+    append_run_metadata_group(&mut rendered, output);
+    for file in &output.files {
+        append_run_file_group(&mut rendered, file);
     }
-    for skipped in &result.skipped {
-        println!("{}", format_validate_warning(&format!("skipped {skipped}")));
+    for skipped in &output.skipped_files {
+        append_run_skipped_file_group(&mut rendered, skipped);
     }
-    for error in &result.errors {
-        println!("{}", format_validate_error(error));
+    append_run_overview_group(&mut rendered, summary);
+
+    rendered
+}
+
+fn append_run_metadata_group(rendered: &mut String, output: &RunOutput) {
+    append_validate_heading(rendered, "run");
+    rendered.push_str(&format!(
+        "metadata file: {}\n",
+        output.metadata_path.display()
+    ));
+    rendered.push_str(&format!("targets: {}\n", output.target_count));
+    if output.dry_run {
+        rendered.push_str(&format!("mode: {}\n", "dry-run".yellow()));
+    }
+    for warning in &output.file_warnings {
+        rendered.push_str(&format!("{}\n", format_validate_warning(warning)));
+    }
+}
+
+fn append_run_file_group(rendered: &mut String, file: &RunFileOutput) {
+    append_validate_heading(rendered, &file.image.display().to_string());
+    rendered.push_str(&format!("file: {}\n", file.image.display()));
+    rendered.push_str(&format!("tags: {}\n", file.result.written));
+    rendered.push_str(&format!("skipped: {}\n", file.result.skipped.len()));
+    for warning in &file.result.warnings {
+        rendered.push_str(&format!("{}\n", format_validate_warning(warning)));
+    }
+    for skipped in &file.result.skipped {
+        rendered.push_str(&format!(
+            "{}\n",
+            format_validate_warning(&format!("skipped {skipped}"))
+        ));
+    }
+    for error in &file.result.errors {
+        rendered.push_str(&format!("{}\n", format_validate_error(error)));
+    }
+}
+
+fn append_run_skipped_file_group(rendered: &mut String, image: &Path) {
+    append_validate_heading(rendered, &image.display().to_string());
+    rendered.push_str(&format!("file: {}\n", image.display()));
+    rendered.push_str("skipped: no metadata\n");
+}
+
+fn append_run_overview_group(rendered: &mut String, summary: &RunSummary) {
+    append_validate_heading(rendered, "overview");
+    rendered.push_str(&format!("errors      {}\n", summary.errors));
+    rendered.push_str(&format!("warnings    {}\n", summary.warnings));
+    rendered.push_str(&format!("written     {}\n", summary.written_tags));
+    rendered.push_str(&format!("skipped     {}\n", summary.skipped_tags));
+    rendered.push_str(&format!("files skipped {}\n", summary.skipped_files));
+
+    if summary.errors > 0 {
+        rendered.push_str(&format!("run: {}\n", "fail".red()));
+    } else {
+        rendered.push_str(&format!("run: {}\n", "success".green()));
     }
 }
 
@@ -2844,7 +2938,7 @@ enum RunTagError {
 }
 
 fn expand_run_tag(tag: &RunTag) -> Result<Vec<WritableExifTag>, RunTagError> {
-    if tag.value.is_null() {
+    if is_blank_yaml_value(&tag.value) {
         return Err(RunTagError::Ignored);
     }
 
@@ -2854,7 +2948,14 @@ fn expand_run_tag(tag: &RunTag) -> Result<Vec<WritableExifTag>, RunTagError> {
 
     writable_exif_tag(&tag.name, &tag.value)
         .map(|tag| vec![tag])
-        .ok_or_else(|| RunTagError::Warning(format!("unsupported writer tag `{}`", tag.name)))
+        .ok_or_else(|| {
+            RunTagError::Warning(format!("skipping unsupported writer tag `{}`", tag.name))
+        })
+}
+
+fn is_blank_yaml_value(value: &YamlValue) -> bool {
+    matches!(value, YamlValue::Null)
+        || matches!(value, YamlValue::String(value) if value.trim().is_empty())
 }
 
 fn expand_location_tag(value: &YamlValue) -> Result<Vec<WritableExifTag>, RunTagError> {
@@ -3042,6 +3143,7 @@ fn yaml_f64(value: &YamlValue) -> Option<f64> {
 
 fn yaml_rational(value: &YamlValue) -> Option<uR64> {
     if let YamlValue::String(value) = value {
+        let value = clean_numeric_string(value);
         if let Some((numerator, denominator)) = value.split_once('/') {
             let numerator = clean_numeric_string(numerator).parse::<u32>().ok()?;
             let denominator = clean_numeric_string(denominator).parse::<u32>().ok()?;
@@ -3056,8 +3158,13 @@ fn yaml_rational(value: &YamlValue) -> Option<uR64> {
 }
 
 fn clean_numeric_string(value: &str) -> String {
+    let value = value.trim();
+    let value = value
+        .strip_prefix("f/")
+        .or_else(|| value.strip_prefix("F/"))
+        .unwrap_or(value);
+
     value
-        .trim()
         .trim_end_matches("mm")
         .trim_end_matches("MM")
         .trim()
@@ -3339,17 +3446,88 @@ frames:
     }
 
     #[test]
+    fn run_plan_expands_iso_aliases_after_frame_overrides() {
+        let directory = temporary_test_directory("run-plan-iso");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        let image = directory.join("one.jpg");
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+exif:
+  ISO: 400
+frames:
+  1:
+    - ISOSpeed: 800
+"#,
+        )
+        .expect("test YAML should parse");
+
+        let plan = build_run_plan(&metadata, &yaml, std::slice::from_ref(&image))
+            .expect("run plan should build");
+        let tags = plan
+            .tags_for_image(&image)
+            .expect("image should have merged tags");
+
+        for name in ["ISO", "ISOSpeed", "ISOSpeedRatings"] {
+            assert!(
+                tags.iter()
+                    .any(|tag| tag.name == name && tag.value.as_i64() == Some(800)),
+                "{name} should be expanded with the frame override"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn run_output_renders_file_groups_and_overview() {
+        colored::control::set_override(true);
+        let image = PathBuf::from("image.jpg");
+        let output = RunOutput {
+            metadata_path: PathBuf::from("metadata.yaml"),
+            dry_run: true,
+            target_count: 1,
+            file_warnings: Vec::new(),
+            files: vec![RunFileOutput {
+                image: image.clone(),
+                result: RunFileResult {
+                    written: 2,
+                    warnings: vec!["skipping unsupported writer tag `FilmRoll`".to_string()],
+                    ..RunFileResult::default()
+                },
+            }],
+            skipped_files: Vec::new(),
+        };
+        let mut summary = RunSummary::default();
+        summary.add(&output.files[0].result);
+
+        let rendered = format_run_output(&output, &summary);
+        let plain = strip_ansi_codes(&rendered);
+
+        assert!(rendered.contains("\u{1b}[94mimage.jpg"));
+        assert!(plain.contains("warning: skipping unsupported writer tag `FilmRoll`"));
+        assert!(rendered.contains("\u{1b}[94moverview"));
+        assert!(plain.contains("errors      0"));
+        assert!(plain.contains("warnings    1"));
+        assert!(rendered.contains("run: \u{1b}[32msuccess"));
+    }
+
+    #[test]
     fn run_tag_parser_supports_fraction_and_unit_values() {
         let exposure = writable_exif_tag("ExposureTime", &YamlValue::String("1/500".to_string()))
             .expect("exposure tag should parse");
         let focal_length = writable_exif_tag("FocalLength", &YamlValue::String("75mm".to_string()))
             .expect("focal length tag should parse");
+        let aperture = writable_exif_tag("FNumber", &YamlValue::String("f/5.6".to_string()))
+            .expect("aperture tag should parse");
 
         assert!(
             matches!(exposure, WritableExifTag::ExposureTime(values) if values[0].nominator == 1 && values[0].denominator == 500)
         );
         assert!(
             matches!(focal_length, WritableExifTag::FocalLength(values) if values[0].nominator == 75_000_000 && values[0].denominator == 1_000_000)
+        );
+        assert!(
+            matches!(aperture, WritableExifTag::FNumber(values) if values[0].nominator == 5_600_000 && values[0].denominator == 1_000_000)
         );
     }
 
