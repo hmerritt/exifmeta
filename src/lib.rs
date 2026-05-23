@@ -2610,6 +2610,7 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
             image,
             result: RunFileResult::default(),
             elapsed_ms: 0,
+            dry_run,
         };
         print!("{}", format_run_file_header_output(&file_output));
         flush_stdout();
@@ -3054,6 +3055,7 @@ struct RunFileOutput {
     image: PathBuf,
     result: RunFileResult,
     elapsed_ms: u128,
+    dry_run: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3244,6 +3246,7 @@ fn apply_tags_to_image(
             .push("replacing existing non-exifmeta UserComment".to_string());
     }
 
+    let mut pending_written = 0;
     for tag in writable_tags {
         let is_custom_payload = matches!(tag, WritableExifTag::UserComment(_));
         if args.no_overwrite && !is_custom_payload && metadata.get_tag(&tag).next().is_some() {
@@ -3255,18 +3258,20 @@ fn apply_tags_to_image(
         }
 
         metadata.set_tag(tag);
-        result.written += if is_custom_payload {
+        pending_written += if is_custom_payload {
             custom_tags.len()
         } else {
             1
         };
     }
 
-    if result.written > 0 {
+    if pending_written > 0 {
         if let Err(error) = metadata.write_to_file(image) {
             result
                 .errors
                 .push(format!("failed to write EXIF metadata: {error}"));
+        } else {
+            result.written = pending_written;
         }
     }
 
@@ -3380,8 +3385,9 @@ fn append_run_file_header(rendered: &mut String, file: &RunFileOutput) {
 }
 
 fn append_run_file_result(rendered: &mut String, file: &RunFileOutput) {
+    let action = if file.dry_run { "would write" } else { "wrote" };
     rendered.push_str(&format!(
-        "wrote {} tags (took {})\n",
+        "{action} {} tags (took {})\n",
         file.result.written,
         format_run_duration(file.elapsed_ms)
     ));
@@ -3435,6 +3441,12 @@ fn append_run_overview_group(rendered: &mut String, first_group: &mut bool, summ
     append_run_overview_row(rendered, "took", format_run_duration(summary.elapsed_ms));
     if summary.errors > 0 {
         append_run_overview_row(rendered, "status", "fail".red());
+    } else if summary.warnings > 0 {
+        append_run_overview_row(
+            rendered,
+            "status",
+            format!("{} {}", "success".green(), "(with warnings)"),
+        );
     } else {
         append_run_overview_row(rendered, "status", "success".green());
     }
@@ -4029,6 +4041,7 @@ frames:
                         ..RunFileResult::default()
                     },
                     elapsed_ms: 42,
+                    dry_run: false,
                 },
                 RunFileOutput {
                     label: "2.jpg".to_string(),
@@ -4038,6 +4051,7 @@ frames:
                         ..RunFileResult::default()
                     },
                     elapsed_ms: 1501,
+                    dry_run: false,
                 },
             ],
             skipped_files: vec![PathBuf::from("missing.jpg")],
@@ -4074,9 +4088,9 @@ frames:
         assert!(plain.contains("skipped       0"));
         assert!(plain.contains("files skipped 1"));
         assert!(plain.contains("took          42ms"));
-        assert!(plain.contains("status        success"));
+        assert!(plain.contains("status        success (with warnings)"));
         assert!(!plain.contains("run:"));
-        assert!(rendered.contains("status        \u{1b}[32msuccess"));
+        assert!(rendered.contains("status        \u{1b}[32msuccess\u{1b}[0m (with warnings)"));
     }
 
     #[test]
@@ -4095,6 +4109,7 @@ frames:
                     ..RunFileResult::default()
                 },
                 elapsed_ms: 0,
+                dry_run: false,
             }],
             skipped_files: Vec::new(),
         };
@@ -4111,6 +4126,40 @@ frames:
     }
 
     #[test]
+    fn run_overview_status_omits_warning_suffix_without_warnings() {
+        colored::control::set_override(true);
+        let summary = RunSummary {
+            written_tags: 1,
+            ..RunSummary::default()
+        };
+
+        let rendered = format_run_overview_output(&summary);
+        let plain = strip_ansi_codes(&rendered);
+
+        assert!(plain.contains("warnings      0"));
+        assert!(plain.contains("status        success\n"));
+        assert!(!plain.contains("(with warnings)"));
+        assert!(rendered.contains("status        \u{1b}[32msuccess"));
+    }
+
+    #[test]
+    fn run_overview_status_fail_takes_precedence_over_warning_suffix() {
+        colored::control::set_override(true);
+        let summary = RunSummary {
+            warnings: 1,
+            errors: 1,
+            ..RunSummary::default()
+        };
+
+        let rendered = format_run_overview_output(&summary);
+        let plain = strip_ansi_codes(&rendered);
+
+        assert!(plain.contains("status        fail\n"));
+        assert!(!plain.contains("(with warnings)"));
+        assert!(rendered.contains("status        \u{1b}[31mfail"));
+    }
+
+    #[test]
     fn run_file_output_can_render_header_before_result() {
         colored::control::set_override(true);
         let file = RunFileOutput {
@@ -4122,6 +4171,7 @@ frames:
                 ..RunFileResult::default()
             },
             elapsed_ms: 1500,
+            dry_run: false,
         };
 
         let header = format_run_file_header_output(&file);
@@ -4134,6 +4184,44 @@ frames:
         assert_eq!(
             strip_ansi_codes(&result),
             "wrote 2 tags (took 1500ms)\nwarning: skipped ISO already exists\n"
+        );
+    }
+
+    #[test]
+    fn run_file_output_always_prints_zero_written_completion_line() {
+        let file = RunFileOutput {
+            label: "frame 1 (image.jpg)".to_string(),
+            image: PathBuf::from("image.jpg"),
+            result: RunFileResult {
+                skipped: vec!["ISO already exists".to_string()],
+                ..RunFileResult::default()
+            },
+            elapsed_ms: 17,
+            dry_run: false,
+        };
+
+        assert_eq!(
+            strip_ansi_codes(&format_run_file_result_output(&file)),
+            "wrote 0 tags (took 17ms)\nwarning: skipped ISO already exists\n"
+        );
+    }
+
+    #[test]
+    fn run_file_output_labels_dry_run_completion_as_would_write() {
+        let file = RunFileOutput {
+            label: "frame 1 (image.jpg)".to_string(),
+            image: PathBuf::from("image.jpg"),
+            result: RunFileResult {
+                written: 2,
+                ..RunFileResult::default()
+            },
+            elapsed_ms: 9,
+            dry_run: true,
+        };
+
+        assert_eq!(
+            strip_ansi_codes(&format_run_file_result_output(&file)),
+            "would write 2 tags (took 9ms)\n"
         );
     }
 
