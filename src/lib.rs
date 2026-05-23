@@ -3,7 +3,7 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use chrono::{DateTime, Local};
 use colored::Colorize;
@@ -2343,6 +2343,7 @@ const STANDARD_EXIF_TAG_NAMES: &[&str] = &[
 ];
 
 fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
+    let started = Instant::now();
     let request = RunRequest::from_args(&args);
     let resolution = resolve_metadata_path(request.metadata.as_deref())?;
 
@@ -2388,6 +2389,7 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
         output.files.push(RunFileOutput { image, result });
     }
 
+    summary.elapsed_ms = started.elapsed().as_millis();
     print!("{}", format_run_output(&output, &summary));
 
     if summary.errors > 0 {
@@ -2758,6 +2760,7 @@ struct RunSummary {
     skipped_files: usize,
     warnings: usize,
     errors: usize,
+    elapsed_ms: u128,
 }
 
 impl RunSummary {
@@ -2924,6 +2927,7 @@ fn append_run_overview_group(rendered: &mut String, summary: &RunSummary) {
     rendered.push_str(&format!("written     {}\n", summary.written_tags));
     rendered.push_str(&format!("skipped     {}\n", summary.skipped_tags));
     rendered.push_str(&format!("files skipped {}\n", summary.skipped_files));
+    rendered.push_str(&format!("took {} ms\n", summary.elapsed_ms));
 
     if summary.errors > 0 {
         rendered.push_str(&format!("run: {}\n", "fail".red()));
@@ -3499,6 +3503,7 @@ frames:
         };
         let mut summary = RunSummary::default();
         summary.add(&output.files[0].result);
+        summary.elapsed_ms = 42;
 
         let rendered = format_run_output(&output, &summary);
         let plain = strip_ansi_codes(&rendered);
@@ -3508,6 +3513,7 @@ frames:
         assert!(rendered.contains("\u{1b}[94moverview"));
         assert!(plain.contains("errors      0"));
         assert!(plain.contains("warnings    1"));
+        assert!(plain.contains("took 42 ms\nrun: success"));
         assert!(rendered.contains("run: \u{1b}[32msuccess"));
     }
 
