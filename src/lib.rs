@@ -2609,16 +2609,20 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
             label: frame.label,
             image,
             result: RunFileResult::default(),
+            elapsed_ms: 0,
         };
         print!("{}", format_run_file_header_output(&file_output));
         flush_stdout();
 
+        let file_started = Instant::now();
         let progress = RunSpinner::start(spinner, "writing metadata".to_string());
         let result = apply_tags_to_image(&file_output.image, &frame.tags, dry_run, &args);
         progress.finish();
+        let elapsed_ms = file_started.elapsed().as_millis();
         summary.add(&result);
         let file_output = RunFileOutput {
             result,
+            elapsed_ms,
             ..file_output
         };
         print!("{}", format_run_file_result_output(&file_output));
@@ -3049,6 +3053,7 @@ struct RunFileOutput {
     label: String,
     image: PathBuf,
     result: RunFileResult,
+    elapsed_ms: u128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3375,8 +3380,11 @@ fn append_run_file_header(rendered: &mut String, file: &RunFileOutput) {
 }
 
 fn append_run_file_result(rendered: &mut String, file: &RunFileOutput) {
-    rendered.push_str(&format!("tags: {}\n", file.result.written));
-    rendered.push_str(&format!("skipped: {}\n", file.result.skipped.len()));
+    rendered.push_str(&format!(
+        "wrote {} tags (took {})\n",
+        file.result.written,
+        format_run_duration(file.elapsed_ms)
+    ));
     for warning in &file.result.warnings {
         rendered.push_str(&format!("{}\n", format_validate_warning(warning)));
     }
@@ -3419,17 +3427,28 @@ fn is_current_directory_file(image: &Path) -> bool {
 
 fn append_run_overview_group(rendered: &mut String, first_group: &mut bool, summary: &RunSummary) {
     append_spaced_validate_heading(rendered, first_group, "overview");
-    rendered.push_str(&format!("errors      {}\n", summary.errors));
-    rendered.push_str(&format!("warnings    {}\n", summary.warnings));
-    rendered.push_str(&format!("written     {}\n", summary.written_tags));
-    rendered.push_str(&format!("skipped     {}\n", summary.skipped_tags));
-    rendered.push_str(&format!("files skipped {}\n", summary.skipped_files));
-    rendered.push_str(&format!("took {} ms\n", summary.elapsed_ms));
-
+    append_run_overview_row(rendered, "errors", summary.errors);
+    append_run_overview_row(rendered, "warnings", summary.warnings);
+    append_run_overview_row(rendered, "written", summary.written_tags);
+    append_run_overview_row(rendered, "skipped", summary.skipped_tags);
+    append_run_overview_row(rendered, "files skipped", summary.skipped_files);
+    append_run_overview_row(rendered, "took", format_run_duration(summary.elapsed_ms));
     if summary.errors > 0 {
-        rendered.push_str(&format!("run: {}\n", "fail".red()));
+        append_run_overview_row(rendered, "status", "fail".red());
     } else {
-        rendered.push_str(&format!("run: {}\n", "success".green()));
+        append_run_overview_row(rendered, "status", "success".green());
+    }
+}
+
+fn append_run_overview_row(rendered: &mut String, label: &str, value: impl std::fmt::Display) {
+    rendered.push_str(&format!("{label:<14}{value}\n"));
+}
+
+fn format_run_duration(elapsed_ms: u128) -> String {
+    if elapsed_ms > 1500 {
+        format!("{:.1}s", elapsed_ms as f64 / 1000.0)
+    } else {
+        format!("{elapsed_ms}ms")
     }
 }
 
@@ -4009,6 +4028,7 @@ frames:
                         warnings: vec!["skipping unsupported writer tag `FilmRoll`".to_string()],
                         ..RunFileResult::default()
                     },
+                    elapsed_ms: 42,
                 },
                 RunFileOutput {
                     label: "2.jpg".to_string(),
@@ -4017,6 +4037,7 @@ frames:
                         written: 1,
                         ..RunFileResult::default()
                     },
+                    elapsed_ms: 1501,
                 },
             ],
             skipped_files: vec![PathBuf::from("missing.jpg")],
@@ -4033,22 +4054,29 @@ frames:
         assert!(plain.starts_with("run "));
         assert!(plain.contains("mode: dry-run\n\nframes "));
         assert!(plain.contains("frames "));
-        assert!(plain.contains("frame 1 (image.jpg)\ntags: 2"));
+        assert!(plain.contains("frame 1 (image.jpg)\nwrote 2 tags (took 42ms)"));
         assert!(rendered.contains("\u{1b}[94mframes"));
         assert!(rendered.contains("\u{1b}[96mframe 1 (image.jpg)"));
         assert!(rendered.contains("\u{1b}[96m2.jpg"));
         assert!(!plain.contains("file: image.jpg"));
+        assert!(!plain.contains("\ntags:"));
+        assert!(!plain.contains("\nskipped: 0"));
         assert!(plain.contains("warning: skipping unsupported writer tag `FilmRoll`"));
-        assert!(
-            plain.contains("warning: skipping unsupported writer tag `FilmRoll`\n2.jpg\ntags: 1")
-        );
-        assert!(plain.contains("skipped: 0\nmissing.jpg\nskipped: no metadata"));
+        assert!(plain.contains(
+            "warning: skipping unsupported writer tag `FilmRoll`\n2.jpg\nwrote 1 tags (took 1.5s)"
+        ));
+        assert!(plain.contains("missing.jpg\nskipped: no metadata"));
         assert!(plain.contains("skipped: no metadata\n\noverview "));
         assert!(rendered.contains("\u{1b}[94moverview"));
-        assert!(plain.contains("errors      0"));
-        assert!(plain.contains("warnings    1"));
-        assert!(plain.contains("took 42 ms\nrun: success"));
-        assert!(rendered.contains("run: \u{1b}[32msuccess"));
+        assert!(plain.contains("errors        0"));
+        assert!(plain.contains("warnings      1"));
+        assert!(plain.contains("written       3"));
+        assert!(plain.contains("skipped       0"));
+        assert!(plain.contains("files skipped 1"));
+        assert!(plain.contains("took          42ms"));
+        assert!(plain.contains("status        success"));
+        assert!(!plain.contains("run:"));
+        assert!(rendered.contains("status        \u{1b}[32msuccess"));
     }
 
     #[test]
@@ -4066,6 +4094,7 @@ frames:
                     written: 1,
                     ..RunFileResult::default()
                 },
+                elapsed_ms: 0,
             }],
             skipped_files: Vec::new(),
         };
@@ -4092,6 +4121,7 @@ frames:
                 skipped: vec!["ISO already exists".to_string()],
                 ..RunFileResult::default()
             },
+            elapsed_ms: 1500,
         };
 
         let header = format_run_file_header_output(&file);
@@ -4103,8 +4133,16 @@ frames:
         assert!(!strip_ansi_codes(&header).contains("tags:"));
         assert_eq!(
             strip_ansi_codes(&result),
-            "tags: 2\nskipped: 1\nwarning: skipped ISO already exists\n"
+            "wrote 2 tags (took 1500ms)\nwarning: skipped ISO already exists\n"
         );
+    }
+
+    #[test]
+    fn run_duration_formats_milliseconds_until_threshold_then_seconds() {
+        assert_eq!(format_run_duration(42), "42ms");
+        assert_eq!(format_run_duration(1500), "1500ms");
+        assert_eq!(format_run_duration(1501), "1.5s");
+        assert_eq!(format_run_duration(2345), "2.3s");
     }
 
     #[test]
