@@ -429,10 +429,10 @@ fn append_pretty_inspect_rows(
 }
 
 fn pretty_inspect_row_sort_label(row: &PrettyInspectRow) -> String {
-    if let Some(suffix) = row.label.strip_prefix("Nearest Location ") {
-        format!("Nearest 0 Location {suffix}")
-    } else if row.label == "Nearest City" {
-        "Nearest 1 City".to_string()
+    if let Some(suffix) = row.label.strip_prefix("GPS Nearest Location ") {
+        format!("GPS Nearest 0 Location {suffix}")
+    } else if row.label == "GPS Nearest City" {
+        "GPS Nearest 1 City".to_string()
     } else {
         row.label.clone()
     }
@@ -507,7 +507,7 @@ fn append_nearest_location_rows(
                 Vec::new()
             }
         };
-    append_location_rows(pretty_rows, "Nearest Location", &nearest_location_rows);
+    append_location_rows(pretty_rows, "GPS Nearest Location", &nearest_location_rows);
 
     match nearest_locations(
         latitude,
@@ -517,7 +517,7 @@ fn append_nearest_location_rows(
     ) {
         Ok(locations) => append_non_duplicate_location_rows(
             pretty_rows,
-            "Nearest City",
+            "GPS Nearest City",
             locations,
             &nearest_location_rows,
         ),
@@ -1880,7 +1880,7 @@ fn append_validate_overview_group(
 }
 
 fn append_validate_heading(output: &mut String, label: &str) {
-    const WIDTH: usize = 58;
+    const WIDTH: usize = 50;
     let dash_count = WIDTH.saturating_sub(label.len() + 1);
     output.push_str(&format!(
         "{}\n",
@@ -2559,15 +2559,19 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
     summary.warnings += output.file_warnings.len();
 
     for image in targets {
-        let Some(tags) = plan.tags_for_image(&image) else {
+        let Some(frame) = plan.frame_for_image(&image) else {
             summary.skipped_files += 1;
             output.skipped_files.push(image);
             continue;
         };
 
-        let result = apply_tags_to_image(&image, &tags, dry_run, &args);
+        let result = apply_tags_to_image(&image, &frame.tags, dry_run, &args);
         summary.add(&result);
-        output.files.push(RunFileOutput { image, result });
+        output.files.push(RunFileOutput {
+            label: frame.label,
+            image,
+            result,
+        });
     }
 
     summary.elapsed_ms = started.elapsed().as_millis();
@@ -2793,19 +2797,19 @@ struct RunTag {
 #[derive(Debug, Clone, Default)]
 struct RunPlan {
     global: Vec<RunTag>,
-    frames: BTreeMap<PathBuf, Vec<RunTag>>,
+    frames: BTreeMap<PathBuf, RunFramePlan>,
 }
 
 impl RunPlan {
-    fn tags_for_image(&self, image: &Path) -> Option<Vec<RunTag>> {
-        let frame_tags = self.frames.get(image);
-        if self.global.is_empty() && frame_tags.is_none_or(Vec::is_empty) {
+    fn frame_for_image(&self, image: &Path) -> Option<RunFramePlan> {
+        let frame = self.frames.get(image);
+        if self.global.is_empty() && frame.is_none_or(|frame| frame.tags.is_empty()) {
             return None;
         }
 
         let mut merged = self.global.clone();
-        if let Some(frame_tags) = frame_tags {
-            for tag in frame_tags {
+        if let Some(frame) = frame {
+            for tag in &frame.tags {
                 if let Some(existing) = merged.iter_mut().find(|existing| existing.name == tag.name)
                 {
                     *existing = tag.clone();
@@ -2815,8 +2819,19 @@ impl RunPlan {
             }
         }
         normalize_iso_aliases(&mut merged);
-        Some(merged)
+        Some(RunFramePlan {
+            label: frame
+                .map(|frame| frame.label.clone())
+                .unwrap_or_else(|| run_file_heading(image)),
+            tags: merged,
+        })
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct RunFramePlan {
+    label: String,
+    tags: Vec<RunTag>,
 }
 
 fn normalize_iso_aliases(tags: &mut Vec<RunTag>) {
@@ -2868,12 +2883,25 @@ fn build_run_plan(
             let Some(image) = resolve_run_frame_target(frame_key, image_directory, targets) else {
                 continue;
             };
-            plan.frames
-                .insert(image, collect_run_tags_from_frame_value(frame_value)?);
+            plan.frames.insert(
+                image.clone(),
+                RunFramePlan {
+                    label: run_frame_label(frame_key, &image),
+                    tags: collect_run_tags_from_frame_value(frame_value)?,
+                },
+            );
         }
     }
 
     Ok(plan)
+}
+
+fn run_frame_label(frame_key: &YamlValue, image: &Path) -> String {
+    if let Some(frame_number) = frame_number_from_key(frame_key) {
+        return format!("frame {frame_number} ({})", run_file_heading(image));
+    }
+
+    run_file_heading(image)
 }
 
 fn resolve_run_frame_target(
@@ -2965,6 +2993,7 @@ struct RunOutput {
 
 #[derive(Debug, Clone)]
 struct RunFileOutput {
+    label: String,
     image: PathBuf,
     result: RunFileResult,
 }
@@ -3094,12 +3123,7 @@ fn format_run_output(output: &RunOutput, summary: &RunSummary) -> String {
     let mut first_group = true;
 
     append_run_metadata_group(&mut rendered, &mut first_group, output);
-    for file in &output.files {
-        append_run_file_group(&mut rendered, &mut first_group, file);
-    }
-    for skipped in &output.skipped_files {
-        append_run_skipped_file_group(&mut rendered, &mut first_group, skipped);
-    }
+    append_run_frames_group(&mut rendered, &mut first_group, output);
     append_run_overview_group(&mut rendered, &mut first_group, summary);
 
     rendered
@@ -3120,8 +3144,18 @@ fn append_run_metadata_group(rendered: &mut String, first_group: &mut bool, outp
     }
 }
 
-fn append_run_file_group(rendered: &mut String, first_group: &mut bool, file: &RunFileOutput) {
-    append_spaced_validate_heading(rendered, first_group, &run_file_heading(&file.image));
+fn append_run_frames_group(rendered: &mut String, first_group: &mut bool, output: &RunOutput) {
+    append_spaced_validate_heading(rendered, first_group, "frames");
+    for file in &output.files {
+        append_run_file_group(rendered, file);
+    }
+    for skipped in &output.skipped_files {
+        append_run_skipped_file_group(rendered, skipped);
+    }
+}
+
+fn append_run_file_group(rendered: &mut String, file: &RunFileOutput) {
+    append_run_frame_subtitle(rendered, &file.label);
     append_run_file_path(rendered, &file.image);
     rendered.push_str(&format!("tags: {}\n", file.result.written));
     rendered.push_str(&format!("skipped: {}\n", file.result.skipped.len()));
@@ -3139,10 +3173,14 @@ fn append_run_file_group(rendered: &mut String, first_group: &mut bool, file: &R
     }
 }
 
-fn append_run_skipped_file_group(rendered: &mut String, first_group: &mut bool, image: &Path) {
-    append_spaced_validate_heading(rendered, first_group, &run_file_heading(image));
+fn append_run_skipped_file_group(rendered: &mut String, image: &Path) {
+    append_run_frame_subtitle(rendered, &run_file_heading(image));
     append_run_file_path(rendered, image);
     rendered.push_str("skipped: no metadata\n");
+}
+
+fn append_run_frame_subtitle(rendered: &mut String, label: &str) {
+    rendered.push_str(&format!("{}\n", label.bright_cyan()));
 }
 
 fn run_file_heading(image: &Path) -> String {
@@ -3657,11 +3695,13 @@ frames:
 
         let plan = build_run_plan(&metadata, &yaml, std::slice::from_ref(&image))
             .expect("run plan should build");
-        let tags = plan
-            .tags_for_image(&image)
+        let frame = plan
+            .frame_for_image(&image)
             .expect("image should have merged tags");
+        let tags = frame.tags;
 
         assert_eq!(tags.len(), 3);
+        assert_eq!(frame.label, "frame 1 (one.jpg)");
         assert!(
             tags.iter()
                 .any(|tag| tag.name == "Make" && tag.value.as_str() == Some("Nikon"))
@@ -3693,8 +3733,9 @@ frames:
         let plan = build_run_plan(&metadata, &yaml, std::slice::from_ref(&image))
             .expect("run plan should build");
         let tags = plan
-            .tags_for_image(&image)
-            .expect("image should have merged tags");
+            .frame_for_image(&image)
+            .expect("image should have merged tags")
+            .tags;
 
         for name in ["ISO", "ISOSpeed", "ISOSpeedRatings"] {
             assert!(
@@ -3708,26 +3749,63 @@ frames:
     }
 
     #[test]
+    fn run_plan_labels_filename_frame_keys_with_file_name() {
+        let directory = temporary_test_directory("run-plan-filename-label");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        let image = directory.join("2.jpg");
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+frames:
+  "2.jpg":
+    Make: Nikon
+"#,
+        )
+        .expect("test YAML should parse");
+
+        let plan = build_run_plan(&metadata, &yaml, std::slice::from_ref(&image))
+            .expect("run plan should build");
+        let frame = plan
+            .frame_for_image(&image)
+            .expect("filename frame should match image");
+
+        assert_eq!(frame.label, "2.jpg");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn run_output_renders_file_groups_and_overview() {
         colored::control::set_override(true);
         let image = PathBuf::from("image.jpg");
         let output = RunOutput {
             metadata_path: PathBuf::from("metadata.yaml"),
             dry_run: true,
-            target_count: 1,
+            target_count: 3,
             file_warnings: Vec::new(),
-            files: vec![RunFileOutput {
-                image: image.clone(),
-                result: RunFileResult {
-                    written: 2,
-                    warnings: vec!["skipping unsupported writer tag `FilmRoll`".to_string()],
-                    ..RunFileResult::default()
+            files: vec![
+                RunFileOutput {
+                    label: "frame 1 (image.jpg)".to_string(),
+                    image: image.clone(),
+                    result: RunFileResult {
+                        written: 2,
+                        warnings: vec!["skipping unsupported writer tag `FilmRoll`".to_string()],
+                        ..RunFileResult::default()
+                    },
                 },
-            }],
+                RunFileOutput {
+                    label: "2.jpg".to_string(),
+                    image: PathBuf::from("2.jpg"),
+                    result: RunFileResult {
+                        written: 1,
+                        ..RunFileResult::default()
+                    },
+                },
+            ],
             skipped_files: vec![PathBuf::from("missing.jpg")],
         };
         let mut summary = RunSummary::default();
         summary.add(&output.files[0].result);
+        summary.add(&output.files[1].result);
         summary.skipped_files = output.skipped_files.len();
         summary.elapsed_ms = 42;
 
@@ -3735,13 +3813,18 @@ frames:
         let plain = strip_ansi_codes(&rendered);
 
         assert!(plain.starts_with("run "));
-        assert!(plain.contains("mode: dry-run\n\nimage.jpg "));
-        assert!(rendered.contains("\u{1b}[94mimage.jpg"));
+        assert!(plain.contains("mode: dry-run\n\nframes "));
+        assert!(plain.contains("frames "));
+        assert!(plain.contains("frame 1 (image.jpg)\ntags: 2"));
+        assert!(rendered.contains("\u{1b}[94mframes"));
+        assert!(rendered.contains("\u{1b}[96mframe 1 (image.jpg)"));
+        assert!(rendered.contains("\u{1b}[96m2.jpg"));
         assert!(!plain.contains("file: image.jpg"));
         assert!(plain.contains("warning: skipping unsupported writer tag `FilmRoll`"));
         assert!(
-            plain.contains("warning: skipping unsupported writer tag `FilmRoll`\n\nmissing.jpg ")
+            plain.contains("warning: skipping unsupported writer tag `FilmRoll`\n2.jpg\ntags: 1")
         );
+        assert!(plain.contains("skipped: 0\nmissing.jpg\nskipped: no metadata"));
         assert!(plain.contains("skipped: no metadata\n\noverview "));
         assert!(rendered.contains("\u{1b}[94moverview"));
         assert!(plain.contains("errors      0"));
@@ -3759,6 +3842,7 @@ frames:
             target_count: 1,
             file_warnings: Vec::new(),
             files: vec![RunFileOutput {
+                label: "image.jpg".to_string(),
                 image: PathBuf::from("nested").join("image.jpg"),
                 result: RunFileResult {
                     written: 1,
@@ -3773,7 +3857,7 @@ frames:
         let rendered = format_run_output(&output, &summary);
         let plain = strip_ansi_codes(&rendered);
 
-        assert!(rendered.contains("\u{1b}[94mimage.jpg"));
+        assert!(rendered.contains("\u{1b}[96mimage.jpg"));
         assert!(
             plain.contains("file: nested\\image.jpg") || plain.contains("file: nested/image.jpg")
         );
@@ -4860,23 +4944,23 @@ frames:
         let plain_output = strip_ansi_codes(&output);
 
         assert!(plain_output.contains("gps "));
-        assert_eq!(plain_output.matches("Nearest Location").count(), 5);
-        assert_eq!(plain_output.matches("Nearest City").count(), 1);
-        assert_eq!(plain_output.matches("Nearest Large City").count(), 0);
-        assert!(plain_output.contains("Nearest Location 1  (1.9 km) Dunchurch, GB"));
-        assert!(plain_output.contains("Nearest Location 2  (3.2 km) Long Lawford, GB"));
-        assert!(plain_output.contains("Nearest City        (15.3 km) Coventry, GB"));
+        assert_eq!(plain_output.matches("GPS Nearest Location").count(), 5);
+        assert_eq!(plain_output.matches("GPS Nearest City").count(), 1);
+        assert_eq!(plain_output.matches("GPS Nearest Large City").count(), 0);
+        assert!(plain_output.contains("GPS Nearest Location 1  (1.9 km) Dunchurch, GB"));
+        assert!(plain_output.contains("GPS Nearest Location 2  (3.2 km) Long Lawford, GB"));
+        assert!(plain_output.contains("GPS Nearest City        (15.3 km) Coventry, GB"));
         assert!(
             plain_output
-                .find("Nearest Location 5")
+                .find("GPS Nearest Location 5")
                 .expect("nearest location rows should be present")
                 < plain_output
-                    .find("Nearest City")
+                    .find("GPS Nearest City")
                     .expect("nearest city rows should be present")
         );
-        assert!(output.contains("\u{1b}[32mNearest Location 1\u{1b}[0m"));
-        assert!(output.contains("\u{1b}[32mNearest City\u{1b}[0m"));
-        assert!(!output.contains("\u{1b}[32mNearest Large City\u{1b}[0m"));
+        assert!(output.contains("\u{1b}[32mGPS Nearest Location 1\u{1b}[0m"));
+        assert!(output.contains("\u{1b}[32mGPS Nearest City\u{1b}[0m"));
+        assert!(!output.contains("\u{1b}[32mGPS Nearest Large City\u{1b}[0m"));
     }
 
     #[test]
@@ -4887,10 +4971,10 @@ frames:
             format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Pretty);
         let plain_output = strip_ansi_codes(&output);
 
-        assert_eq!(plain_output.matches("Nearest Location").count(), 5);
-        assert_eq!(plain_output.matches("Nearest City").count(), 0);
+        assert_eq!(plain_output.matches("GPS Nearest Location").count(), 5);
+        assert_eq!(plain_output.matches("GPS Nearest City").count(), 0);
         assert_eq!(plain_output.matches("Coventry, GB").count(), 1);
-        assert!(plain_output.contains("Nearest Location 1  (0 m) Coventry, GB"));
+        assert!(plain_output.contains("GPS Nearest Location 1  (0 m) Coventry, GB"));
     }
 
     #[test]
@@ -4902,9 +4986,9 @@ frames:
         assert!(output.contains("GPSLatitude"));
         assert!(output.contains("GPSLatitudeRef"));
         assert!(output.contains("GPSLongitudeRef"));
-        assert!(!output.contains("Nearest Location"));
-        assert!(!output.contains("Nearest City"));
-        assert!(!output.contains("Nearest Large City"));
+        assert!(!output.contains("GPS Nearest Location"));
+        assert!(!output.contains("GPS Nearest City"));
+        assert!(!output.contains("GPS Nearest Large City"));
         assert!(!output.contains("Dunchurch"));
         assert!(!output.contains("Coventry"));
     }
@@ -4925,7 +5009,7 @@ frames:
         assert!(output.contains("GPS Latitude"));
         assert!(output.contains("[GPSLatitudeRef missing]"));
         assert!(output.contains("(10.5) 10 deg 30 min 0 sec [GPSLatitudeRef missing]"));
-        assert!(!output.contains("Nearest Location"));
+        assert!(!output.contains("GPS Nearest Location"));
     }
 
     #[test]
