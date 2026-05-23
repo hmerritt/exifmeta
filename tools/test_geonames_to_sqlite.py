@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
-import tempfile
+import shutil
 import unittest
+import uuid
 from contextlib import closing
 from pathlib import Path
 
@@ -11,8 +12,9 @@ import geonames_to_sqlite
 
 class GeoNamesToSqliteTests(unittest.TestCase):
     def test_convert_imports_population_and_elevation(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
-            root = Path(directory)
+        root = Path.cwd() / f"test-geonames-{uuid.uuid4().hex}"
+        root.mkdir()
+        try:
             input_path = root / "cities1000.txt"
             output_path = root / "cities1000.sqlite"
             input_path.write_text(
@@ -46,6 +48,8 @@ class GeoNamesToSqliteTests(unittest.TestCase):
                     (456, "Blankton", "GB", 52.5, -1.25, 1234, None),
                 ],
             )
+        finally:
+            shutil.rmtree(root)
 
 
 def geonames_row(

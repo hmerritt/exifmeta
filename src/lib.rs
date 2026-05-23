@@ -4704,7 +4704,7 @@ frames:
         let output =
             format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
         colored::control::set_override(false);
-        let expected = format!("\u{1b}[94mcamera {}\u{1b}[0m", "─".repeat(51));
+        let expected = format!("\u{1b}[94mcamera {}\u{1b}[0m", "─".repeat(43));
 
         assert_eq!(output.lines().next(), Some(expected.as_str()));
     }
