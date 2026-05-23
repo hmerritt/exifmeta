@@ -251,6 +251,7 @@ dependencies = [
  "colored",
  "kamadak-exif",
  "little_exif",
+ "rattles",
  "rusqlite",
  "serde_json",
  "serde_yaml",
@@ -486,6 +487,12 @@ checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "rattles"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0704e453f2514c76367349b878f07a9c969365dab09d8a97e96a89cd4c3e26e"
 
 [[package]]
 name = "rusqlite"

@@ -3,7 +3,12 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::time::{Instant, SystemTime};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
 use colored::Colorize;
@@ -11,6 +16,7 @@ use exif::{Error as ExifError, Exif, Field, Reader, Tag, Value};
 use little_exif::exif_tag::ExifTag as WritableExifTag;
 use little_exif::metadata::Metadata as WritableMetadata;
 use little_exif::rational::uR64;
+use rattles::presets::prelude as spinners;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, DatabaseName, params, params_from_iter};
 use serde_yaml::{Mapping, Value as YamlValue};
@@ -2576,25 +2582,53 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
         skipped_files: Vec::new(),
     };
     summary.warnings += output.file_warnings.len();
+    let spinner = RunSpinnerPreset::random();
+
+    print!("{}", format_run_metadata_output(&output));
+    print!("{}", format_run_frames_heading());
+    flush_stdout();
 
     for image in targets {
         let Some(frame) = plan.frame_for_image(&image) else {
             summary.skipped_files += 1;
             output.skipped_files.push(image);
+            print!(
+                "{}",
+                format_run_skipped_file_output(
+                    output
+                        .skipped_files
+                        .last()
+                        .expect("skipped file should exist")
+                )
+            );
+            flush_stdout();
             continue;
         };
 
-        let result = apply_tags_to_image(&image, &frame.tags, dry_run, &args);
-        summary.add(&result);
-        output.files.push(RunFileOutput {
+        let file_output = RunFileOutput {
             label: frame.label,
             image,
+            result: RunFileResult::default(),
+        };
+        print!("{}", format_run_file_header_output(&file_output));
+        flush_stdout();
+
+        let progress = RunSpinner::start(spinner, "writing metadata".to_string());
+        let result = apply_tags_to_image(&file_output.image, &frame.tags, dry_run, &args);
+        progress.finish();
+        summary.add(&result);
+        let file_output = RunFileOutput {
             result,
-        });
+            ..file_output
+        };
+        print!("{}", format_run_file_result_output(&file_output));
+        flush_stdout();
+        output.files.push(file_output);
     }
 
     summary.elapsed_ms = started.elapsed().as_millis();
-    print!("{}", format_run_output(&output, &summary));
+    print!("{}", format_run_overview_output(&summary));
+    flush_stdout();
 
     if summary.errors > 0 {
         Err("one or more target images failed".to_string())
@@ -3017,6 +3051,126 @@ struct RunFileOutput {
     result: RunFileResult,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunSpinnerPreset {
+    Dots,
+    Pulse,
+    FillSweep,
+    DiagSwipe,
+    Cascade,
+    Columns,
+    Sand,
+    WaveRows,
+    Scan,
+}
+
+const RUN_SPINNER_PRESETS: [RunSpinnerPreset; 9] = [
+    RunSpinnerPreset::Dots,
+    RunSpinnerPreset::Pulse,
+    RunSpinnerPreset::FillSweep,
+    RunSpinnerPreset::DiagSwipe,
+    RunSpinnerPreset::Cascade,
+    RunSpinnerPreset::Columns,
+    RunSpinnerPreset::Sand,
+    RunSpinnerPreset::WaveRows,
+    RunSpinnerPreset::Scan,
+];
+
+impl RunSpinnerPreset {
+    fn random() -> Self {
+        let entropy = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        RUN_SPINNER_PRESETS[entropy as usize % RUN_SPINNER_PRESETS.len()]
+    }
+
+    fn frame(self) -> &'static str {
+        match self {
+            Self::Dots => spinners::dots().current_frame(),
+            Self::Pulse => spinners::pulse().current_frame(),
+            Self::FillSweep => spinners::fillsweep().current_frame(),
+            Self::DiagSwipe => spinners::diagswipe().current_frame(),
+            Self::Cascade => spinners::cascade().current_frame(),
+            Self::Columns => spinners::columns().current_frame(),
+            Self::Sand => spinners::sand().current_frame(),
+            Self::WaveRows => spinners::waverows().current_frame(),
+            Self::Scan => spinners::scan().current_frame(),
+        }
+    }
+
+    #[cfg(test)]
+    fn name(self) -> &'static str {
+        match self {
+            Self::Dots => "dots",
+            Self::Pulse => "pulse",
+            Self::FillSweep => "fillsweep",
+            Self::DiagSwipe => "diagswipe",
+            Self::Cascade => "cascade",
+            Self::Columns => "columns",
+            Self::Sand => "sand",
+            Self::WaveRows => "waverows",
+            Self::Scan => "scan",
+        }
+    }
+}
+
+struct RunSpinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+    clear_width: usize,
+}
+
+impl RunSpinner {
+    fn start(preset: RunSpinnerPreset, label: String) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let clear_width = label.len() + 16;
+        print!("\r{} {}", preset.frame(), label);
+        flush_stdout();
+        let handle = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Relaxed) {
+                print!("\r{} {}", preset.frame(), label);
+                flush_stdout();
+                thread::sleep(Duration::from_millis(80));
+            }
+        });
+
+        Self {
+            stop,
+            handle: Some(handle),
+            clear_width,
+        }
+    }
+
+    fn finish(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+            clear_spinner_line(self.clear_width);
+        }
+    }
+}
+
+impl Drop for RunSpinner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+            clear_spinner_line(self.clear_width);
+        }
+    }
+}
+
+fn clear_spinner_line(width: usize) {
+    print!("\r{}\r", " ".repeat(width));
+    flush_stdout();
+}
+
+fn flush_stdout() {
+    let _ = std::io::stdout().flush();
+}
+
 fn apply_tags_to_image(
     image: &Path,
     tags: &[RunTag],
@@ -3137,14 +3291,66 @@ fn writable_tag_identity(tag: &WritableExifTag) -> (u16, String) {
     (tag.as_u16(), format!("{:?}", tag.get_group()))
 }
 
+#[cfg(test)]
 fn format_run_output(output: &RunOutput, summary: &RunSummary) -> String {
     let mut rendered = String::new();
+    rendered.push_str(&format_run_metadata_output(output));
+    rendered.push_str(&format_run_frames_heading());
+    for file in &output.files {
+        rendered.push_str(&format_run_file_output(file));
+    }
+    for skipped in &output.skipped_files {
+        rendered.push_str(&format_run_skipped_file_output(skipped));
+    }
+    rendered.push_str(&format_run_overview_output(summary));
+
+    rendered
+}
+
+fn format_run_metadata_output(output: &RunOutput) -> String {
+    let mut rendered = String::new();
     let mut first_group = true;
-
     append_run_metadata_group(&mut rendered, &mut first_group, output);
-    append_run_frames_group(&mut rendered, &mut first_group, output);
-    append_run_overview_group(&mut rendered, &mut first_group, summary);
+    rendered
+}
 
+fn format_run_frames_heading() -> String {
+    let mut rendered = String::new();
+    let mut first_group = false;
+    append_spaced_validate_heading(&mut rendered, &mut first_group, "frames");
+    rendered
+}
+
+#[cfg(test)]
+fn format_run_file_output(file: &RunFileOutput) -> String {
+    let mut rendered = String::new();
+    append_run_file_header(&mut rendered, file);
+    append_run_file_result(&mut rendered, file);
+    rendered
+}
+
+fn format_run_file_header_output(file: &RunFileOutput) -> String {
+    let mut rendered = String::new();
+    append_run_file_header(&mut rendered, file);
+    rendered
+}
+
+fn format_run_file_result_output(file: &RunFileOutput) -> String {
+    let mut rendered = String::new();
+    append_run_file_result(&mut rendered, file);
+    rendered
+}
+
+fn format_run_skipped_file_output(image: &Path) -> String {
+    let mut rendered = String::new();
+    append_run_skipped_file_group(&mut rendered, image);
+    rendered
+}
+
+fn format_run_overview_output(summary: &RunSummary) -> String {
+    let mut rendered = String::new();
+    let mut first_group = false;
+    append_run_overview_group(&mut rendered, &mut first_group, summary);
     rendered
 }
 
@@ -3163,19 +3369,12 @@ fn append_run_metadata_group(rendered: &mut String, first_group: &mut bool, outp
     }
 }
 
-fn append_run_frames_group(rendered: &mut String, first_group: &mut bool, output: &RunOutput) {
-    append_spaced_validate_heading(rendered, first_group, "frames");
-    for file in &output.files {
-        append_run_file_group(rendered, file);
-    }
-    for skipped in &output.skipped_files {
-        append_run_skipped_file_group(rendered, skipped);
-    }
-}
-
-fn append_run_file_group(rendered: &mut String, file: &RunFileOutput) {
+fn append_run_file_header(rendered: &mut String, file: &RunFileOutput) {
     append_run_frame_subtitle(rendered, &file.label);
     append_run_file_path(rendered, &file.image);
+}
+
+fn append_run_file_result(rendered: &mut String, file: &RunFileOutput) {
     rendered.push_str(&format!("tags: {}\n", file.result.written));
     rendered.push_str(&format!("skipped: {}\n", file.result.skipped.len()));
     for warning in &file.result.warnings {
@@ -3879,6 +4078,55 @@ frames:
         assert!(rendered.contains("\u{1b}[96mimage.jpg"));
         assert!(
             plain.contains("file: nested\\image.jpg") || plain.contains("file: nested/image.jpg")
+        );
+    }
+
+    #[test]
+    fn run_file_output_can_render_header_before_result() {
+        colored::control::set_override(true);
+        let file = RunFileOutput {
+            label: "frame 1 (image.jpg)".to_string(),
+            image: PathBuf::from("image.jpg"),
+            result: RunFileResult {
+                written: 2,
+                skipped: vec!["ISO already exists".to_string()],
+                ..RunFileResult::default()
+            },
+        };
+
+        let header = format_run_file_header_output(&file);
+        let result = format_run_file_result_output(&file);
+        let combined = format_run_file_output(&file);
+
+        assert_eq!(combined, format!("{header}{result}"));
+        assert_eq!(strip_ansi_codes(&header), "frame 1 (image.jpg)\n");
+        assert!(!strip_ansi_codes(&header).contains("tags:"));
+        assert_eq!(
+            strip_ansi_codes(&result),
+            "tags: 2\nskipped: 1\nwarning: skipped ISO already exists\n"
+        );
+    }
+
+    #[test]
+    fn run_spinner_presets_match_allowed_names() {
+        let names = RUN_SPINNER_PRESETS
+            .iter()
+            .map(|preset| preset.name())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            [
+                "dots",
+                "pulse",
+                "fillsweep",
+                "diagswipe",
+                "cascade",
+                "columns",
+                "sand",
+                "waverows",
+                "scan",
+            ]
         );
     }
 
@@ -4703,11 +4951,8 @@ frames:
             file_info: InspectFileInfo::empty(),
         };
 
-        let pretty = format_inspect_output(
-            Path::new("image.tif"),
-            &metadata,
-            InspectFormat::Pretty,
-        );
+        let pretty =
+            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
         let plain_pretty = strip_ansi_codes(&pretty);
         let raw = strip_ansi_codes(&format_inspect_output(
             Path::new("image.tif"),
@@ -4760,11 +5005,8 @@ frames:
             file_info: InspectFileInfo::empty(),
         };
 
-        let pretty = format_inspect_output(
-            Path::new("image.tif"),
-            &metadata,
-            InspectFormat::Pretty,
-        );
+        let pretty =
+            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
         let plain_pretty = strip_ansi_codes(&pretty);
         let raw = strip_ansi_codes(&format_inspect_output(
             Path::new("image.tif"),
