@@ -29,6 +29,10 @@ const METADATA_YML_FILE_NAME: &str = "metadata.yml";
 const CUSTOM_TAG_PAYLOAD_MARKER: &str = concat!("exifmeta-v", env!("CARGO_PKG_VERSION"), "\n");
 const LEGACY_CUSTOM_TAG_PAYLOAD_PREFIX: &[u8] = b"exifmeta-custom-tags-v1\n";
 const USER_COMMENT_ASCII_PREFIX: &[u8] = b"ASCII\0\0\0";
+const PRETTY_UNKNOWN_VALUE_DISPLAY_LIMIT: usize = 120;
+const PRETTY_KNOWN_VALUE_DISPLAY_LIMIT: usize = 2000;
+const PRETTY_UNKNOWN_VALUE_OMITTED_LABEL: &str = "<long value omitted>";
+const PRETTY_UNKNOWN_VALUE_OMITTED_HINT: &str = " (use `--format raw` to view)";
 const METADATA_TEMPLATE: &str = r#"# ───────────────────────────────────────────────
 # Metadata file for images in this directory. Used by exifmeta, https://github.com/hmerritt/exifmeta
 # ───────────────────────────────────────────────
@@ -810,11 +814,26 @@ fn normalized_label_starts_with(label: &str, prefixes: &[&str]) -> bool {
 }
 
 fn pretty_inspect_value(row: &InspectRow) -> String {
+    if row.is_unknown && row.value.chars().count() > PRETTY_UNKNOWN_VALUE_DISPLAY_LIMIT {
+        return pretty_unknown_value_omitted_message();
+    }
+    if !row.is_unknown && row.value.chars().count() > PRETTY_KNOWN_VALUE_DISPLAY_LIMIT {
+        return pretty_unknown_value_omitted_message();
+    }
+
     if row.name == "ExposureTime" {
         return pretty_exposure_time(&row.value).unwrap_or_else(|| row.value.clone());
     }
 
     row.value.clone()
+}
+
+fn pretty_unknown_value_omitted_message() -> String {
+    format!(
+        "{}{}",
+        PRETTY_UNKNOWN_VALUE_OMITTED_LABEL.yellow(),
+        PRETTY_UNKNOWN_VALUE_OMITTED_HINT
+    )
 }
 
 fn pretty_exposure_time(value: &str) -> Option<String> {
@@ -4672,6 +4691,119 @@ frames:
     }
 
     #[test]
+    fn pretty_inspect_output_masks_long_unknown_values() {
+        colored::control::set_override(true);
+        let long_value = "x".repeat(160);
+        let mut raw_value = long_value.clone().into_bytes();
+        raw_value.push(0);
+        let entry = tiff_ascii_offset_entry(0xfde8, raw_value.len(), 200);
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif_with_offsets(&[entry], &[(200, raw_value)]),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        };
+
+        let pretty = format_inspect_output(
+            Path::new("image.tif"),
+            &metadata,
+            InspectFormat::Pretty,
+        );
+        let plain_pretty = strip_ansi_codes(&pretty);
+        let raw = strip_ansi_codes(&format_inspect_output(
+            Path::new("image.tif"),
+            &metadata,
+            InspectFormat::Raw,
+        ));
+        let omitted_message = format!(
+            "{}{}",
+            PRETTY_UNKNOWN_VALUE_OMITTED_LABEL, PRETTY_UNKNOWN_VALUE_OMITTED_HINT
+        );
+
+        assert!(plain_pretty.contains("unknown "));
+        assert!(plain_pretty.contains("Unknown Tiff Tag"));
+        assert!(plain_pretty.contains(&omitted_message));
+        assert!(pretty.contains(&format!(
+            "\u{1b}[33m{}\u{1b}[0m{}",
+            PRETTY_UNKNOWN_VALUE_OMITTED_LABEL, PRETTY_UNKNOWN_VALUE_OMITTED_HINT
+        )));
+        assert!(!plain_pretty.contains(&long_value));
+        assert!(raw.contains(&long_value));
+        assert!(!raw.contains(&omitted_message));
+    }
+
+    #[test]
+    fn pretty_inspect_output_keeps_unknown_values_at_display_limit() {
+        let value = "x".repeat(PRETTY_UNKNOWN_VALUE_DISPLAY_LIMIT);
+        let row = InspectRow {
+            is_unknown: true,
+            ifd: 0,
+            context: "Tiff".to_string(),
+            tag_id: 0xfde8,
+            name: "Tag(Tiff, 0xFDE8)".to_string(),
+            pretty_name: "Unknown Tiff Tag".to_string(),
+            value: value.clone(),
+        };
+
+        assert_eq!(pretty_inspect_value(&row), value);
+    }
+
+    #[test]
+    fn pretty_inspect_output_masks_long_known_exif_values() {
+        colored::control::set_override(true);
+        let long_value = "x".repeat(PRETTY_KNOWN_VALUE_DISPLAY_LIMIT + 1);
+        let mut raw_value = USER_COMMENT_ASCII_PREFIX.to_vec();
+        raw_value.extend_from_slice(long_value.as_bytes());
+        let entry = tiff_undefined_entry(0x9286, raw_value.len(), 200);
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif_with_exif_entries(&[entry], &[(200, raw_value)]),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        };
+
+        let pretty = format_inspect_output(
+            Path::new("image.tif"),
+            &metadata,
+            InspectFormat::Pretty,
+        );
+        let plain_pretty = strip_ansi_codes(&pretty);
+        let raw = strip_ansi_codes(&format_inspect_output(
+            Path::new("image.tif"),
+            &metadata,
+            InspectFormat::Raw,
+        ));
+        let omitted_message = format!(
+            "{}{}",
+            PRETTY_UNKNOWN_VALUE_OMITTED_LABEL, PRETTY_UNKNOWN_VALUE_OMITTED_HINT
+        );
+
+        assert!(plain_pretty.contains("User Comment"));
+        assert!(plain_pretty.contains(&omitted_message));
+        assert!(pretty.contains(&format!(
+            "\u{1b}[33m{}\u{1b}[0m{}",
+            PRETTY_UNKNOWN_VALUE_OMITTED_LABEL, PRETTY_UNKNOWN_VALUE_OMITTED_HINT
+        )));
+        assert!(!plain_pretty.contains(&long_value));
+        assert!(raw.contains(&long_value));
+        assert!(!raw.contains(&omitted_message));
+    }
+
+    #[test]
+    fn pretty_inspect_output_keeps_known_exif_values_at_display_limit() {
+        let value = "x".repeat(PRETTY_KNOWN_VALUE_DISPLAY_LIMIT);
+        let row = InspectRow {
+            is_unknown: false,
+            ifd: 0,
+            context: "Exif".to_string(),
+            tag_id: 0x9286,
+            name: "UserComment".to_string(),
+            pretty_name: "User Comment".to_string(),
+            value: value.clone(),
+        };
+
+        assert_eq!(pretty_inspect_value(&row), value);
+    }
+
+    #[test]
     fn pretty_inspect_output_omits_empty_groups() {
         let metadata = InspectMetadata {
             exif: parse_raw_exif(&[tiff_ascii_entry(0x010f, b"Z\0")]),
@@ -5363,6 +5495,15 @@ frames:
         entry[2..4].copy_from_slice(&2u16.to_be_bytes());
         entry[4..8].copy_from_slice(&(value.len() as u32).to_be_bytes());
         entry[8..(8 + value.len())].copy_from_slice(value);
+        entry
+    }
+
+    fn tiff_ascii_offset_entry(tag: u16, length: usize, offset: u32) -> [u8; 12] {
+        let mut entry = [0; 12];
+        entry[0..2].copy_from_slice(&tag.to_be_bytes());
+        entry[2..4].copy_from_slice(&2u16.to_be_bytes());
+        entry[4..8].copy_from_slice(&(length as u32).to_be_bytes());
+        entry[8..12].copy_from_slice(&offset.to_be_bytes());
         entry
     }
 
