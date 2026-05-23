@@ -26,6 +26,7 @@ const NEAREST_CITY_MINIMUM_POPULATION: i64 = 200_000;
 const EARTH_RADIUS_KM: f64 = 6_371.0088;
 const METADATA_FILE_NAME: &str = "metadata.yaml";
 const METADATA_YML_FILE_NAME: &str = "metadata.yml";
+const CUSTOM_TAG_PAYLOAD_PREFIX: &[u8] = b"exifmeta-custom-tags-v1\n";
 const METADATA_TEMPLATE: &str = r#"# ───────────────────────────────────────────────
 # Metadata file for images in this directory. Used by exifmeta, https://github.com/hmerritt/exifmeta
 # ───────────────────────────────────────────────
@@ -303,13 +304,17 @@ fn format_inspect_output(
 ) -> String {
     let mut output = String::new();
     let mut warnings = metadata.warnings.clone();
+    let custom_tags = custom_tags_from_exif(&metadata.exif);
     let mut rows = metadata
         .exif
         .fields()
+        .filter(|field| {
+            matches!(format, InspectFormat::Raw) || !is_exifmeta_custom_payload_field(field)
+        })
         .map(|field| InspectRow::from_field(field, &metadata.exif))
         .collect::<Vec<_>>();
 
-    if rows.is_empty() {
+    if rows.is_empty() && custom_tags.is_empty() {
         output.push_str(&format_empty_exif_message(format));
     } else {
         sort_inspect_rows(&mut rows);
@@ -319,12 +324,11 @@ fn format_inspect_output(
                 &mut output,
                 &metadata.file_info.rows,
                 &rows,
+                &custom_tags,
                 &metadata.exif,
                 &mut warnings,
             ),
-            InspectFormat::Raw => {
-                append_raw_inspect_rows(&mut output, &rows);
-            }
+            InspectFormat::Raw => append_raw_inspect_rows(&mut output, &rows),
         }
 
         output = output.trim_end().to_string();
@@ -375,10 +379,11 @@ fn append_pretty_inspect_rows(
     output: &mut String,
     info_rows: &[InspectInfoRow],
     rows: &[InspectRow],
+    custom_tags: &[CustomTag],
     exif: &Exif,
     warnings: &mut Vec<String>,
 ) {
-    let mut pretty_rows = pretty_inspect_rows(info_rows, rows);
+    let mut pretty_rows = pretty_inspect_rows(info_rows, rows, custom_tags);
     append_nearest_location_rows(&mut pretty_rows, exif, warnings);
     pretty_rows.sort_by(|left, right| {
         left.group
@@ -439,7 +444,11 @@ fn pretty_inspect_row_sort_label(row: &PrettyInspectRow) -> String {
     }
 }
 
-fn pretty_inspect_rows(info_rows: &[InspectInfoRow], rows: &[InspectRow]) -> Vec<PrettyInspectRow> {
+fn pretty_inspect_rows(
+    info_rows: &[InspectInfoRow],
+    rows: &[InspectRow],
+    custom_tags: &[CustomTag],
+) -> Vec<PrettyInspectRow> {
     let mut pretty_rows = info_rows
         .iter()
         .map(|row| PrettyInspectRow {
@@ -468,6 +477,15 @@ fn pretty_inspect_rows(info_rows: &[InspectInfoRow], rows: &[InspectRow]) -> Vec
             label: row.pretty_name.clone(),
             label_color: None,
             value,
+        });
+    }
+
+    for tag in custom_tags {
+        pretty_rows.push(PrettyInspectRow {
+            group: PrettyInspectGroup::Custom,
+            label: title_case_tag_name(&tag.name),
+            label_color: None,
+            value: custom_tag_value_label(&tag.value),
         });
     }
 
@@ -591,6 +609,7 @@ enum PrettyInspectGroup {
     File,
     Camera,
     Film,
+    Custom,
     Exposure,
     Gps,
     Misc,
@@ -598,10 +617,11 @@ enum PrettyInspectGroup {
 }
 
 impl PrettyInspectGroup {
-    const OUTPUT_ORDER: [Self; 7] = [
+    const OUTPUT_ORDER: [Self; 8] = [
         Self::File,
         Self::Camera,
         Self::Film,
+        Self::Custom,
         Self::Exposure,
         Self::Gps,
         Self::Misc,
@@ -613,10 +633,11 @@ impl PrettyInspectGroup {
             Self::File => 0,
             Self::Camera => 1,
             Self::Film => 2,
-            Self::Exposure => 3,
-            Self::Gps => 4,
-            Self::Misc => 5,
-            Self::Unknown => 6,
+            Self::Custom => 3,
+            Self::Exposure => 4,
+            Self::Gps => 5,
+            Self::Misc => 6,
+            Self::Unknown => 7,
         }
     }
 
@@ -625,6 +646,7 @@ impl PrettyInspectGroup {
             Self::File => "File",
             Self::Camera => "Camera",
             Self::Film => "Film",
+            Self::Custom => "Custom",
             Self::Exposure => "Exposure",
             Self::Gps => "GPS",
             Self::Misc => "MISC",
@@ -1130,6 +1152,80 @@ fn format_decimal_coordinate(value: f64) -> String {
         .trim_end_matches('0')
         .trim_end_matches('.')
         .to_string()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CustomTag {
+    name: String,
+    value: YamlValue,
+}
+
+fn custom_tags_from_exif(exif: &Exif) -> Vec<CustomTag> {
+    exif.fields()
+        .filter(|field| field.tag == Tag::UserComment)
+        .find_map(custom_tags_from_field)
+        .unwrap_or_default()
+}
+
+fn custom_tags_from_field(field: &Field) -> Option<Vec<CustomTag>> {
+    custom_tags_from_bytes(user_comment_bytes(field)?)
+}
+
+fn user_comment_bytes(field: &Field) -> Option<&[u8]> {
+    match &field.value {
+        Value::Undefined(bytes, _) => Some(bytes.as_slice()),
+        Value::Ascii(values) => values.first().map(Vec::as_slice),
+        _ => None,
+    }
+}
+
+fn is_exifmeta_custom_payload_field(field: &Field) -> bool {
+    field.tag == Tag::UserComment
+        && user_comment_bytes(field).is_some_and(|bytes| custom_tags_from_bytes(bytes).is_some())
+}
+
+fn custom_tags_from_bytes(bytes: &[u8]) -> Option<Vec<CustomTag>> {
+    let body = bytes.strip_prefix(CUSTOM_TAG_PAYLOAD_PREFIX)?;
+    let mapping = serde_yaml::from_slice::<Mapping>(body).ok()?;
+    let mut tags = Vec::new();
+
+    for (key, value) in mapping {
+        let Some(name) = key.as_str() else {
+            continue;
+        };
+        tags.push(CustomTag {
+            name: name.to_string(),
+            value,
+        });
+    }
+
+    Some(tags)
+}
+
+fn encode_custom_tags(tags: &[CustomTag]) -> Result<Vec<u8>, String> {
+    let mut mapping = Mapping::new();
+    for tag in tags {
+        mapping.insert(YamlValue::String(tag.name.clone()), tag.value.clone());
+    }
+
+    let mut bytes = CUSTOM_TAG_PAYLOAD_PREFIX.to_vec();
+    let body = serde_yaml::to_string(&mapping)
+        .map_err(|error| format!("failed to encode custom tags: {error}"))?;
+    bytes.extend_from_slice(body.as_bytes());
+    Ok(bytes)
+}
+
+fn custom_tag_value_label(value: &YamlValue) -> String {
+    match value {
+        YamlValue::Null => "<null>".to_string(),
+        YamlValue::Bool(value) => value.to_string(),
+        YamlValue::Number(value) => value.to_string(),
+        YamlValue::String(value) => value.clone(),
+        YamlValue::Sequence(_) | YamlValue::Mapping(_) => serde_yaml::to_string(value)
+            .map(|value| value.trim().replace('\n', " "))
+            .unwrap_or_else(|_| format!("{value:?}")),
+        YamlValue::Tagged(_) => format!("{value:?}"),
+    }
 }
 
 struct GeoLocation {
@@ -2796,18 +2892,42 @@ fn apply_tags_to_image(
 ) -> RunFileResult {
     let mut result = RunFileResult::default();
     let mut writable_tags = Vec::new();
+    let mut custom_tags = Vec::new();
 
     for tag in tags {
-        match expand_run_tag(tag) {
-            Ok(expanded) => writable_tags.extend(expanded),
-            Err(RunTagError::Ignored) => {}
-            Err(RunTagError::Warning(message)) => result.warnings.push(message),
+        if is_blank_yaml_value(&tag.value) {
+            continue;
+        }
+
+        if tag.name == "$Location" {
+            match expand_location_tag(&tag.value) {
+                Ok(expanded) => writable_tags.extend(expanded),
+                Err(RunTagError::Ignored) => {}
+                Err(RunTagError::Warning(message)) => result.warnings.push(message),
+            }
+        } else if let Some(tag) = writable_exif_tag(&tag.name, &tag.value) {
+            writable_tags.push(tag);
+        } else {
+            custom_tags.push(CustomTag {
+                name: tag.name.clone(),
+                value: tag.value.clone(),
+            });
         }
     }
     dedupe_writable_tags(&mut writable_tags);
+    if !custom_tags.is_empty() {
+        match encode_custom_tags(&custom_tags) {
+            Ok(payload) => writable_tags.push(WritableExifTag::UserComment(payload)),
+            Err(error) => result.errors.push(error),
+        }
+    }
 
     if dry_run {
-        result.written = writable_tags.len();
+        result.written = writable_tags
+            .iter()
+            .filter(|tag| !matches!(tag, WritableExifTag::UserComment(_)))
+            .count()
+            + custom_tags.len();
         return result;
     }
 
@@ -2822,8 +2942,19 @@ fn apply_tags_to_image(
 
     let mut metadata =
         WritableMetadata::new_from_path(image).unwrap_or_else(|_| WritableMetadata::new());
+    if !custom_tags.is_empty()
+        && metadata
+            .get_tag(&WritableExifTag::UserComment(Vec::new()))
+            .any(|tag| !writable_user_comment_has_custom_payload(tag))
+    {
+        result
+            .warnings
+            .push("replacing existing non-exifmeta UserComment".to_string());
+    }
+
     for tag in writable_tags {
-        if args.no_overwrite && metadata.get_tag(&tag).next().is_some() {
+        let is_custom_payload = matches!(tag, WritableExifTag::UserComment(_));
+        if args.no_overwrite && !is_custom_payload && metadata.get_tag(&tag).next().is_some() {
             result.skipped.push(format!(
                 "{} already exists",
                 writable_tag_name(&tag).unwrap_or("EXIF tag")
@@ -2832,7 +2963,11 @@ fn apply_tags_to_image(
         }
 
         metadata.set_tag(tag);
-        result.written += 1;
+        result.written += if is_custom_payload {
+            custom_tags.len()
+        } else {
+            1
+        };
     }
 
     if result.written > 0 {
@@ -2844,6 +2979,10 @@ fn apply_tags_to_image(
     }
 
     result
+}
+
+fn writable_user_comment_has_custom_payload(tag: &WritableExifTag) -> bool {
+    matches!(tag, WritableExifTag::UserComment(bytes) if custom_tags_from_bytes(bytes).is_some())
 }
 
 fn dedupe_writable_tags(tags: &mut Vec<WritableExifTag>) {
@@ -2896,8 +3035,8 @@ fn append_run_metadata_group(rendered: &mut String, output: &RunOutput) {
 }
 
 fn append_run_file_group(rendered: &mut String, file: &RunFileOutput) {
-    append_validate_heading(rendered, &file.image.display().to_string());
-    rendered.push_str(&format!("file: {}\n", file.image.display()));
+    append_validate_heading(rendered, &run_file_heading(&file.image));
+    append_run_file_path(rendered, &file.image);
     rendered.push_str(&format!("tags: {}\n", file.result.written));
     rendered.push_str(&format!("skipped: {}\n", file.result.skipped.len()));
     for warning in &file.result.warnings {
@@ -2915,9 +3054,25 @@ fn append_run_file_group(rendered: &mut String, file: &RunFileOutput) {
 }
 
 fn append_run_skipped_file_group(rendered: &mut String, image: &Path) {
-    append_validate_heading(rendered, &image.display().to_string());
-    rendered.push_str(&format!("file: {}\n", image.display()));
+    append_validate_heading(rendered, &run_file_heading(image));
+    append_run_file_path(rendered, image);
     rendered.push_str("skipped: no metadata\n");
+}
+
+fn run_file_heading(image: &Path) -> String {
+    file_name(image)
+}
+
+fn append_run_file_path(rendered: &mut String, image: &Path) {
+    if !is_current_directory_file(image) {
+        rendered.push_str(&format!("file: {}\n", image.display()));
+    }
+}
+
+fn is_current_directory_file(image: &Path) -> bool {
+    image
+        .parent()
+        .is_none_or(|parent| parent.as_os_str().is_empty() || parent == Path::new("."))
 }
 
 fn append_run_overview_group(rendered: &mut String, summary: &RunSummary) {
@@ -2939,22 +3094,6 @@ fn append_run_overview_group(rendered: &mut String, summary: &RunSummary) {
 enum RunTagError {
     Ignored,
     Warning(String),
-}
-
-fn expand_run_tag(tag: &RunTag) -> Result<Vec<WritableExifTag>, RunTagError> {
-    if is_blank_yaml_value(&tag.value) {
-        return Err(RunTagError::Ignored);
-    }
-
-    if tag.name == "$Location" {
-        return expand_location_tag(&tag.value);
-    }
-
-    writable_exif_tag(&tag.name, &tag.value)
-        .map(|tag| vec![tag])
-        .ok_or_else(|| {
-            RunTagError::Warning(format!("skipping unsupported writer tag `{}`", tag.name))
-        })
 }
 
 fn is_blank_yaml_value(value: &YamlValue) -> bool {
@@ -3509,12 +3648,134 @@ frames:
         let plain = strip_ansi_codes(&rendered);
 
         assert!(rendered.contains("\u{1b}[94mimage.jpg"));
+        assert!(!plain.contains("file: image.jpg"));
         assert!(plain.contains("warning: skipping unsupported writer tag `FilmRoll`"));
         assert!(rendered.contains("\u{1b}[94moverview"));
         assert!(plain.contains("errors      0"));
         assert!(plain.contains("warnings    1"));
         assert!(plain.contains("took 42 ms\nrun: success"));
         assert!(rendered.contains("run: \u{1b}[32msuccess"));
+    }
+
+    #[test]
+    fn run_output_prints_path_for_non_current_directory_files() {
+        colored::control::set_override(true);
+        let output = RunOutput {
+            metadata_path: PathBuf::from("metadata.yaml"),
+            dry_run: true,
+            target_count: 1,
+            file_warnings: Vec::new(),
+            files: vec![RunFileOutput {
+                image: PathBuf::from("nested").join("image.jpg"),
+                result: RunFileResult {
+                    written: 1,
+                    ..RunFileResult::default()
+                },
+            }],
+            skipped_files: Vec::new(),
+        };
+        let mut summary = RunSummary::default();
+        summary.add(&output.files[0].result);
+
+        let rendered = format_run_output(&output, &summary);
+        let plain = strip_ansi_codes(&rendered);
+
+        assert!(rendered.contains("\u{1b}[94mimage.jpg"));
+        assert!(
+            plain.contains("file: nested\\image.jpg") || plain.contains("file: nested/image.jpg")
+        );
+    }
+
+    #[test]
+    fn custom_tag_payload_round_trips_yaml_values() {
+        let tags = vec![
+            CustomTag {
+                name: "FilmRoll".to_string(),
+                value: YamlValue::Number(35.into()),
+            },
+            CustomTag {
+                name: "FilmName".to_string(),
+                value: YamlValue::String("Kodak Double-X".to_string()),
+            },
+            CustomTag {
+                name: "FilmNegative".to_string(),
+                value: YamlValue::Bool(true),
+            },
+        ];
+
+        let payload = encode_custom_tags(&tags).expect("custom tags should encode");
+        let decoded = custom_tags_from_bytes(&payload).expect("custom tags should decode");
+
+        assert_eq!(decoded, tags);
+    }
+
+    #[test]
+    fn run_dry_run_counts_custom_tags_without_warning() {
+        let args = RunArgs {
+            metadata_or_targets: None,
+            targets: None,
+            strip: false,
+            no_overwrite: false,
+            extensions: Vec::new(),
+            recursive: false,
+        };
+        let tags = vec![
+            RunTag {
+                name: "Make".to_string(),
+                value: YamlValue::String("Nikon".to_string()),
+            },
+            RunTag {
+                name: "FilmRoll".to_string(),
+                value: YamlValue::Number(35.into()),
+            },
+        ];
+
+        let result = apply_tags_to_image(Path::new("image.jpg"), &tags, true, &args);
+
+        assert_eq!(result.written, 2);
+        assert!(result.warnings.is_empty());
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn inspect_decodes_custom_tags_from_user_comment() {
+        colored::control::set_override(true);
+        let payload = encode_custom_tags(&[
+            CustomTag {
+                name: "FilmRoll".to_string(),
+                value: YamlValue::Number(35.into()),
+            },
+            CustomTag {
+                name: "FilmName".to_string(),
+                value: YamlValue::String("Kodak Double-X".to_string()),
+            },
+        ])
+        .expect("custom tags should encode");
+        let entry = tiff_undefined_entry(0x9286, payload.len(), 200);
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif_with_exif_entries(&[entry], &[(200, payload)]),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        };
+
+        let pretty = strip_ansi_codes(&format_inspect_output(
+            Path::new("image.jpg"),
+            &metadata,
+            InspectFormat::Pretty,
+        ));
+        let raw = strip_ansi_codes(&format_inspect_output(
+            Path::new("image.jpg"),
+            &metadata,
+            InspectFormat::Raw,
+        ));
+
+        assert!(pretty.contains("Custom\n------\n"));
+        assert!(pretty.contains("Film Roll  35"));
+        assert!(pretty.contains("Film Name  Kodak Double-X"));
+        assert!(!pretty.contains("User Comment"));
+        assert!(raw.contains("0x9286"));
+        assert!(raw.contains("UserComment"));
+        assert!(!raw.contains("IFD exifmeta  Custom  0x0000"));
     }
 
     #[test]
@@ -4842,6 +5103,15 @@ frames:
         entry[2..4].copy_from_slice(&4u16.to_be_bytes());
         entry[4..8].copy_from_slice(&1u32.to_be_bytes());
         entry[8..12].copy_from_slice(&value.to_be_bytes());
+        entry
+    }
+
+    fn tiff_undefined_entry(tag: u16, length: usize, offset: u32) -> [u8; 12] {
+        let mut entry = [0; 12];
+        entry[0..2].copy_from_slice(&tag.to_be_bytes());
+        entry[2..4].copy_from_slice(&7u16.to_be_bytes());
+        entry[4..8].copy_from_slice(&(length as u32).to_be_bytes());
+        entry[8..12].copy_from_slice(&offset.to_be_bytes());
         entry
     }
 
