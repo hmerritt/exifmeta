@@ -39,6 +39,7 @@ const PRETTY_UNKNOWN_VALUE_DISPLAY_LIMIT: usize = 120;
 const PRETTY_KNOWN_VALUE_DISPLAY_LIMIT: usize = 2000;
 const PRETTY_UNKNOWN_VALUE_OMITTED_LABEL: &str = "<long value omitted>";
 const PRETTY_UNKNOWN_VALUE_OMITTED_HINT: &str = " (use `--format raw` to view)";
+const PRETTY_OMITTED_TAG_HINT: &str = " (use `--format raw` to view)";
 const METADATA_TEMPLATE: &str = r#"# ───────────────────────────────────────────────
 # Metadata file for images in this directory. Used by exifmeta, https://github.com/hmerritt/exifmeta
 # ───────────────────────────────────────────────
@@ -399,7 +400,7 @@ fn append_pretty_inspect_rows(
     exif: &Exif,
     warnings: &mut Vec<String>,
 ) {
-    let mut pretty_rows = pretty_inspect_rows(info_rows, rows, custom_tags);
+    let (mut pretty_rows, omitted_row_count) = pretty_inspect_rows(info_rows, rows, custom_tags);
     append_nearest_location_rows(&mut pretty_rows, exif, warnings);
     pretty_rows.sort_by(|left, right| {
         left.group
@@ -440,6 +441,8 @@ fn append_pretty_inspect_rows(
             output.push_str(&format!("  {}\n", row.value));
         }
     }
+
+    append_pretty_omitted_tag_notice(output, &mut first_group, omitted_row_count);
 }
 
 fn pretty_inspect_row_sort_label(row: &PrettyInspectRow) -> String {
@@ -456,7 +459,7 @@ fn pretty_inspect_rows(
     info_rows: &[InspectInfoRow],
     rows: &[InspectRow],
     custom_tags: &[CustomTag],
-) -> Vec<PrettyInspectRow> {
+) -> (Vec<PrettyInspectRow>, usize) {
     let mut pretty_rows = info_rows
         .iter()
         .map(|row| PrettyInspectRow {
@@ -468,8 +471,10 @@ fn pretty_inspect_rows(
         .collect::<Vec<_>>();
 
     let mut seen_ifd_0_1 = HashSet::new();
+    let mut omitted_row_count = 0;
     for row in rows {
-        if is_pretty_omitted_gps_reference(row) {
+        if is_pretty_omitted_row(row) {
+            omitted_row_count += 1;
             continue;
         }
 
@@ -497,11 +502,36 @@ fn pretty_inspect_rows(
         });
     }
 
-    pretty_rows
+    (pretty_rows, omitted_row_count)
 }
 
-fn is_pretty_omitted_gps_reference(row: &InspectRow) -> bool {
-    matches!(row.name.as_str(), "GPSLatitudeRef" | "GPSLongitudeRef")
+fn is_pretty_omitted_row(row: &InspectRow) -> bool {
+    matches!(
+        row.name.as_str(),
+        "GPSLatitudeRef" | "GPSLongitudeRef" | "StripByteCounts" | "StripOffsets"
+    )
+}
+
+fn append_pretty_omitted_tag_notice(
+    output: &mut String,
+    first_group: &mut bool,
+    omitted_row_count: usize,
+) {
+    if omitted_row_count == 0 {
+        return;
+    }
+
+    if !*first_group {
+        output.push('\n');
+    }
+    *first_group = false;
+
+    output.push_str(&format!("{}\n", "─".repeat(50).bright_blue()));
+    output.push_str(&format!(
+        "{}{}\n",
+        format!("{omitted_row_count} tags were omitted for not being human-readable").yellow(),
+        PRETTY_OMITTED_TAG_HINT
+    ));
 }
 
 fn append_nearest_location_rows(
@@ -5098,6 +5128,52 @@ frames:
     }
 
     #[test]
+    fn pretty_inspect_output_omits_non_human_readable_tags_with_bottom_notice() {
+        colored::control::set_override(true);
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif(&[
+                tiff_ascii_entry(0x010f, b"Z\0"),
+                tiff_long_entry(0x0111, 12345),
+                tiff_long_entry(0x0117, 67890),
+            ]),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        };
+
+        let pretty =
+            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+        colored::control::set_override(false);
+        let plain_pretty = strip_ansi_codes(&pretty);
+        let raw = strip_ansi_codes(&format_inspect_output(
+            Path::new("image.tif"),
+            &metadata,
+            InspectFormat::Raw,
+        ));
+        let notice = "2 tags were omitted for not being human-readable";
+
+        assert!(plain_pretty.contains("Make  \"Z\""));
+        assert!(!plain_pretty.contains("Strip Offsets"));
+        assert!(!plain_pretty.contains("Strip Byte Counts"));
+        assert!(!plain_pretty.contains("12345"));
+        assert!(!plain_pretty.contains("67890"));
+        assert!(!plain_pretty.contains("Warnings:"));
+        assert!(!plain_pretty.contains("warning:"));
+        assert!(plain_pretty.contains(&format!("{notice}{PRETTY_OMITTED_TAG_HINT}")));
+        assert!(plain_pretty.contains(&"─".repeat(50)));
+        assert!(pretty.contains(&format!(
+            "\u{1b}[33m{notice}\u{1b}[0m{PRETTY_OMITTED_TAG_HINT}"
+        )));
+        assert!(!pretty.contains(&format!(
+            "\u{1b}[33m{notice}{PRETTY_OMITTED_TAG_HINT}\u{1b}[0m"
+        )));
+        assert!(pretty.contains(&format!("\u{1b}[94m{}\u{1b}[0m", "─".repeat(50))));
+        assert!(raw.contains("StripOffsets"));
+        assert!(raw.contains("StripByteCounts"));
+        assert!(raw.contains("12345"));
+        assert!(raw.contains("67890"));
+    }
+
+    #[test]
     fn pretty_inspect_output_masks_long_unknown_values() {
         colored::control::set_override(true);
         let long_value = "x".repeat(160);
@@ -5447,6 +5523,7 @@ frames:
 
         let output =
             format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Pretty);
+        let plain_output = strip_ansi_codes(&output);
 
         assert!(output.contains("GPS Latitude"));
         assert!(output.contains("(52.352832) 52 deg 21 min 10.1952 sec N"));
@@ -5454,6 +5531,9 @@ frames:
         assert!(output.contains("(-1.304089) 1 deg 18 min 14.71968 sec W"));
         assert!(!output.contains("GPS Latitude Ref"));
         assert!(!output.contains("GPS Longitude Ref"));
+        assert!(plain_output.contains(&format!(
+            "2 tags were omitted for not being human-readable{PRETTY_OMITTED_TAG_HINT}"
+        )));
     }
 
     #[test]
