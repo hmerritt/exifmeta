@@ -3453,7 +3453,7 @@ fn append_run_overview_group(rendered: &mut String, first_group: &mut bool, summ
 }
 
 fn append_run_overview_row(rendered: &mut String, label: &str, value: impl std::fmt::Display) {
-    rendered.push_str(&format!("{label:<14}{value}\n"));
+    rendered.push_str(&format!("{label:<14} {value}\n"));
 }
 
 fn format_run_duration(elapsed_ms: u128) -> String {
@@ -4082,15 +4082,15 @@ frames:
         assert!(plain.contains("missing.jpg\nskipped: no metadata"));
         assert!(plain.contains("skipped: no metadata\n\noverview "));
         assert!(rendered.contains("\u{1b}[94moverview"));
-        assert!(plain.contains("errors        0"));
-        assert!(plain.contains("warnings      1"));
-        assert!(plain.contains("written       3"));
-        assert!(plain.contains("skipped       0"));
-        assert!(plain.contains("files skipped 1"));
-        assert!(plain.contains("took          42ms"));
-        assert!(plain.contains("status        success (with warnings)"));
+        assert!(plain.contains("errors         0"));
+        assert!(plain.contains("warnings       1"));
+        assert!(plain.contains("written        3"));
+        assert!(plain.contains("skipped        0"));
+        assert!(plain.contains("files skipped  1"));
+        assert!(plain.contains("took           42ms"));
+        assert!(plain.contains("status         success (with warnings)"));
         assert!(!plain.contains("run:"));
-        assert!(rendered.contains("status        \u{1b}[32msuccess\u{1b}[0m (with warnings)"));
+        assert!(rendered.contains("status         \u{1b}[32msuccess\u{1b}[0m (with warnings)"));
     }
 
     #[test]
@@ -4136,10 +4136,10 @@ frames:
         let rendered = format_run_overview_output(&summary);
         let plain = strip_ansi_codes(&rendered);
 
-        assert!(plain.contains("warnings      0"));
-        assert!(plain.contains("status        success\n"));
+        assert!(plain.contains("warnings       0"));
+        assert!(plain.contains("status         success\n"));
         assert!(!plain.contains("(with warnings)"));
-        assert!(rendered.contains("status        \u{1b}[32msuccess"));
+        assert!(rendered.contains("status         \u{1b}[32msuccess"));
     }
 
     #[test]
@@ -4154,9 +4154,9 @@ frames:
         let rendered = format_run_overview_output(&summary);
         let plain = strip_ansi_codes(&rendered);
 
-        assert!(plain.contains("status        fail\n"));
+        assert!(plain.contains("status         fail\n"));
         assert!(!plain.contains("(with warnings)"));
-        assert!(rendered.contains("status        \u{1b}[31mfail"));
+        assert!(rendered.contains("status         \u{1b}[31mfail"));
     }
 
     #[test]
