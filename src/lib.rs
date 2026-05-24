@@ -327,7 +327,7 @@ fn format_inspect_output(
         .filter(|field| {
             matches!(format, InspectFormat::Raw) || !is_exifmeta_custom_payload_field(field)
         })
-        .map(|field| InspectRow::from_field(field, &metadata.exif))
+        .map(|field| InspectRow::from_field(field, &metadata.exif, format))
         .collect::<Vec<_>>();
 
     if rows.is_empty() && custom_tags.is_empty() {
@@ -1044,7 +1044,7 @@ struct InspectRow {
 }
 
 impl InspectRow {
-    fn from_field(field: &Field, exif: &Exif) -> Self {
+    fn from_field(field: &Field, exif: &Exif, format: InspectFormat) -> Self {
         let is_unknown =
             field.tag.description().is_none() || matches!(field.value, Value::Unknown(..));
         let name = if is_unknown {
@@ -1062,7 +1062,7 @@ impl InspectRow {
             title_case_tag_name(&name)
         };
         let mut value = if is_unknown {
-            format!("{:?}", field.value)
+            format_unknown_field_value(&field.value, format)
         } else {
             format_known_field_value(field, exif, &name)
         };
@@ -1082,6 +1082,35 @@ impl InspectRow {
             pretty_name,
             value,
         }
+    }
+}
+
+fn format_unknown_field_value(value: &Value, format: InspectFormat) -> String {
+    if matches!(format, InspectFormat::Pretty)
+        && unknown_value_payload_len(value)
+            .is_some_and(|length| length > PRETTY_UNKNOWN_VALUE_DISPLAY_LIMIT)
+    {
+        pretty_unknown_value_omitted_message()
+    } else {
+        format!("{value:?}")
+    }
+}
+
+fn unknown_value_payload_len(value: &Value) -> Option<usize> {
+    match value {
+        Value::Byte(values) => Some(values.len()),
+        Value::Ascii(values) => Some(values.iter().map(Vec::len).sum()),
+        Value::Short(values) => Some(values.len()),
+        Value::Long(values) => Some(values.len()),
+        Value::Rational(values) => Some(values.len()),
+        Value::SByte(values) => Some(values.len()),
+        Value::Undefined(values, _) => Some(values.len()),
+        Value::SShort(values) => Some(values.len()),
+        Value::SLong(values) => Some(values.len()),
+        Value::SRational(values) => Some(values.len()),
+        Value::Float(values) => Some(values.len()),
+        Value::Double(values) => Some(values.len()),
+        Value::Unknown(_, count, _) => usize::try_from(*count).ok(),
     }
 }
 
