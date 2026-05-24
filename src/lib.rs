@@ -39,7 +39,6 @@ const PRETTY_UNKNOWN_VALUE_DISPLAY_LIMIT: usize = 120;
 const PRETTY_KNOWN_VALUE_DISPLAY_LIMIT: usize = 2000;
 const PRETTY_UNKNOWN_VALUE_OMITTED_LABEL: &str = "<long value omitted>";
 const PRETTY_UNKNOWN_VALUE_OMITTED_HINT: &str = " (use `--format raw` to view)";
-const PRETTY_OMITTED_TAG_HINT: &str = " (use `--format raw` to view)";
 const METADATA_TEMPLATE: &str = r#"# ───────────────────────────────────────────────
 # Metadata file for images in this directory. Used by exifmeta, https://github.com/hmerritt/exifmeta
 # ───────────────────────────────────────────────
@@ -400,7 +399,7 @@ fn append_pretty_inspect_rows(
     exif: &Exif,
     warnings: &mut Vec<String>,
 ) {
-    let (mut pretty_rows, omitted_row_count) = pretty_inspect_rows(info_rows, rows, custom_tags);
+    let mut pretty_rows = pretty_inspect_rows(info_rows, rows, custom_tags);
     append_nearest_location_rows(&mut pretty_rows, exif, warnings);
     pretty_rows.sort_by(|left, right| {
         left.group
@@ -442,7 +441,6 @@ fn append_pretty_inspect_rows(
         }
     }
 
-    append_pretty_omitted_tag_notice(output, &mut first_group, omitted_row_count);
 }
 
 fn pretty_inspect_row_sort_label(row: &PrettyInspectRow) -> String {
@@ -459,7 +457,7 @@ fn pretty_inspect_rows(
     info_rows: &[InspectInfoRow],
     rows: &[InspectRow],
     custom_tags: &[CustomTag],
-) -> (Vec<PrettyInspectRow>, usize) {
+) -> Vec<PrettyInspectRow> {
     let mut pretty_rows = info_rows
         .iter()
         .map(|row| PrettyInspectRow {
@@ -471,14 +469,21 @@ fn pretty_inspect_rows(
         .collect::<Vec<_>>();
 
     let mut seen_ifd_0_1 = HashSet::new();
-    let mut omitted_row_count = 0;
+    let iso_speed_values = rows
+        .iter()
+        .filter(|row| !is_pretty_omitted_row(row) && row.name == "ISOSpeed")
+        .map(pretty_inspect_value)
+        .collect::<HashSet<_>>();
     for row in rows {
         if is_pretty_omitted_row(row) {
-            omitted_row_count += 1;
             continue;
         }
 
         let value = pretty_inspect_value(row);
+        if is_duplicate_photographic_sensitivity(row, &value, &iso_speed_values) {
+            continue;
+        }
+
         if matches!(row.ifd, 0 | 1)
             && !seen_ifd_0_1.insert((row.name.clone(), row.context.clone(), value.clone()))
         {
@@ -502,36 +507,26 @@ fn pretty_inspect_rows(
         });
     }
 
-    (pretty_rows, omitted_row_count)
+    pretty_rows
+}
+
+fn is_duplicate_photographic_sensitivity(
+    row: &InspectRow,
+    value: &str,
+    iso_speed_values: &HashSet<String>,
+) -> bool {
+    row.name == "PhotographicSensitivity" && iso_speed_values.contains(value)
 }
 
 fn is_pretty_omitted_row(row: &InspectRow) -> bool {
+    if row.is_unknown {
+        return true;
+    }
+
     matches!(
         row.name.as_str(),
         "GPSLatitudeRef" | "GPSLongitudeRef" | "StripByteCounts" | "StripOffsets"
     )
-}
-
-fn append_pretty_omitted_tag_notice(
-    output: &mut String,
-    first_group: &mut bool,
-    omitted_row_count: usize,
-) {
-    if omitted_row_count == 0 {
-        return;
-    }
-
-    if !*first_group {
-        output.push('\n');
-    }
-    *first_group = false;
-
-    output.push_str(&format!("{}\n", "─".repeat(50).bright_blue()));
-    output.push_str(&format!(
-        "{}{}\n",
-        format!("{omitted_row_count} tags were omitted for not being human-readable").yellow(),
-        PRETTY_OMITTED_TAG_HINT
-    ));
 }
 
 fn append_nearest_location_rows(
@@ -675,11 +670,10 @@ enum PrettyInspectGroup {
     Exposure,
     Gps,
     Misc,
-    Unknown,
 }
 
 impl PrettyInspectGroup {
-    const OUTPUT_ORDER: [Self; 8] = [
+    const OUTPUT_ORDER: [Self; 7] = [
         Self::File,
         Self::Camera,
         Self::Film,
@@ -687,7 +681,6 @@ impl PrettyInspectGroup {
         Self::Gps,
         Self::Custom,
         Self::Misc,
-        Self::Unknown,
     ];
 
     fn output_order(self) -> usize {
@@ -699,7 +692,6 @@ impl PrettyInspectGroup {
             Self::Gps => 4,
             Self::Custom => 5,
             Self::Misc => 6,
-            Self::Unknown => 7,
         }
     }
 
@@ -712,7 +704,6 @@ impl PrettyInspectGroup {
             Self::Exposure => "exposure",
             Self::Gps => "gps",
             Self::Misc => "misc",
-            Self::Unknown => "unknown",
         }
     }
 }
@@ -740,10 +731,6 @@ fn classify_info_row(row: &InspectInfoRow) -> PrettyInspectGroup {
 }
 
 fn classify_exif_row(row: &InspectRow) -> PrettyInspectGroup {
-    if row.is_unknown {
-        return PrettyInspectGroup::Unknown;
-    }
-
     if row.context == "Gps"
         || normalized_label_starts_with(&row.name, &["gps"])
         || normalized_label_starts_with(&row.pretty_name, &["gps"])
@@ -5114,12 +5101,13 @@ frames:
         assert!(plain_output.contains("File Name  image.tif"));
         assert!(plain_output.contains("camera "));
         assert!(plain_output.contains("Make   \"Z\"\nModel  \"E\""));
-        assert!(plain_output.contains("unknown "));
-        assert!(plain_output.contains("Unknown Tiff Tag  Short([42])"));
+        assert!(!plain_output.contains("unknown "));
+        assert!(!plain_output.contains("Unknown Tiff Tag"));
+        assert!(!plain_output.contains("tags were omitted for not being human-readable"));
         assert!(output.contains("Warnings:"));
         assert!(output.contains("warning: ignored malformed trailing field"));
         assert!(plain_output.find("file ").unwrap() < plain_output.find("camera ").unwrap());
-        assert!(plain_output.find("camera ").unwrap() < plain_output.find("unknown ").unwrap());
+        assert!(plain_output.find("camera ").unwrap() < plain_output.find("Warnings:").unwrap());
         assert!(!output.contains("IFD"));
         assert!(!output.contains("Tiff  "));
         assert!(!output.contains("0x010F"));
@@ -5128,7 +5116,7 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_output_omits_non_human_readable_tags_with_bottom_notice() {
+    fn pretty_inspect_output_omits_non_human_readable_tags_without_notice() {
         colored::control::set_override(true);
         let metadata = InspectMetadata {
             exif: parse_raw_exif(&[
@@ -5149,7 +5137,6 @@ frames:
             &metadata,
             InspectFormat::Raw,
         ));
-        let notice = "2 tags were omitted for not being human-readable";
 
         assert!(plain_pretty.contains("Make  \"Z\""));
         assert!(!plain_pretty.contains("Strip Offsets"));
@@ -5158,15 +5145,8 @@ frames:
         assert!(!plain_pretty.contains("67890"));
         assert!(!plain_pretty.contains("Warnings:"));
         assert!(!plain_pretty.contains("warning:"));
-        assert!(plain_pretty.contains(&format!("{notice}{PRETTY_OMITTED_TAG_HINT}")));
-        assert!(plain_pretty.contains(&"─".repeat(50)));
-        assert!(pretty.contains(&format!(
-            "\u{1b}[33m{notice}\u{1b}[0m{PRETTY_OMITTED_TAG_HINT}"
-        )));
-        assert!(!pretty.contains(&format!(
-            "\u{1b}[33m{notice}{PRETTY_OMITTED_TAG_HINT}\u{1b}[0m"
-        )));
-        assert!(pretty.contains(&format!("\u{1b}[94m{}\u{1b}[0m", "─".repeat(50))));
+        assert!(!plain_pretty.contains("tags were omitted for not being human-readable"));
+        assert!(!pretty.contains("tags were omitted for not being human-readable"));
         assert!(raw.contains("StripOffsets"));
         assert!(raw.contains("StripByteCounts"));
         assert!(raw.contains("12345"));
@@ -5174,7 +5154,7 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_output_masks_long_unknown_values() {
+    fn pretty_inspect_output_omits_unknown_values() {
         colored::control::set_override(true);
         let long_value = "x".repeat(160);
         let mut raw_value = long_value.clone().into_bytes();
@@ -5199,13 +5179,11 @@ frames:
             PRETTY_UNKNOWN_VALUE_OMITTED_LABEL, PRETTY_UNKNOWN_VALUE_OMITTED_HINT
         );
 
-        assert!(plain_pretty.contains("unknown "));
-        assert!(plain_pretty.contains("Unknown Tiff Tag"));
-        assert!(plain_pretty.contains(&omitted_message));
-        assert!(pretty.contains(&format!(
-            "\u{1b}[33m{}\u{1b}[0m{}",
-            PRETTY_UNKNOWN_VALUE_OMITTED_LABEL, PRETTY_UNKNOWN_VALUE_OMITTED_HINT
-        )));
+        assert!(!plain_pretty.contains("unknown "));
+        assert!(!plain_pretty.contains("Unknown Tiff Tag"));
+        assert!(!plain_pretty.contains(&omitted_message));
+        assert!(!plain_pretty.contains("tags were omitted for not being human-readable"));
+        assert!(!pretty.contains("tags were omitted for not being human-readable"));
         assert!(!plain_pretty.contains(&long_value));
         assert!(raw.contains(&long_value));
         assert!(!raw.contains(&omitted_message));
@@ -5419,6 +5397,72 @@ frames:
     }
 
     #[test]
+    fn pretty_inspect_output_omits_photographic_sensitivity_duplicate_of_iso_speed() {
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif_with_exif_entries(
+                &[tiff_short_entry(0x8827, 400), tiff_long_entry(0x8833, 400)],
+                &[],
+            ),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        };
+
+        let pretty = strip_ansi_codes(&format_inspect_output(
+            Path::new("image.tif"),
+            &metadata,
+            InspectFormat::Pretty,
+        ));
+        let raw = strip_ansi_codes(&format_inspect_output(
+            Path::new("image.tif"),
+            &metadata,
+            InspectFormat::Raw,
+        ));
+
+        assert!(pretty.contains("ISO Speed"));
+        assert!(!pretty.contains("Photographic Sensitivity"));
+        assert!(raw.contains("PhotographicSensitivity"));
+        assert!(raw.contains("ISOSpeed"));
+    }
+
+    #[test]
+    fn pretty_inspect_output_keeps_photographic_sensitivity_when_iso_speed_differs() {
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif_with_exif_entries(
+                &[tiff_short_entry(0x8827, 400), tiff_long_entry(0x8833, 800)],
+                &[],
+            ),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        };
+
+        let pretty = strip_ansi_codes(&format_inspect_output(
+            Path::new("image.tif"),
+            &metadata,
+            InspectFormat::Pretty,
+        ));
+
+        assert!(pretty.contains("Photographic Sensitivity  400"));
+        assert!(pretty.contains("ISO Speed                 800"));
+    }
+
+    #[test]
+    fn pretty_inspect_output_keeps_photographic_sensitivity_without_iso_speed() {
+        let metadata = InspectMetadata {
+            exif: parse_raw_exif_with_exif_entries(&[tiff_short_entry(0x8827, 400)], &[]),
+            warnings: Vec::new(),
+            file_info: InspectFileInfo::empty(),
+        };
+
+        let pretty = strip_ansi_codes(&format_inspect_output(
+            Path::new("image.tif"),
+            &metadata,
+            InspectFormat::Pretty,
+        ));
+
+        assert!(pretty.contains("Photographic Sensitivity  400"));
+    }
+
+    #[test]
     fn de_camelcases_tag_names_for_pretty_output() {
         assert_eq!(title_case_tag_name("GPSLatitude"), "GPS Latitude");
         assert_eq!(
@@ -5531,9 +5575,7 @@ frames:
         assert!(output.contains("(-1.304089) 1 deg 18 min 14.71968 sec W"));
         assert!(!output.contains("GPS Latitude Ref"));
         assert!(!output.contains("GPS Longitude Ref"));
-        assert!(plain_output.contains(&format!(
-            "2 tags were omitted for not being human-readable{PRETTY_OMITTED_TAG_HINT}"
-        )));
+        assert!(!plain_output.contains("tags were omitted for not being human-readable"));
     }
 
     #[test]
