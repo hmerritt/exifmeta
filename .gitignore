@@ -1,0 +1,22 @@
+# Build
+/target/
+
+# Assets
+cities1000.sqlite
+cities1000.txt
+
+# Images (allow in exampels/)
+*jpg
+*jpeg
+*png
+*tif
+!examples/*jpg
+!examples/*jpeg
+!examples/*png
+!examples/*tif
+
+# metadata files linguring around
+metadata.yml
+metadata.yaml
+!examples/metadata.yml
+!examples/metadata.yaml
