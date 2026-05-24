@@ -1,12 +1,15 @@
 [package]
 name = "exifmeta"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
-description = "Read metadata.yaml and write EXIF metadata to image files"
+description = "EXIF tool for photographers. Reads a metadata.yaml and writes EXIF to one or many image files"
 license = "MIT"
 
 [dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = [
+    "clock",
+    "std",
+] }
 clap = { version = "4.5", features = ["derive"] }
 colored = "3"
 kamadak-exif = "0.6.1"

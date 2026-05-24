@@ -28,7 +28,7 @@ exif:
     MaxApertureValue: 2.8
 
     # Film / Capture
-    ISOSpeedRatings: 250 # ISOSpeedRatings | exif:ISO | exifEX:ISOSpeed
+    ISOSpeed: 250
     DateTimeOriginal: "2026-04-28"
     CreateDate: "2026-04-28"
     # 1 = Film Scanner

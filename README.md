@@ -1,6 +1,14 @@
 # Exif Metadata
 
+EXIF tool for photographers.
+
 A simple program to read a standardised `metadata.yaml` file and write the data as EXIF to all image files in the same directory.
+
+## Features ⚡
+
+- EXIF viewer
+- Custom EXIF properties are supported
+- Automatically bulk add EXIF to images in the current directory
 
 ## CLI Commands
 
@@ -170,3 +178,9 @@ During import, the script validates that each GeoNames row has 19 tab-separated 
 
 - [https://github.com/TechnikTobi/little_exif](TechnikTobi/little_exif) — A library for reading and writing EXIF data in pure Rust.
 - [GeoNames](https://www.geonames.org/) — The GeoNames geographical database `cities1000.zip`. Used to match location names to EXIF GPS data.
+
+#### Features (maybe)
+
+```
+
+```
