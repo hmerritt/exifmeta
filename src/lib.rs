@@ -164,9 +164,13 @@ fn inspect_command(args: InspectArgs) -> Result<(), String> {
     let image = args.image;
     validate_image_path(&image)?;
 
-    let metadata = read_metadata(&image)?;
+    let progress = TerminalSpinner::start(SpinnerPreset::random(), "reading exif".to_string());
+    let metadata = read_metadata(&image);
+    let metadata = metadata?;
+    let output = format_inspect_output(&image, &metadata, args.format);
+    progress.finish();
 
-    println!("{}", format_inspect_output(&image, &metadata, args.format));
+    println!("{output}");
 
     Ok(())
 }
@@ -2582,7 +2586,7 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
         skipped_files: Vec::new(),
     };
     summary.warnings += output.file_warnings.len();
-    let spinner = RunSpinnerPreset::random();
+    let spinner = SpinnerPreset::random();
 
     print!("{}", format_run_metadata_output(&output));
     print!("{}", format_run_frames_heading());
@@ -2616,7 +2620,7 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
         flush_stdout();
 
         let file_started = Instant::now();
-        let progress = RunSpinner::start(spinner, "writing metadata".to_string());
+        let progress = TerminalSpinner::start(spinner, "writing metadata".to_string());
         let result = apply_tags_to_image(&file_output.image, &frame.tags, dry_run, &args);
         progress.finish();
         let elapsed_ms = file_started.elapsed().as_millis();
@@ -3059,7 +3063,7 @@ struct RunFileOutput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunSpinnerPreset {
+enum SpinnerPreset {
     Dots,
     Pulse,
     FillSweep,
@@ -3071,25 +3075,25 @@ enum RunSpinnerPreset {
     Scan,
 }
 
-const RUN_SPINNER_PRESETS: [RunSpinnerPreset; 9] = [
-    RunSpinnerPreset::Dots,
-    RunSpinnerPreset::Pulse,
-    RunSpinnerPreset::FillSweep,
-    RunSpinnerPreset::DiagSwipe,
-    RunSpinnerPreset::Cascade,
-    RunSpinnerPreset::Columns,
-    RunSpinnerPreset::Sand,
-    RunSpinnerPreset::WaveRows,
-    RunSpinnerPreset::Scan,
+const SPINNER_PRESETS: [SpinnerPreset; 9] = [
+    SpinnerPreset::Dots,
+    SpinnerPreset::Pulse,
+    SpinnerPreset::FillSweep,
+    SpinnerPreset::DiagSwipe,
+    SpinnerPreset::Cascade,
+    SpinnerPreset::Columns,
+    SpinnerPreset::Sand,
+    SpinnerPreset::WaveRows,
+    SpinnerPreset::Scan,
 ];
 
-impl RunSpinnerPreset {
+impl SpinnerPreset {
     fn random() -> Self {
         let entropy = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
-        RUN_SPINNER_PRESETS[entropy as usize % RUN_SPINNER_PRESETS.len()]
+        SPINNER_PRESETS[entropy as usize % SPINNER_PRESETS.len()]
     }
 
     fn frame(self) -> &'static str {
@@ -3122,14 +3126,14 @@ impl RunSpinnerPreset {
     }
 }
 
-struct RunSpinner {
+struct TerminalSpinner {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     clear_width: usize,
 }
 
-impl RunSpinner {
-    fn start(preset: RunSpinnerPreset, label: String) -> Self {
+impl TerminalSpinner {
+    fn start(preset: SpinnerPreset, label: String) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let clear_width = label.len() + 16;
@@ -3159,7 +3163,7 @@ impl RunSpinner {
     }
 }
 
-impl Drop for RunSpinner {
+impl Drop for TerminalSpinner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
@@ -4234,8 +4238,8 @@ frames:
     }
 
     #[test]
-    fn run_spinner_presets_match_allowed_names() {
-        let names = RUN_SPINNER_PRESETS
+    fn spinner_presets_match_allowed_names() {
+        let names = SPINNER_PRESETS
             .iter()
             .map(|preset| preset.name())
             .collect::<Vec<_>>();
