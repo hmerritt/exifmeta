@@ -17,7 +17,7 @@ fn main() {
     emit_env("EXIFMETA_BUILD_DATE", &build_date());
     emit_env(
         "EXIFMETA_GIT_COMMIT",
-        &git(["rev-parse", "--short=12", "HEAD"]),
+        &git(["rev-parse", "--short=7", "HEAD"]),
     );
     emit_env(
         "EXIFMETA_GIT_BRANCH",
