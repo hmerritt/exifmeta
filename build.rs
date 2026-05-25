@@ -7,6 +7,7 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-env-changed=EXIFMETA_VERSION_PRERELEASE");
     println!("cargo:rerun-if-env-changed=EXIFMETA_VERSION_METADATA");
+    println!("cargo:rerun-if-env-changed=EXIFMETA_SUPPRESS_GIT_DIRTY");
 
     if !std::path::Path::new("assets/geonames/cities1000.sqlite").is_file() {
         panic!(
@@ -25,7 +26,7 @@ fn main() {
     );
     emit_env(
         "EXIFMETA_GIT_DIRTY",
-        if is_git_dirty() { "true" } else { "" },
+        if should_emit_git_dirty() { "true" } else { "" },
     );
     emit_env(
         "EXIFMETA_VERSION_PRERELEASE",
@@ -66,4 +67,8 @@ fn is_git_dirty() -> bool {
         .filter(|output| output.status.success())
         .map(|output| !output.stdout.is_empty())
         .unwrap_or(false)
+}
+
+fn should_emit_git_dirty() -> bool {
+    std::env::var("EXIFMETA_SUPPRESS_GIT_DIRTY").as_deref() != Ok("true") && is_git_dirty()
 }

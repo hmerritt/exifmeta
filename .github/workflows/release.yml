@@ -67,6 +67,8 @@ jobs:
 
       - name: Build
         if: steps.tag_check.outputs.valid == 'true'
+        env:
+          EXIFMETA_SUPPRESS_GIT_DIRTY: "true"
         run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Compress binary with UPX
@@ -137,6 +139,8 @@ jobs:
 
       - name: Build
         if: steps.tag_check.outputs.valid == 'true'
+        env:
+          EXIFMETA_SUPPRESS_GIT_DIRTY: "true"
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Compress binary with UPX
