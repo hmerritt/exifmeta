@@ -1304,9 +1304,15 @@ fn custom_tags_from_bytes(bytes: &[u8]) -> Option<Vec<CustomTag>> {
 }
 
 fn custom_tag_json_body(bytes: &[u8]) -> &[u8] {
+    const MARKER_PREFIX: &[u8] = b"exifmeta-v";
+
+    if let Some(rest) = bytes.strip_prefix(MARKER_PREFIX) {
+        if let Some(marker_end) = rest.iter().position(|byte| *byte == b'\n') {
+            return &rest[(marker_end + 1)..];
+        }
+    }
+
     bytes
-        .strip_prefix(CUSTOM_TAG_PAYLOAD_MARKER.as_bytes())
-        .unwrap_or(bytes)
 }
 
 fn custom_tags_from_yaml_bytes(bytes: &[u8]) -> Option<Vec<CustomTag>> {
@@ -4335,7 +4341,7 @@ frames:
         assert_eq!(decoded, tags);
         assert!(!payload.starts_with(LEGACY_CUSTOM_TAG_PAYLOAD_PREFIX));
         assert!(json.starts_with(CUSTOM_TAG_PAYLOAD_MARKER));
-        assert!(json.contains("exifmeta-v0.1.0"));
+        assert!(json.contains(&format!("exifmeta-v{}", env!("CARGO_PKG_VERSION"))));
         assert!(json.contains(r#""FilmRoll":35"#));
         assert!(json.contains(r#""FilmName":"Kodak Double-X""#));
         assert!(json.contains(r#""FilmNegative":true"#));
@@ -4346,16 +4352,25 @@ frames:
         let bare_json = br#"{"FilmRoll":35,"FilmName":"Kodak Double-X"}"#;
         let mut marked_json = CUSTOM_TAG_PAYLOAD_MARKER.as_bytes().to_vec();
         marked_json.extend_from_slice(bare_json);
+        let mut old_marked_json = b"exifmeta-v0.1.0\n".to_vec();
+        old_marked_json.extend_from_slice(bare_json);
         let mut ascii_prefixed_json = USER_COMMENT_ASCII_PREFIX.to_vec();
         ascii_prefixed_json.extend_from_slice(bare_json);
+        let mut ascii_prefixed_old_marked_json = USER_COMMENT_ASCII_PREFIX.to_vec();
+        ascii_prefixed_old_marked_json.extend_from_slice(&old_marked_json);
         let mut legacy = LEGACY_CUSTOM_TAG_PAYLOAD_PREFIX.to_vec();
         legacy.extend_from_slice(b"FilmRoll: 35\nFilmName: Kodak Double-X\n");
 
         let bare_decoded = custom_tags_from_bytes(bare_json).expect("bare JSON should decode");
         let marked_decoded =
             custom_tags_from_bytes(&marked_json).expect("marked JSON should decode");
+        let old_marked_decoded =
+            custom_tags_from_bytes(&old_marked_json).expect("old marked JSON should decode");
         let ascii_prefixed_decoded = custom_tags_from_bytes(&ascii_prefixed_json)
             .expect("ASCII-prefixed JSON should decode");
+        let ascii_prefixed_old_marked_decoded =
+            custom_tags_from_bytes(&ascii_prefixed_old_marked_json)
+                .expect("ASCII-prefixed old marked JSON should decode");
         let legacy_decoded =
             custom_tags_from_bytes(&legacy).expect("legacy YAML payload should decode");
 
@@ -4373,8 +4388,11 @@ frames:
             ]
         );
         assert_eq!(marked_decoded, bare_decoded);
+        assert_eq!(old_marked_decoded, bare_decoded);
         assert_eq!(ascii_prefixed_decoded, bare_decoded);
+        assert_eq!(ascii_prefixed_old_marked_decoded, bare_decoded);
         assert_eq!(legacy_decoded, bare_decoded);
+        assert!(custom_tags_from_bytes(b"exifmeta-v0.1.0").is_none());
     }
 
     #[test]
@@ -4448,7 +4466,7 @@ frames:
         assert!(!pretty.contains("User Comment"));
         assert!(raw.contains("0x9286"));
         assert!(raw.contains("UserComment"));
-        assert!(raw.contains("exifmeta-v0.1.0"));
+        assert!(raw.contains(&format!("exifmeta-v{}", env!("CARGO_PKG_VERSION"))));
         assert!(raw.contains("FilmRoll"));
         assert!(raw.contains("Kodak Double-X"));
         assert!(!raw.contains("IFD exifmeta  Custom  0x0000"));
