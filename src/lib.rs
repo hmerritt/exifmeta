@@ -852,6 +852,16 @@ fn pretty_inspect_value(row: &InspectRow) -> String {
         return pretty_exposure_time(&row.value).unwrap_or_else(|| row.value.clone());
     }
 
+    if !row.is_unknown {
+        if let Some(value) = row
+            .value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        {
+            return value.to_string();
+        }
+    }
+
     row.value.clone()
 }
 
@@ -5118,7 +5128,7 @@ frames:
         assert!(plain_output.contains("file "));
         assert!(plain_output.contains("File Name  image.tif"));
         assert!(plain_output.contains("camera "));
-        assert!(plain_output.contains("Make   \"Z\"\nModel  \"E\""));
+        assert!(plain_output.contains("Make   Z\nModel  E"));
         assert!(!plain_output.contains("unknown "));
         assert!(!plain_output.contains("Unknown Tiff Tag"));
         assert!(!plain_output.contains("tags were omitted for not being human-readable"));
@@ -5156,7 +5166,7 @@ frames:
             InspectFormat::Raw,
         ));
 
-        assert!(plain_pretty.contains("Make  \"Z\""));
+        assert!(plain_pretty.contains("Make  Z"));
         assert!(!plain_pretty.contains("Strip Offsets"));
         assert!(!plain_pretty.contains("Strip Byte Counts"));
         assert!(!plain_pretty.contains("12345"));
@@ -5167,6 +5177,8 @@ frames:
         assert!(!pretty.contains("tags were omitted for not being human-readable"));
         assert!(raw.contains("StripOffsets"));
         assert!(raw.contains("StripByteCounts"));
+        assert!(raw.contains("Make"));
+        assert!(raw.contains("\"Z\""));
         assert!(raw.contains("12345"));
         assert!(raw.contains("67890"));
     }
@@ -5391,8 +5403,8 @@ frames:
             format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
 
         assert_eq!(output.matches("Make").count(), 1);
-        assert_eq!(output.matches("\"A\"").count(), 1);
-        assert!(output.contains("Model  \"B\""));
+        assert_eq!(output.matches("A").count(), 1);
+        assert!(output.contains("Model  B"));
     }
 
     #[test]
@@ -5410,8 +5422,8 @@ frames:
             format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
 
         assert_eq!(output.matches("Make").count(), 2);
-        assert!(output.contains("Make  \"A\""));
-        assert!(output.contains("Make  \"B\""));
+        assert!(output.contains("Make  A"));
+        assert!(output.contains("Make  B"));
     }
 
     #[test]
