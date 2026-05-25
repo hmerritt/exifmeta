@@ -10,7 +10,7 @@ on:
 
 jobs:
   test_build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,6 +20,15 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Generate GeoNames database
+        run: |
+          curl -fsSLO https://download.geonames.org/export/dump/cities1000.zip
+          unzip -q cities1000.zip cities1000.txt
+          python tools/geonames_to_sqlite.py
+
+      - name: Test GeoNames converter
+        run: python -m unittest discover tools
 
       - name: Build
         run: cargo build --release --locked
