@@ -1,6 +1,6 @@
 [package]
 name = "exifmeta"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "EXIF tool for photographers. Reads a metadata.yaml and writes EXIF to one or many image files"
 license = "MIT"

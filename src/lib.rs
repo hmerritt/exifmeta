@@ -3022,7 +3022,7 @@ fn build_run_plan(
 
 fn run_frame_label(frame_key: &YamlValue, image: &Path) -> String {
     if let Some(frame_number) = frame_number_from_key(frame_key) {
-        return format!("frame {frame_number} ({})", run_file_heading(image));
+        return format!("{} — frame {frame_number}", run_file_heading(image));
     }
 
     run_file_heading(image)
@@ -3453,18 +3453,20 @@ fn append_run_file_header(rendered: &mut String, file: &RunFileOutput) {
 fn append_run_file_result(rendered: &mut String, file: &RunFileOutput) {
     let action = if file.dry_run { "would write" } else { "wrote" };
     rendered.push_str(&format!(
-        "{action} {} tags (took {})\n",
-        file.result.written,
-        format_run_duration(file.elapsed_ms)
+        "{action} {} tags\n",
+        file.result.written
     ));
-    for warning in &file.result.warnings {
-        rendered.push_str(&format!("{}\n", format_validate_warning(warning)));
-    }
+    rendered.push_str(&format!(
+        "took {}\n", format_run_duration(file.elapsed_ms)
+    ));
     for skipped in &file.result.skipped {
         rendered.push_str(&format!(
             "{}\n",
             format_validate_warning(&format!("skipped {skipped}"))
         ));
+    }
+    for warning in &file.result.warnings {
+        rendered.push_str(&format!("{}\n", format_validate_warning(warning)));
     }
     for error in &file.result.errors {
         rendered.push_str(&format!("{}\n", format_validate_error(error)));
@@ -4016,7 +4018,7 @@ frames:
         let tags = frame.tags;
 
         assert_eq!(tags.len(), 3);
-        assert_eq!(frame.label, "frame 1 (one.jpg)");
+        assert_eq!(frame.label, "one.jpg — frame 1");
         assert!(
             tags.iter()
                 .any(|tag| tag.name == "Make" && tag.value.as_str() == Some("Nikon"))
@@ -4134,7 +4136,7 @@ frames:
         assert!(plain.starts_with("run "));
         assert!(plain.contains("mode: dry-run\n\nframes "));
         assert!(plain.contains("frames "));
-        assert!(plain.contains("frame 1 (image.jpg)\nwrote 2 tags (took 42ms)"));
+        assert!(plain.contains("frame 1 (image.jpg)\nwrote 2 tags\ntook 42ms"));
         assert!(rendered.contains("\u{1b}[94mframes"));
         assert!(rendered.contains("\u{1b}[96mframe 1 (image.jpg)"));
         assert!(rendered.contains("\u{1b}[96m2.jpg"));
@@ -4143,7 +4145,7 @@ frames:
         assert!(!plain.contains("\nskipped: 0"));
         assert!(plain.contains("warning: skipping unsupported writer tag `FilmRoll`"));
         assert!(plain.contains(
-            "warning: skipping unsupported writer tag `FilmRoll`\n2.jpg\nwrote 1 tags (took 1.5s)"
+            "warning: skipping unsupported writer tag `FilmRoll`\n2.jpg\nwrote 1 tags\ntook 1.5s"
         ));
         assert!(plain.contains("missing.jpg\nskipped: no metadata"));
         assert!(plain.contains("skipped: no metadata\n\noverview "));
@@ -4249,7 +4251,7 @@ frames:
         assert!(!strip_ansi_codes(&header).contains("tags:"));
         assert_eq!(
             strip_ansi_codes(&result),
-            "wrote 2 tags (took 1500ms)\nwarning: skipped ISO already exists\n"
+            "wrote 2 tags\ntook 1500ms\nwarning: skipped ISO already exists\n"
         );
     }
 
@@ -4268,7 +4270,7 @@ frames:
 
         assert_eq!(
             strip_ansi_codes(&format_run_file_result_output(&file)),
-            "wrote 0 tags (took 17ms)\nwarning: skipped ISO already exists\n"
+            "wrote 0 tags\ntook 17ms\nwarning: skipped ISO already exists\n"
         );
     }
 
@@ -4287,7 +4289,7 @@ frames:
 
         assert_eq!(
             strip_ansi_codes(&format_run_file_result_output(&file)),
-            "would write 2 tags (took 9ms)\n"
+            "would write 2 tags\ntook 9ms\n"
         );
     }
 
