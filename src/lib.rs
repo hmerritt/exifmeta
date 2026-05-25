@@ -3022,7 +3022,7 @@ fn build_run_plan(
 
 fn run_frame_label(frame_key: &YamlValue, image: &Path) -> String {
     if let Some(frame_number) = frame_number_from_key(frame_key) {
-        return format!("{} — frame {frame_number}", run_file_heading(image));
+        return format!("{} ← frame {frame_number}", run_file_heading(image));
     }
 
     run_file_heading(image)
@@ -4018,7 +4018,7 @@ frames:
         let tags = frame.tags;
 
         assert_eq!(tags.len(), 3);
-        assert_eq!(frame.label, "one.jpg — frame 1");
+        assert_eq!(frame.label, "one.jpg ← frame 1");
         assert!(
             tags.iter()
                 .any(|tag| tag.name == "Make" && tag.value.as_str() == Some("Nikon"))
