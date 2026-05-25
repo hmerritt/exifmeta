@@ -141,7 +141,8 @@ jobs:
 
       - name: Compress binary with UPX
         if: steps.tag_check.outputs.valid == 'true'
-        run: upx --best --lzma "target/${{ matrix.target }}/release/exifmeta"
+        continue-on-error: true
+        run: upx --best --lzma --force-macos "target/${{ matrix.target }}/release/exifmeta"
 
       - name: Package artifact
         if: steps.tag_check.outputs.valid == 'true'
