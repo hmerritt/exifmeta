@@ -16,7 +16,8 @@ locations: [Wales]
 
 # ───────────────────────────────────────────────
 # Global EXIF Properties
-# Any valid EXIF tag can be set here. These tags will be written to ALL images.
+# Any valid EXIF tag can be set here. Non-standard tags can also be set here, and will
+# be written together in a single custom property.
 # ───────────────────────────────────────────────
 exif:
     # Camera & Lens
@@ -60,20 +61,22 @@ exif:
 # GPS data. Values set here will override the above `exif` values.
 # ───────────────────────────────────────────────
 frames:
-    # Frame number (first file when sorted alphabetically, useful when shooting film and files are in-order)
-    1:
-        - ImageDescription:
-        - ExposureTime: 1/500
-        - FNumber: 2.8
+    # Filename
+    "image-file.tif":
+        - ExposureTime: 1/250
+        - FNumber: 5.6
         # Special key (`$` prefix) that will match city/town names to GPS long/lat
         # values automatically, and set EXIF acordingly. This uses an embeded locations
         # database, no internet requried.
         - $Location: Betws-y-Coed
-
-    # Filename (direct but more verbose)
-    "image-file.tif":
-        - ExposureTime: 1/250
-        - FNumber: 5.6
+        # Manually setting GPS with the following values:
+        - GPSLatitude: "51.5074"
+        - GPSLatitudeRef: "N"
+        - GPSLongitude: "3.1791"
+        - GPSLongitudeRef: "W"
+        - GPSAltitude: "142"
+        - GPSAltitudeRef: 0 # 0 = above sea level
+        - GPSMapDatum: "WGS-84"
         # 0 = Unknown
         # 1 = Average
         # 2 = Center-weighted average
@@ -83,11 +86,3 @@ frames:
         # 6 = Partial
         # 255 = Other
         - MeteringMode: 2
-        # Manually setting  GPS, all of the following values must be set!
-        - GPSLatitude: "51.5074"
-        - GPSLatitudeRef: "N"
-        - GPSLongitude: "3.1791"
-        - GPSLongitudeRef: "W"
-        - GPSAltitude: "142"
-        - GPSAltitudeRef: 0 # 0 = above sea level
-        - GPSMapDatum: "WGS-84"

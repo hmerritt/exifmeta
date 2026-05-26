@@ -57,7 +57,8 @@ locations: []
 
 # ───────────────────────────────────────────────
 # Global EXIF Properties
-# Any valid EXIF tag can be set here. These tags will be written to ALL images.
+# Any valid EXIF tag can be set here. Non-standard tags can also be set here, and will
+# be written together in a single custom property.
 # ───────────────────────────────────────────────
 exif:
     # Camera & Lens
@@ -101,37 +102,7 @@ exif:
 # GPS data. Values set here will override the above `exif` values.
 # ───────────────────────────────────────────────
 frames:
-    # Frame number (first file when sorted alphabetically, useful when shooting film and files are in-order)
-    1:
-        - ImageDescription:
-        - ExposureTime:
-        - FNumber:
-        # Special key (`$` prefix) that will match city/town names to GPS long/lat
-        # values automatically, and set EXIF acordingly. This uses an embeded locations
-        # database, no internet requried.
-        - $Location:
-
-    # Filename (direct but more verbose)
-    "image-file.tif":
-        - ExposureTime:
-        - FNumber:
-        # 0 = Unknown
-        # 1 = Average
-        # 2 = Center-weighted average
-        # 3 = Spot
-        # 4 = Multi-spot
-        # 5 = Multi-segment
-        # 6 = Partial
-        # 255 = Other
-        - MeteringMode: 2
-        # Manually setting  GPS, all of the following values must be set!
-        - GPSLatitude:
-        - GPSLatitudeRef:
-        - GPSLongitude:
-        - GPSLongitudeRef:
-        - GPSAltitude:
-        - GPSAltitudeRef: 0 # 0 = above sea level
-        - GPSMapDatum:
+<frames>
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1642,8 +1613,9 @@ fn init_command(dry_run: bool, args: InitArgs) -> Result<(), CliError> {
     }
 
     let today = Local::now().format("%Y-%m-%d").to_string();
-    let image_count = count_supported_images_in_directory(&directory)?;
-    let contents = render_metadata_template(&today, image_count);
+    let image_files = supported_image_files_in_directory(&directory).map_err(CliError::Error)?;
+    let image_count = image_files.len();
+    let contents = render_metadata_template(&today, &image_files);
 
     if dry_run {
         println!(
@@ -1684,37 +1656,24 @@ fn init_command(dry_run: bool, args: InitArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn render_metadata_template(today: &str, image_count: usize) -> String {
+fn render_metadata_template(today: &str, image_files: &[PathBuf]) -> String {
+    let image_count = image_files.len();
     METADATA_TEMPLATE
         .replace("<today>", today)
         .replace("<image-count-in-directory>", &image_count.to_string())
+        .replace("<frames>", &render_metadata_template_frames(image_files))
 }
 
-fn count_supported_images_in_directory(directory: &Path) -> Result<usize, CliError> {
-    let entries = fs::read_dir(directory).map_err(|error| {
-        CliError::Error(format!(
-            "failed to read directory {}: {error}",
-            directory.display()
-        ))
-    })?;
+fn render_metadata_template_frames(image_files: &[PathBuf]) -> String {
+    image_files
+        .iter()
+        .map(|path| format!("    {}:", yaml_quoted_string(&file_name(path))))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-    let mut count = 0;
-
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            CliError::Error(format!(
-                "failed to read directory entry in {}: {error}",
-                directory.display()
-            ))
-        })?;
-        let path = entry.path();
-
-        if path.is_file() && is_supported_image_file(&path) {
-            count += 1;
-        }
-    }
-
-    Ok(count)
+fn yaml_quoted_string(value: &str) -> String {
+    serde_json::to_string(value).expect("YAML string key should serialize")
 }
 
 fn is_supported_image_file(path: &Path) -> bool {
@@ -2137,9 +2096,12 @@ fn validate_metadata_yaml(
     }
 
     if let Some(frames) = yaml_mapping_get(root, "frames") {
-        let frames = frames
-            .as_mapping()
-            .ok_or_else(|| "metadata YAML `frames` key must be a mapping".to_string())?;
+        let empty_frames = Mapping::new();
+        let frames = match frames {
+            YamlValue::Null => &empty_frames,
+            YamlValue::Mapping(frames) => frames,
+            _ => return Err("metadata YAML `frames` key must be a mapping".to_string()),
+        };
         let frame_report = validate_frames_mapping(metadata_path, frames)?;
         report.frame_tags = frame_report.tags;
         report
@@ -2319,6 +2281,7 @@ fn collect_frame_tags(
             }
             Ok(())
         }
+        YamlValue::Null => Ok(()),
         _ => Err("metadata YAML frame values must be mappings or sequences".to_string()),
     }
 }
@@ -3017,9 +2980,12 @@ fn build_run_plan(
     }
 
     if let Some(frames) = yaml_mapping_get(root, "frames") {
-        let frames = frames
-            .as_mapping()
-            .ok_or_else(|| "metadata YAML `frames` key must be a mapping".to_string())?;
+        let empty_frames = Mapping::new();
+        let frames = match frames {
+            YamlValue::Null => &empty_frames,
+            YamlValue::Mapping(frames) => frames,
+            _ => return Err("metadata YAML `frames` key must be a mapping".to_string()),
+        };
         let image_directory = path_parent_or_current(metadata_path);
         for (frame_key, frame_value) in frames {
             let Some(image) = resolve_run_frame_target(frame_key, image_directory, targets) else {
@@ -3078,6 +3044,7 @@ fn collect_run_tags_from_frame_value(value: &YamlValue) -> Result<Vec<RunTag>, S
             }
             Ok(tags)
         }
+        YamlValue::Null => Ok(Vec::new()),
         _ => Err("metadata YAML frame values must be mappings or sequences".to_string()),
     }
 }
@@ -3808,13 +3775,18 @@ mod tests {
 
     #[test]
     fn renders_metadata_template_values() {
-        let output = render_metadata_template("2026-05-22", 12);
+        let image_files = vec![PathBuf::from("01.tif"), PathBuf::from("1_result.jpg")];
+        let output = render_metadata_template("2026-05-22", &image_files);
 
         assert!(output.contains("date: 2026-05-22"));
         assert!(output.contains("date_end: 2026-05-22"));
-        assert!(output.contains("frame_count: 12"));
+        assert!(output.contains("frame_count: 2"));
+        assert!(output.contains("frames:\n    \"01.tif\":\n    \"1_result.jpg\":"));
+        assert!(!output.contains("image-file.tif"));
+        assert!(!output.contains("ExposureTime:"));
         assert!(!output.contains("<today>"));
         assert!(!output.contains("<image-count-in-directory>"));
+        assert!(!output.contains("<frames>"));
     }
 
     #[test]
@@ -3834,6 +3806,8 @@ mod tests {
         let today = Local::now().format("%Y-%m-%d").to_string();
         assert!(output.contains(&format!("date: {today}")));
         assert!(output.contains("frame_count: 0"));
+        assert!(output.contains("frames:\n\n"));
+        assert!(!output.contains("frames: {}"));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -3907,6 +3881,14 @@ mod tests {
         let output = std::fs::read_to_string(directory.join(METADATA_FILE_NAME))
             .expect("metadata file should be readable");
         assert!(output.contains("frame_count: 10"));
+        for file_name in [
+            "a.JPG", "b.jpeg", "c.jxl", "d.heif", "e.hif", "f.heic", "g.avif", "h.png", "i.tiff",
+            "j.webp",
+        ] {
+            assert!(output.contains(&format!("    \"{file_name}\":")));
+        }
+        assert!(!output.contains("notes.txt"));
+        assert!(!output.contains("nested.jpg"));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -4099,6 +4081,50 @@ frames:
             .expect("filename frame should match image");
 
         assert_eq!(frame.label, "2.jpg");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn run_plan_accepts_null_frames_and_null_frame_values() {
+        let directory = temporary_test_directory("run-plan-null-frames");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        let image = directory.join("one.jpg");
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+exif:
+  Make: Nikon
+frames:
+  "one.jpg":
+"#,
+        )
+        .expect("test YAML should parse");
+
+        let plan = build_run_plan(&metadata, &yaml, std::slice::from_ref(&image))
+            .expect("run plan should build");
+        let frame = plan
+            .frame_for_image(&image)
+            .expect("global tags should apply to the null frame");
+
+        assert_eq!(frame.label, "one.jpg");
+        assert!(
+            frame
+                .tags
+                .iter()
+                .any(|tag| tag.name == "Make" && tag.value.as_str() == Some("Nikon"))
+        );
+
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+exif:
+  Make: Nikon
+frames:
+"#,
+        )
+        .expect("test YAML should parse");
+        let plan = build_run_plan(&metadata, &yaml, std::slice::from_ref(&image))
+            .expect("run plan should build");
+        assert!(plan.frame_for_image(&image).is_some());
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -4587,6 +4613,40 @@ frames:
                 .iter()
                 .any(|warning| warning.contains("$Location"))
         );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn validate_metadata_accepts_null_frames_and_null_frame_values() {
+        let directory = temporary_test_directory("validate-null-frames");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(directory.join("one.jpg"), []).expect("test image should be written");
+
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+frames:
+  "one.jpg":
+"#,
+        )
+        .expect("test YAML should parse");
+        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+
+        assert_eq!(report.frame_tags, TagCounts::default());
+        assert_eq!(report.frames.frames.len(), 1);
+        assert!(report.frames.frames[0].errors.is_empty());
+        assert!(report.frames.frames[0].warnings.is_empty());
+
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+frames:
+"#,
+        )
+        .expect("test YAML should parse");
+        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+
+        assert_eq!(report.frames.file_count, 1);
+        assert!(report.frames.frames.is_empty());
 
         let _ = std::fs::remove_dir_all(directory);
     }
