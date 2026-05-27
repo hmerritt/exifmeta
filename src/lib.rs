@@ -4994,6 +4994,39 @@ mod tests {
     }
 
     #[test]
+    fn strip_privacy_preserves_unknown_tags_and_required_tiff_tags() {
+        let exif = parse_raw_exif(&[
+            tiff_long_entry(0x0100, 640),
+            tiff_ascii_entry(0x010f, b"N\0"),
+            tiff_short_entry(0xfde8, 42),
+        ]);
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+
+        let targets = strip_removal_targets(
+            &exif,
+            &StripMode::privacy(),
+            true,
+            &mut warnings,
+            &mut errors,
+        );
+        let tag_ids = targets
+            .iter()
+            .map(|target| target.tag_id)
+            .collect::<HashSet<_>>();
+        let names = targets
+            .into_iter()
+            .map(|target| target.name)
+            .collect::<HashSet<_>>();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!tag_ids.contains(&0xfde8));
+        assert!(!names.contains("ImageWidth"));
+        assert!(!names.contains("Make"));
+    }
+
+    #[test]
     fn strip_selective_tiff_preserves_required_structural_tags() {
         let exif = parse_raw_exif(&[
             tiff_long_entry(0x0100, 640),
