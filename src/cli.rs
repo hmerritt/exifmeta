@@ -80,6 +80,24 @@ pub struct StripArgs {
     pub targets: Option<String>,
 
     #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "TAGS",
+        conflicts_with_all = ["remove", "privacy"],
+        help = "Strip all EXIF tags except the comma-separated tag names"
+    )]
+    pub keep: Vec<String>,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "TAGS",
+        conflicts_with_all = ["keep", "privacy"],
+        help = "Remove only the comma-separated EXIF tag names"
+    )]
+    pub remove: Vec<String>,
+
+    #[arg(
         short = 'e',
         long,
         value_delimiter = ',',
@@ -93,6 +111,13 @@ pub struct StripArgs {
 
     #[arg(long, help = "Verify that no EXIF metadata remains after stripping")]
     pub verify: bool,
+
+    #[arg(
+        long,
+        conflicts_with_all = ["keep", "remove"],
+        help = "Remove privacy-sensitive EXIF tags while keeping harmless technical tags"
+    )]
+    pub privacy: bool,
 
     #[arg(long, help = "Emit a machine-readable JSON report")]
     pub json: bool,
@@ -229,9 +254,12 @@ mod tests {
         };
 
         assert_eq!(args.targets, None);
+        assert!(args.keep.is_empty());
+        assert!(args.remove.is_empty());
         assert!(args.extensions.is_empty());
         assert!(!args.recursive);
         assert!(!args.verify);
+        assert!(!args.privacy);
         assert!(!args.json);
     }
 
@@ -242,6 +270,8 @@ mod tests {
             "--dry-run",
             "strip",
             "photos/*.jpg",
+            "--keep",
+            "Make,Model",
             "--recursive",
             "--extensions",
             "jpg,png",
@@ -257,10 +287,45 @@ mod tests {
         };
 
         assert_eq!(args.targets, Some("photos/*.jpg".to_string()));
+        assert_eq!(args.keep, ["Make", "Model"]);
+        assert!(args.remove.is_empty());
         assert_eq!(args.extensions, ["jpg", "png"]);
         assert!(args.recursive);
         assert!(args.verify);
+        assert!(!args.privacy);
         assert!(args.json);
+    }
+
+    #[test]
+    fn parses_strip_repeated_remove_values() {
+        let cli = Cli::try_parse_from([
+            "exifmeta",
+            "strip",
+            "--remove",
+            "GPSLatitude,GPSLongitude",
+            "--remove",
+            "UserComment",
+        ])
+        .expect("strip repeated remove values should parse");
+
+        let Command::Strip(args) = cli.command else {
+            panic!("expected strip command");
+        };
+
+        assert_eq!(args.remove, ["GPSLatitude", "GPSLongitude", "UserComment"]);
+    }
+
+    #[test]
+    fn rejects_conflicting_strip_modes() {
+        assert!(
+            Cli::try_parse_from(["exifmeta", "strip", "--keep", "Make", "--remove", "Model"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["exifmeta", "strip", "--privacy", "--keep", "Make"]).is_err());
+        assert!(
+            Cli::try_parse_from(["exifmeta", "strip", "--privacy", "--remove", "GPSLatitude"])
+                .is_err()
+        );
     }
 
     #[test]
