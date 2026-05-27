@@ -32,7 +32,7 @@ pub enum Command {
     Interactive,
 
     #[command(about = "Remove all existing EXIF metadata from target image files")]
-    Strip,
+    Strip(StripArgs),
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -72,6 +72,30 @@ pub struct RunArgs {
 
     #[arg(long, help = "Find image files across all subdirectories")]
     pub recursive: bool,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct StripArgs {
+    #[arg(value_name = "TARGETS")]
+    pub targets: Option<String>,
+
+    #[arg(
+        short = 'e',
+        long,
+        value_delimiter = ',',
+        value_name = "EXTENSIONS",
+        help = "Restrict processing to comma-separated file extensions"
+    )]
+    pub extensions: Vec<String>,
+
+    #[arg(long, help = "Find image files across all subdirectories")]
+    pub recursive: bool,
+
+    #[arg(long, help = "Verify that no EXIF metadata remains after stripping")]
+    pub verify: bool,
+
+    #[arg(long, help = "Emit a machine-readable JSON report")]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -194,6 +218,49 @@ mod tests {
         assert!(args.no_overwrite);
         assert!(args.recursive);
         assert_eq!(args.extensions, ["jpg", "tiff"]);
+    }
+
+    #[test]
+    fn parses_strip_default_args() {
+        let cli = Cli::try_parse_from(["exifmeta", "strip"]).expect("strip should parse");
+
+        let Command::Strip(args) = cli.command else {
+            panic!("expected strip command");
+        };
+
+        assert_eq!(args.targets, None);
+        assert!(args.extensions.is_empty());
+        assert!(!args.recursive);
+        assert!(!args.verify);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn parses_strip_flags() {
+        let cli = Cli::try_parse_from([
+            "exifmeta",
+            "--dry-run",
+            "strip",
+            "photos/*.jpg",
+            "--recursive",
+            "--extensions",
+            "jpg,png",
+            "--verify",
+            "--json",
+        ])
+        .expect("strip flags should parse");
+
+        assert!(cli.dry_run);
+
+        let Command::Strip(args) = cli.command else {
+            panic!("expected strip command");
+        };
+
+        assert_eq!(args.targets, Some("photos/*.jpg".to_string()));
+        assert_eq!(args.extensions, ["jpg", "png"]);
+        assert!(args.recursive);
+        assert!(args.verify);
+        assert!(args.json);
     }
 
     #[test]

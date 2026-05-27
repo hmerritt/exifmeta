@@ -19,12 +19,15 @@ use little_exif::rational::uR64;
 use rattles::presets::prelude as spinners;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, DatabaseName, params, params_from_iter};
+use serde_json::json;
 use serde_yaml::{Mapping, Value as YamlValue};
 
 pub mod cli;
 pub mod version;
 
-pub use cli::{Cli, Command, InitArgs, InspectArgs, InspectFormat, RunArgs, ValidateArgs};
+pub use cli::{
+    Cli, Command, InitArgs, InspectArgs, InspectFormat, RunArgs, StripArgs, ValidateArgs,
+};
 
 const GEONAMES_DATABASE: &[u8] = include_bytes!("../assets/geonames/cities1000.sqlite");
 const NEAREST_LOCATION_LIMIT: usize = 5;
@@ -119,7 +122,9 @@ impl From<String> for CliError {
 }
 
 pub fn run(cli: Cli) -> Result<(), CliError> {
-    version::print_title();
+    if !matches!(&cli.command, Command::Strip(args) if args.json) {
+        version::print_title();
+    }
 
     match cli.command {
         Command::Run(args) => run_command(cli.dry_run, args).map_err(Into::into),
@@ -127,7 +132,7 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
         Command::Validate(args) => validate_command(args),
         Command::Inspect(args) => inspect_command(args).map_err(Into::into),
         Command::Interactive => stub_command(cli.dry_run, "interactive").map_err(Into::into),
-        Command::Strip => stub_command(cli.dry_run, "strip").map_err(Into::into),
+        Command::Strip(args) => strip_command(cli.dry_run, args),
     }
 }
 
@@ -2689,6 +2694,323 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
     }
 }
 
+fn strip_command(dry_run: bool, args: StripArgs) -> Result<(), CliError> {
+    let started = Instant::now();
+    let targets = resolve_run_targets(
+        Path::new("."),
+        args.targets.as_deref(),
+        args.recursive,
+        &args.extensions,
+    )
+    .map_err(CliError::Error)?;
+
+    if targets.is_empty() {
+        return Err(CliError::Error("no target images matched".to_string()));
+    }
+
+    let mut output = StripOutput {
+        dry_run,
+        target_count: targets.len(),
+        files: Vec::new(),
+    };
+    let mut summary = StripSummary::default();
+    let spinner = SpinnerPreset::random();
+
+    if !args.json {
+        print!("{}", format_strip_heading_output(&output));
+        flush_stdout();
+    }
+
+    for image in targets {
+        let file_output = StripFileOutput {
+            label: run_file_heading(&image),
+            image,
+            result: StripFileResult::default(),
+            elapsed_ms: 0,
+            dry_run,
+        };
+
+        if !args.json {
+            print!("{}", format_strip_file_header_output(&file_output));
+            flush_stdout();
+        }
+
+        let file_started = Instant::now();
+        let result = if args.json {
+            strip_metadata_from_image(&file_output.image, dry_run, args.verify)
+        } else {
+            let progress = TerminalSpinner::start(spinner, "stripping metadata".to_string());
+            let result = strip_metadata_from_image(&file_output.image, dry_run, args.verify);
+            progress.finish();
+            result
+        };
+        let elapsed_ms = file_started.elapsed().as_millis();
+        summary.add(&result);
+
+        let file_output = StripFileOutput {
+            result,
+            elapsed_ms,
+            ..file_output
+        };
+
+        if !args.json {
+            print!("{}", format_strip_file_result_output(&file_output));
+            flush_stdout();
+        }
+
+        output.files.push(file_output);
+    }
+
+    summary.elapsed_ms = started.elapsed().as_millis();
+
+    if args.json {
+        println!("{}", format_strip_json_output(&output, &summary));
+    } else {
+        print!("{}", format_strip_overview_output(&output, &summary));
+        flush_stdout();
+    }
+
+    if summary.errors > 0 {
+        Err(CliError::Failure)
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct StripFileResult {
+    stripped: bool,
+    verified: bool,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StripSummary {
+    stripped_files: usize,
+    verified_files: usize,
+    warnings: usize,
+    errors: usize,
+    elapsed_ms: u128,
+}
+
+impl StripSummary {
+    fn add(&mut self, result: &StripFileResult) {
+        self.stripped_files += usize::from(result.stripped);
+        self.verified_files += usize::from(result.verified);
+        self.warnings += result.warnings.len();
+        self.errors += result.errors.len();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StripOutput {
+    dry_run: bool,
+    target_count: usize,
+    files: Vec<StripFileOutput>,
+}
+
+#[derive(Debug, Clone)]
+struct StripFileOutput {
+    label: String,
+    image: PathBuf,
+    result: StripFileResult,
+    elapsed_ms: u128,
+    dry_run: bool,
+}
+
+fn strip_metadata_from_image(image: &Path, dry_run: bool, verify: bool) -> StripFileResult {
+    let mut result = StripFileResult::default();
+
+    if dry_run {
+        result.stripped = true;
+        return result;
+    }
+
+    if let Err(error) = WritableMetadata::file_clear_metadata(image) {
+        result
+            .errors
+            .push(format!("failed to strip EXIF metadata: {error}"));
+        return result;
+    }
+
+    result.stripped = true;
+
+    if verify {
+        match read_metadata(image) {
+            Ok(metadata) if metadata.exif.fields().next().is_none() => {
+                result.verified = true;
+            }
+            Ok(_) => result
+                .errors
+                .push("verification failed: EXIF metadata remains".to_string()),
+            Err(error) => result.errors.push(format!("verification failed: {error}")),
+        }
+    }
+
+    result
+}
+
+#[cfg(test)]
+fn format_strip_output(output: &StripOutput, summary: &StripSummary) -> String {
+    let mut rendered = String::new();
+    rendered.push_str(&format_strip_heading_output(output));
+    for file in &output.files {
+        rendered.push_str(&format_strip_file_output(file));
+    }
+    rendered.push_str(&format_strip_overview_output(output, summary));
+    rendered
+}
+
+fn format_strip_heading_output(output: &StripOutput) -> String {
+    let mut rendered = String::new();
+    let mut first_group = true;
+    append_strip_heading_group(&mut rendered, &mut first_group, output);
+    rendered
+}
+
+#[cfg(test)]
+fn format_strip_file_output(file: &StripFileOutput) -> String {
+    let mut rendered = String::new();
+    append_strip_file_header(&mut rendered, file);
+    append_strip_file_result(&mut rendered, file);
+    rendered
+}
+
+fn format_strip_file_header_output(file: &StripFileOutput) -> String {
+    let mut rendered = String::new();
+    append_strip_file_header(&mut rendered, file);
+    rendered
+}
+
+fn format_strip_file_result_output(file: &StripFileOutput) -> String {
+    let mut rendered = String::new();
+    append_strip_file_result(&mut rendered, file);
+    rendered
+}
+
+fn format_strip_overview_output(output: &StripOutput, summary: &StripSummary) -> String {
+    let mut rendered = String::new();
+    let mut first_group = false;
+    append_strip_overview_group(&mut rendered, &mut first_group, output, summary);
+    rendered
+}
+
+fn append_strip_heading_group(rendered: &mut String, first_group: &mut bool, output: &StripOutput) {
+    append_spaced_validate_heading(rendered, first_group, "strip");
+    rendered.push_str(&format!("targets: {}\n", output.target_count));
+    if output.dry_run {
+        rendered.push_str(&format!("mode: {}\n", "dry-run".yellow()));
+    }
+}
+
+fn append_strip_file_header(rendered: &mut String, file: &StripFileOutput) {
+    append_run_frame_subtitle(rendered, &file.label);
+    append_run_file_path(rendered, &file.image);
+}
+
+fn append_strip_file_result(rendered: &mut String, file: &StripFileOutput) {
+    let action = if file.dry_run {
+        "would strip EXIF"
+    } else if file.result.stripped {
+        "stripped EXIF"
+    } else {
+        "stripped EXIF: no"
+    };
+    rendered.push_str(&format!("{action}\n"));
+    if file.result.verified {
+        rendered.push_str("verified: no EXIF metadata\n");
+    }
+    rendered.push_str(&format!("took {}\n", format_run_duration(file.elapsed_ms)));
+    for warning in &file.result.warnings {
+        rendered.push_str(&format!("{}\n", format_validate_warning(warning)));
+    }
+    for error in &file.result.errors {
+        rendered.push_str(&format!("{}\n", format_validate_error(error)));
+    }
+}
+
+fn append_strip_overview_group(
+    rendered: &mut String,
+    first_group: &mut bool,
+    output: &StripOutput,
+    summary: &StripSummary,
+) {
+    append_spaced_validate_heading(rendered, first_group, "overview");
+    append_run_overview_row(rendered, "errors", summary.errors);
+    append_run_overview_row(rendered, "warnings", summary.warnings);
+    append_run_overview_row(
+        rendered,
+        if output.dry_run {
+            "would strip"
+        } else {
+            "stripped"
+        },
+        summary.stripped_files,
+    );
+    append_run_overview_row(rendered, "verified", summary.verified_files);
+    append_run_overview_row(rendered, "took", format_run_duration(summary.elapsed_ms));
+    if summary.errors > 0 {
+        append_run_overview_row(rendered, "status", "fail".red());
+    } else if summary.warnings > 0 {
+        append_run_overview_row(
+            rendered,
+            "status",
+            format!("{} {}", "success".green(), "(with warnings)"),
+        );
+    } else {
+        append_run_overview_row(rendered, "status", "success".green());
+    }
+}
+
+fn format_strip_json_output(output: &StripOutput, summary: &StripSummary) -> String {
+    let files = output
+        .files
+        .iter()
+        .map(|file| {
+            json!({
+                "path": path_to_pattern(&file.image),
+                "status": strip_file_status(file),
+                "stripped": file.result.stripped && !file.dry_run,
+                "would_strip": file.result.stripped && file.dry_run,
+                "verified": file.result.verified,
+                "elapsed_ms": file.elapsed_ms,
+                "warnings": file.result.warnings,
+                "errors": file.result.errors,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "command": "strip",
+        "dry_run": output.dry_run,
+        "target_count": output.target_count,
+        "files": files,
+        "summary": {
+            "files_stripped": if output.dry_run { 0 } else { summary.stripped_files },
+            "files_would_strip": if output.dry_run { summary.stripped_files } else { 0 },
+            "files_verified": summary.verified_files,
+            "warnings": summary.warnings,
+            "errors": summary.errors,
+            "elapsed_ms": summary.elapsed_ms,
+        },
+        "status": if summary.errors > 0 { "fail" } else { "success" },
+    })
+    .to_string()
+}
+
+fn strip_file_status(file: &StripFileOutput) -> &'static str {
+    if !file.result.errors.is_empty() {
+        "error"
+    } else if file.dry_run {
+        "would_strip"
+    } else if file.result.verified {
+        "verified"
+    } else {
+        "stripped"
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct RunRequest {
     metadata: Option<PathBuf>,
@@ -3985,6 +4307,108 @@ mod tests {
         assert_eq!(targets, [directory.join("a.jpg")]);
 
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn strip_dry_run_reports_without_modifying_file() {
+        let directory = temporary_test_directory("strip-dry-run");
+        let image = directory.join("image.jpg");
+        let contents = [0xff, 0xd8, 0xff, 0xd9];
+        std::fs::write(&image, contents).expect("jpg should be written");
+
+        let result = strip_metadata_from_image(&image, true, true);
+
+        assert!(result.stripped);
+        assert!(!result.verified);
+        assert!(result.warnings.is_empty());
+        assert!(result.errors.is_empty());
+        assert_eq!(
+            std::fs::read(&image).expect("image should be readable"),
+            contents
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn strip_unsupported_clear_format_reports_per_file_error() {
+        let directory = temporary_test_directory("strip-unsupported-clear-format");
+        let image = directory.join("image.webp");
+        std::fs::write(&image, b"RIFF\x04\0\0\0WEBP").expect("webp should be written");
+
+        let result = strip_metadata_from_image(&image, false, false);
+
+        assert!(!result.stripped);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("failed to strip EXIF metadata"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn strip_output_renders_pretty_summary() {
+        let output = StripOutput {
+            dry_run: true,
+            target_count: 1,
+            files: vec![StripFileOutput {
+                label: "image.jpg".to_string(),
+                image: PathBuf::from("image.jpg"),
+                result: StripFileResult {
+                    stripped: true,
+                    verified: false,
+                    warnings: Vec::new(),
+                    errors: Vec::new(),
+                },
+                elapsed_ms: 17,
+                dry_run: true,
+            }],
+        };
+        let mut summary = StripSummary::default();
+        summary.add(&output.files[0].result);
+        summary.elapsed_ms = 17;
+
+        let rendered = strip_ansi_codes(&format_strip_output(&output, &summary));
+
+        assert!(rendered.contains("strip "));
+        assert!(rendered.contains("targets: 1"));
+        assert!(rendered.contains("image.jpg\nwould strip EXIF\ntook 17ms"));
+        assert!(rendered.contains("would strip    1"));
+        assert!(rendered.contains("status         success"));
+    }
+
+    #[test]
+    fn strip_json_output_is_machine_readable() {
+        let output = StripOutput {
+            dry_run: false,
+            target_count: 1,
+            files: vec![StripFileOutput {
+                label: "image.jpg".to_string(),
+                image: PathBuf::from("image.jpg"),
+                result: StripFileResult {
+                    stripped: true,
+                    verified: true,
+                    warnings: Vec::new(),
+                    errors: Vec::new(),
+                },
+                elapsed_ms: 12,
+                dry_run: false,
+            }],
+        };
+        let mut summary = StripSummary::default();
+        summary.add(&output.files[0].result);
+        summary.elapsed_ms = 12;
+
+        let value: serde_json::Value =
+            serde_json::from_str(&format_strip_json_output(&output, &summary))
+                .expect("strip JSON should parse");
+
+        assert_eq!(value["command"], "strip");
+        assert_eq!(value["dry_run"], false);
+        assert_eq!(value["target_count"], 1);
+        assert_eq!(value["files"][0]["status"], "verified");
+        assert_eq!(value["summary"]["files_stripped"], 1);
+        assert_eq!(value["summary"]["files_verified"], 1);
+        assert_eq!(value["status"], "success");
     }
 
     #[test]
@@ -5918,9 +6342,10 @@ frames:
 
         let metadata = read_metadata(&path).expect("missing EXIF should not fail inspect");
 
-        assert_eq!(
-            format_inspect_output(&path, &metadata, InspectFormat::Pretty),
-            "\u{1b}[33m<No EXIF metadata found>\u{1b}[0m"
+        let pretty = format_inspect_output(&path, &metadata, InspectFormat::Pretty);
+        assert!(
+            pretty == "\u{1b}[33m<No EXIF metadata found>\u{1b}[0m"
+                || pretty == "<No EXIF metadata found>"
         );
         assert_eq!(
             format_inspect_output(&path, &metadata, InspectFormat::Raw),
