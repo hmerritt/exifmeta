@@ -3042,6 +3042,14 @@ fn normalized_strip_tag_aliases(name: &str) -> Vec<String> {
             .into_iter()
             .map(normalized_strip_tag_name)
             .collect(),
+        "predictor" => ["Predictor", "0x013D"]
+            .into_iter()
+            .map(normalized_strip_tag_name)
+            .collect(),
+        "icc" | "iccprofile" | "intercolorprofile" => ["ICCProfile", "0x8773"]
+            .into_iter()
+            .map(normalized_strip_tag_name)
+            .collect(),
         normalized => vec![normalized.to_string()],
     }
 }
@@ -3054,7 +3062,10 @@ fn normalized_strip_tag_name(name: &str) -> String {
 }
 
 fn strip_field_names(field: &Field) -> Vec<String> {
-    let mut names = vec![normalized_strip_tag_name(&field.tag.to_string())];
+    let mut names = vec![
+        normalized_strip_tag_name(&field.tag.to_string()),
+        normalized_strip_tag_name(&format!("0x{:04X}", field.tag.number())),
+    ];
     if field.tag == Tag::PhotographicSensitivity {
         names.extend(normalized_strip_tag_aliases("ISO"));
     }
@@ -3132,7 +3143,12 @@ fn strip_metadata_from_image(
     }
 
     if mode.is_full_strip() {
-        if let Err(error) = WritableMetadata::file_clear_metadata(image) {
+        let strip_result = if is_tiff {
+            strip_tiff_full_metadata(image)
+        } else {
+            WritableMetadata::file_clear_metadata(image).map_err(|error| error.to_string())
+        };
+        if let Err(error) = strip_result {
             result
                 .errors
                 .push(format!("failed to strip EXIF metadata: {error}"));
@@ -3184,6 +3200,32 @@ fn strip_metadata_from_image(
     result
 }
 
+fn strip_tiff_full_metadata(image: &Path) -> Result<(), String> {
+    let mut metadata = WritableMetadata::new_from_path(image)
+        .map_err(|error| format!("failed to read writable EXIF metadata: {error}"))?;
+    let preserved_tags = metadata
+        .get_ifds()
+        .iter()
+        .filter(|ifd| ifd.get_ifd_type() == ExifTagGroup::GENERIC)
+        .flat_map(|ifd| {
+            ifd.get_tags()
+                .iter()
+                .filter(|tag| TIFF_VISUAL_STRUCTURAL_TAG_IDS.contains(&tag.as_u16()))
+                .cloned()
+                .map(|tag| (ifd.get_ifd_type(), ifd.get_generic_ifd_nr(), tag))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<(ExifTagGroup, u32, WritableExifTag)>>();
+
+    metadata.reduce_to_a_minimum();
+    for (group, ifd_number, tag) in preserved_tags {
+        metadata.get_ifd_mut(group, ifd_number).set_tag(tag);
+    }
+    metadata
+        .write_to_file(image)
+        .map_err(|error| format!("failed to write stripped EXIF metadata: {error}"))
+}
+
 #[derive(Debug, Clone)]
 struct StripRemovalTarget {
     group: ExifTagGroup,
@@ -3212,7 +3254,7 @@ fn strip_removal_targets(
             {
                 errors.push(format!(
                     "cannot remove required TIFF tag `{}`: TIFF cannot be written without it",
-                    field.tag
+                    strip_tag_display(field)
                 ));
                 continue;
             }
@@ -3228,17 +3270,54 @@ fn strip_removal_targets(
             continue;
         };
 
-        let key = (format!("{group:?}"), field.tag.number());
-        if seen.insert(key) {
-            targets.push(StripRemovalTarget {
-                group,
-                tag_id: field.tag.number(),
-                name: field.tag.to_string(),
-            });
+        push_strip_removal_target(
+            &mut targets,
+            &mut seen,
+            group,
+            field.tag.number(),
+            field.tag.to_string(),
+        );
+    }
+
+    if is_tiff && mode.is_full_strip() {
+        for &(group, tag_id, name) in TIFF_FULL_STRIP_AUXILIARY_TAGS {
+            push_strip_removal_target(&mut targets, &mut seen, group, tag_id, name.to_string());
         }
     }
 
     targets
+}
+
+fn push_strip_removal_target(
+    targets: &mut Vec<StripRemovalTarget>,
+    seen: &mut HashSet<(String, u16)>,
+    group: ExifTagGroup,
+    tag_id: u16,
+    name: String,
+) {
+    let key = (format!("{group:?}"), tag_id);
+    if seen.insert(key) {
+        targets.push(StripRemovalTarget {
+            group,
+            tag_id,
+            name,
+        });
+    }
+}
+
+const TIFF_FULL_STRIP_AUXILIARY_TAGS: &[(ExifTagGroup, u16, &str)] = &[
+    (ExifTagGroup::GENERIC, 0x8769, "ExifIFDPointer"),
+    (ExifTagGroup::GENERIC, 0x8825, "GPSInfoIFDPointer"),
+    (ExifTagGroup::EXIF, 0xA005, "InteropIFDPointer"),
+];
+
+fn strip_tag_display(field: &Field) -> String {
+    let name = field.tag.to_string();
+    if name.starts_with("Tag(") {
+        format!("0x{:04X}", field.tag.number())
+    } else {
+        name
+    }
 }
 
 fn is_tiff_image(image: &Path) -> bool {
@@ -3247,21 +3326,53 @@ fn is_tiff_image(image: &Path) -> bool {
 
 fn is_required_tiff_structural_field(field: &Field) -> bool {
     field.tag.context() == Context::Tiff
-        && matches!(
-            field.tag.to_string().as_str(),
-            "ImageWidth"
-                | "ImageLength"
-                | "ImageHeight"
-                | "Compression"
-                | "PhotometricInterpretation"
-                | "StripOffsets"
-                | "RowsPerStrip"
-                | "StripByteCounts"
-                | "XResolution"
-                | "YResolution"
-                | "ResolutionUnit"
-        )
+        && (TIFF_VISUAL_STRUCTURAL_TAG_IDS.contains(&field.tag.number())
+            || matches!(
+                field.tag.to_string().as_str(),
+                "ImageWidth"
+                    | "ImageLength"
+                    | "ImageHeight"
+                    | "BitsPerSample"
+                    | "Compression"
+                    | "PhotometricInterpretation"
+                    | "StripOffsets"
+                    | "Orientation"
+                    | "SamplesPerPixel"
+                    | "RowsPerStrip"
+                    | "StripByteCounts"
+                    | "XResolution"
+                    | "YResolution"
+                    | "PlanarConfiguration"
+                    | "ResolutionUnit"
+                    | "ColorMap"
+            ))
 }
+
+const TIFF_VISUAL_STRUCTURAL_TAG_IDS: &[u16] = &[
+    0x0100, // ImageWidth
+    0x0101, // ImageLength
+    0x0102, // BitsPerSample
+    0x0103, // Compression
+    0x0106, // PhotometricInterpretation
+    0x0111, // StripOffsets
+    0x0112, // Orientation
+    0x0115, // SamplesPerPixel
+    0x0116, // RowsPerStrip
+    0x0117, // StripByteCounts
+    0x011A, // XResolution
+    0x011B, // YResolution
+    0x011C, // PlanarConfiguration
+    0x0128, // ResolutionUnit
+    0x013D, // Predictor
+    0x0140, // ColorMap
+    0x0142, // TileWidth
+    0x0143, // TileLength
+    0x0144, // TileOffsets
+    0x0145, // TileByteCounts
+    0x0152, // ExtraSamples
+    0x0153, // SampleFormat
+    0x8773, // ICC profile
+];
 
 fn writable_group_from_context(context: Context) -> Option<ExifTagGroup> {
     match context {
@@ -5079,8 +5190,10 @@ mod tests {
         let exif = parse_raw_exif(&[
             tiff_long_entry(0x0100, 640),
             tiff_long_entry(0x0101, 480),
+            tiff_short_entry(0x0102, 8),
             tiff_ascii_entry(0x010e, b"A\0"),
             tiff_ascii_entry(0x013b, b"B\0"),
+            tiff_short_entry(0x013d, 2),
         ]);
         let mode = StripMode::keep(
             TagSelectorSet::from_values(&["Make".to_string()]).expect("selector should parse"),
@@ -5089,6 +5202,10 @@ mod tests {
         let mut errors = Vec::new();
 
         let targets = strip_removal_targets(&exif, &mode, true, &mut warnings, &mut errors);
+        let tag_ids = targets
+            .iter()
+            .map(|target| target.tag_id)
+            .collect::<HashSet<_>>();
         let names = targets
             .into_iter()
             .map(|target| target.name)
@@ -5098,8 +5215,80 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert!(!names.contains("ImageWidth"));
         assert!(!names.contains("ImageLength"));
+        assert!(!names.contains("BitsPerSample"));
         assert!(names.contains("ImageDescription"));
         assert!(names.contains("Artist"));
+        assert!(!tag_ids.contains(&0x013d));
+    }
+
+    #[test]
+    fn strip_all_tiff_preserves_visual_structural_tags_and_removes_metadata_tags() {
+        let (xres_entry, xres_data) = tiff_rational_entry_with_count(0x011a, &[(300, 1)], 200);
+        let (yres_entry, yres_data) = tiff_rational_entry_with_count(0x011b, &[(300, 1)], 208);
+        let exif = parse_raw_exif_with_offsets(
+            &[
+                tiff_long_entry(0x0100, 640),
+                tiff_long_entry(0x0101, 480),
+                tiff_short_entry(0x0102, 8),
+                tiff_short_entry(0x0103, 5),
+                tiff_short_entry(0x0106, 2),
+                tiff_ascii_entry(0x010f, b"N\0"),
+                tiff_ascii_entry(0x0110, b"F3\0"),
+                tiff_long_entry(0x0111, 256),
+                tiff_short_entry(0x0112, 1),
+                tiff_short_entry(0x0115, 3),
+                tiff_long_entry(0x0116, 1),
+                tiff_long_entry(0x0117, 4),
+                xres_entry,
+                yres_entry,
+                tiff_short_entry(0x011c, 1),
+                tiff_short_entry(0x0128, 2),
+                tiff_ascii_offset_entry(0x0131, 6, 216),
+                tiff_ascii_offset_entry(0x0132, 20, 222),
+                tiff_short_entry(0x013d, 2),
+                tiff_undefined_entry(0x02bc, 4, 242),
+                tiff_undefined_entry(0x83bb, 4, 246),
+                tiff_long_entry(0x8769, 300),
+                tiff_undefined_entry(0x8773, 4, 254),
+            ],
+            &[
+                (200, xres_data),
+                (208, yres_data),
+                (216, b"soft\0\0".to_vec()),
+                (222, b"2026:05:27 12:00:00\0".to_vec()),
+                (242, b"xmp!".to_vec()),
+                (246, b"iptc".to_vec()),
+                (254, b"icc!".to_vec()),
+                (300, vec![0, 0, 0, 0, 0, 0]),
+            ],
+        );
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+
+        let targets =
+            strip_removal_targets(&exif, &StripMode::all(), true, &mut warnings, &mut errors);
+        let target_ids = targets
+            .iter()
+            .map(|target| target.tag_id)
+            .collect::<HashSet<_>>();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(errors.is_empty(), "{errors:?}");
+        for protected in [
+            0x0100, 0x0101, 0x0102, 0x0103, 0x0106, 0x0111, 0x0112, 0x0115, 0x0116, 0x0117, 0x011a,
+            0x011b, 0x011c, 0x0128, 0x013d, 0x8773,
+        ] {
+            assert!(
+                !target_ids.contains(&protected),
+                "protected TIFF tag 0x{protected:04x} should not be removed"
+            );
+        }
+        for removable in [0x010f, 0x0110, 0x0131, 0x0132, 0x02bc, 0x83bb, 0x8769] {
+            assert!(
+                target_ids.contains(&removable),
+                "metadata TIFF tag 0x{removable:04x} should be removed"
+            );
+        }
     }
 
     #[test]
@@ -5123,6 +5312,51 @@ mod tests {
             errors,
             vec!["cannot remove required TIFF tag `ImageWidth`: TIFF cannot be written without it"]
         );
+    }
+
+    #[test]
+    fn strip_remove_predictor_fails_before_write() {
+        let exif = parse_raw_exif(&[
+            tiff_short_entry(0x013d, 2),
+            tiff_ascii_entry(0x010e, b"A\0"),
+        ]);
+        let mode = StripMode::remove(
+            TagSelectorSet::from_values(&["Predictor".to_string()]).expect("selector should parse"),
+        );
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+
+        let targets = strip_removal_targets(&exif, &mode, true, &mut warnings, &mut errors);
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(targets.is_empty());
+        assert_eq!(
+            errors,
+            vec!["cannot remove required TIFF tag `0x013D`: TIFF cannot be written without it"]
+        );
+    }
+
+    #[test]
+    fn strip_all_tiff_preserves_predictor_when_writing() {
+        let directory = temporary_test_directory("strip-tiff-predictor");
+        let image = directory.join("image.tif");
+        write_synthetic_tiff_with_predictor(&image);
+
+        let result = strip_metadata_from_image(&image, false, true, &StripMode::all());
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.stripped);
+        assert!(result.verified);
+        let ids = exif_tag_ids(&image);
+        let names = exif_tag_names(&image);
+        assert!(ids.contains(&0x013d));
+        assert!(ids.contains(&0x8773));
+        assert!(!names.contains("Make"));
+        assert!(!names.contains("Model"));
+        assert!(!names.contains("Software"));
+        assert!(!names.contains("DateTime"));
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -7577,6 +7811,15 @@ frames:
             .collect()
     }
 
+    fn exif_tag_ids(image: &Path) -> HashSet<u16> {
+        read_metadata(image)
+            .expect("EXIF metadata should be readable")
+            .exif
+            .fields()
+            .map(|field| field.tag.number())
+            .collect()
+    }
+
     fn strip_ansi_codes(value: &str) -> String {
         let mut output = String::new();
         let mut chars = value.chars().peekable();
@@ -7606,6 +7849,107 @@ frames:
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir(&path).expect("test directory should be created");
         path
+    }
+
+    fn write_synthetic_tiff_with_predictor(path: &Path) {
+        let mut entries = vec![
+            test_tiff_long_entry_data(0x0100, 1),
+            test_tiff_long_entry_data(0x0101, 1),
+            test_tiff_short_values_entry_data(0x0102, &[8, 8, 8]),
+            test_tiff_short_entry_data(0x0103, 5),
+            test_tiff_short_entry_data(0x0106, 2),
+            test_tiff_ascii_entry_data(0x010f, b"Nikon\0"),
+            test_tiff_ascii_entry_data(0x0110, b"F3\0"),
+            test_tiff_long_entry_data(0x0111, 0),
+            test_tiff_short_entry_data(0x0112, 1),
+            test_tiff_short_entry_data(0x0115, 3),
+            test_tiff_long_entry_data(0x0116, 1),
+            test_tiff_long_entry_data(0x0117, 4),
+            test_tiff_rational_entry_data(0x011a, 300, 1),
+            test_tiff_rational_entry_data(0x011b, 300, 1),
+            test_tiff_short_entry_data(0x011c, 1),
+            test_tiff_short_entry_data(0x0128, 2),
+            test_tiff_ascii_entry_data(0x0131, b"test software\0"),
+            test_tiff_ascii_entry_data(0x0132, b"2026:05:27 12:00:00\0"),
+            test_tiff_short_entry_data(0x013d, 2),
+            test_tiff_undefined_entry_data(0x8773, &[1, 2, 3, 4]),
+        ];
+        entries.sort_by_key(|entry| entry.0);
+
+        let base_data_offset = 8 + 2 + entries.len() * 12 + 4;
+        let offset_data_len = entries
+            .iter()
+            .filter(|entry| entry.3.len() > 4)
+            .map(|entry| entry.3.len())
+            .sum::<usize>();
+        let pixel_offset = (base_data_offset + offset_data_len) as u32;
+        for entry in &mut entries {
+            if entry.0 == 0x0111 {
+                entry.3 = pixel_offset.to_be_bytes().to_vec();
+            }
+        }
+
+        let mut data = vec![0x4d, 0x4d, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+        data.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+
+        let mut offset_chunks = Vec::new();
+        let mut current_offset = base_data_offset as u32;
+        for (tag, type_id, count, value) in entries {
+            data.extend_from_slice(&tag.to_be_bytes());
+            data.extend_from_slice(&type_id.to_be_bytes());
+            data.extend_from_slice(&count.to_be_bytes());
+            if value.len() <= 4 {
+                data.extend_from_slice(&value);
+                data.resize(data.len() + (4 - value.len()), 0);
+            } else {
+                data.extend_from_slice(&current_offset.to_be_bytes());
+                current_offset += value.len() as u32;
+                offset_chunks.push(value);
+            }
+        }
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        for chunk in offset_chunks {
+            data.extend_from_slice(&chunk);
+        }
+        assert_eq!(data.len(), pixel_offset as usize);
+        data.extend_from_slice(&[0x80, 0x00, 0x00, 0x00]);
+
+        std::fs::write(path, data).expect("synthetic TIFF should be written");
+    }
+
+    fn test_tiff_ascii_entry_data(tag: u16, value: &[u8]) -> (u16, u16, u32, Vec<u8>) {
+        (tag, 2, value.len() as u32, value.to_vec())
+    }
+
+    fn test_tiff_short_entry_data(tag: u16, value: u16) -> (u16, u16, u32, Vec<u8>) {
+        (tag, 3, 1, value.to_be_bytes().to_vec())
+    }
+
+    fn test_tiff_short_values_entry_data(tag: u16, values: &[u16]) -> (u16, u16, u32, Vec<u8>) {
+        let mut bytes = Vec::new();
+        for value in values {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        (tag, 3, values.len() as u32, bytes)
+    }
+
+    fn test_tiff_long_entry_data(tag: u16, value: u32) -> (u16, u16, u32, Vec<u8>) {
+        (tag, 4, 1, value.to_be_bytes().to_vec())
+    }
+
+    fn test_tiff_rational_entry_data(
+        tag: u16,
+        numerator: u32,
+        denominator: u32,
+    ) -> (u16, u16, u32, Vec<u8>) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&numerator.to_be_bytes());
+        bytes.extend_from_slice(&denominator.to_be_bytes());
+        (tag, 5, 1, bytes)
+    }
+
+    fn test_tiff_undefined_entry_data(tag: u16, value: &[u8]) -> (u16, u16, u32, Vec<u8>) {
+        (tag, 7, value.len() as u32, value.to_vec())
     }
 
     fn test_geonames_connection() -> Connection {
