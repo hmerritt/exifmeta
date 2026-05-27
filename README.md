@@ -26,10 +26,15 @@ A simple program to read a standardised `metadata.yaml` file and write the data 
 | Command          | Function                                                                                                                                   |
 | :--------------- | :----------------------------------------------------------------------------------------------------------------------------------------- |
 | `--dry-run`      | Runs the program in 'simulation' mode, without making any changes to any files                                                             |
-| `--strip`        | Will remove all existing EXIF data before adding new data                                                                                  |
+| `--strip`        | With `run`, remove all existing EXIF data from each file before adding new data                                                            |
 | `--no-overwrite` | Prevents overwriting exif data if there is already data there                                                                              |
 | `--extensions`   | Restricts processing to specified file typologies to prevent the script from attempting to modify unsupported binaries (e.g., -e jpg,tiff) |
 | `--recursive`    | Find image files across all subdirectories, applying the root configuration to nested image repositories                                   |
+| `--verify`       | Re-read images after `strip` and fail if EXIF metadata remains                                                                             |
+| `--keep`         | With `run` or `strip`, remove all EXIF tags except the comma-separated tag names                                                           |
+| `--remove`       | With `run` or `strip`, remove the comma-separated tag names; can combine with `--keep` or `--privacy` and takes precedence                 |
+| `--privacy`      | With `run` or `strip`, remove known privacy-sensitive EXIF tags while keeping harmless technical and unknown tags                          |
+| `--json`         | Emit machine-readable JSON output for `strip`                                                                                              |
 
 ### Supported Image File Formats
 
@@ -74,8 +79,8 @@ exif:
 
     # Film / Capture
     ISOSpeedRatings: 250 # ISOSpeedRatings | exif:ISO | exifEX:ISOSpeed
-    DateTimeOriginal: '2026-04-28'
-    CreateDate: '2026-04-28'
+    DateTimeOriginal: "2026-04-28"
+    CreateDate: "2026-04-28"
     # 1 = Film Scanner
     # 2 = Reflection Print Scanner
     # 3 = Digital Camera
@@ -116,7 +121,7 @@ frames:
         - $Location: Betws-y-Coed
 
     # Filename (direct but more verbose)
-    'image-file.tif':
+    "image-file.tif":
         - ExposureTime: 1/250
         - FNumber: 5.6
         # 0 = Unknown
@@ -129,13 +134,13 @@ frames:
         # 255 = Other
         - MeteringMode: 2
         # Manually setting  GPS, all of the following values must be set!
-        - GPSLatitude: '51.5074'
-        - GPSLatitudeRef: 'N'
-        - GPSLongitude: '3.1791'
-        - GPSLongitudeRef: 'W'
-        - GPSAltitude: '142'
+        - GPSLatitude: "51.5074"
+        - GPSLatitudeRef: "N"
+        - GPSLongitude: "3.1791"
+        - GPSLongitudeRef: "W"
+        - GPSAltitude: "142"
         - GPSAltitudeRef: 0 # 0 = above sea level
-        - GPSMapDatum: 'WGS-84'
+        - GPSMapDatum: "WGS-84"
 ```
 
 ---

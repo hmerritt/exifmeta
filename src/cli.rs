@@ -55,8 +55,36 @@ pub struct RunArgs {
     #[arg(value_name = "TARGETS")]
     pub targets: Option<String>,
 
-    #[arg(long, help = "Remove existing EXIF data before adding new data")]
+    #[arg(
+        long,
+        conflicts_with_all = ["keep", "remove", "privacy"],
+        help = "Remove existing EXIF data before adding new data"
+    )]
     pub strip: bool,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "TAGS",
+        conflicts_with = "privacy",
+        help = "Strip all EXIF tags except the comma-separated tag names before adding new data"
+    )]
+    pub keep: Vec<String>,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "TAGS",
+        help = "Remove only the comma-separated EXIF tag names before adding new data"
+    )]
+    pub remove: Vec<String>,
+
+    #[arg(
+        long,
+        conflicts_with = "keep",
+        help = "Remove privacy-sensitive EXIF tags before adding new data"
+    )]
+    pub privacy: bool,
 
     #[arg(long, help = "Prevent overwriting existing EXIF data")]
     pub no_overwrite: bool,
@@ -239,9 +267,67 @@ mod tests {
         };
 
         assert!(args.strip);
+        assert!(args.keep.is_empty());
+        assert!(args.remove.is_empty());
+        assert!(!args.privacy);
         assert!(args.no_overwrite);
         assert!(args.recursive);
         assert_eq!(args.extensions, ["jpg", "tiff"]);
+    }
+
+    #[test]
+    fn parses_run_keep() {
+        let cli = Cli::try_parse_from(["exifmeta", "run", "--keep", "Make,Model"])
+            .expect("run keep should parse");
+
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert!(!args.strip);
+        assert_eq!(args.keep, ["Make", "Model"]);
+        assert!(args.remove.is_empty());
+        assert!(!args.privacy);
+    }
+
+    #[test]
+    fn parses_run_repeated_remove_values() {
+        let cli = Cli::try_parse_from([
+            "exifmeta",
+            "run",
+            "--remove",
+            "GPSLatitude,GPSLongitude",
+            "--remove",
+            "UserComment",
+        ])
+        .expect("run repeated remove values should parse");
+
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.remove, ["GPSLatitude", "GPSLongitude", "UserComment"]);
+    }
+
+    #[test]
+    fn parses_run_remove_with_privacy() {
+        let cli = Cli::try_parse_from(["exifmeta", "run", "--privacy", "--remove", "FNumber"])
+            .expect("run remove should compose with privacy");
+
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert!(args.privacy);
+        assert_eq!(args.remove, ["FNumber"]);
+    }
+
+    #[test]
+    fn rejects_conflicting_run_strip_modes() {
+        assert!(Cli::try_parse_from(["exifmeta", "run", "--privacy", "--keep", "Make"]).is_err());
+        assert!(Cli::try_parse_from(["exifmeta", "run", "--strip", "--keep", "Make"]).is_err());
+        assert!(Cli::try_parse_from(["exifmeta", "run", "--strip", "--remove", "Make"]).is_err());
+        assert!(Cli::try_parse_from(["exifmeta", "run", "--strip", "--privacy"]).is_err());
     }
 
     #[test]

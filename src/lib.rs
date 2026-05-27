@@ -2604,6 +2604,7 @@ const STANDARD_EXIF_TAG_NAMES: &[&str] = &[
 fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
     let started = Instant::now();
     let request = RunRequest::from_args(&args);
+    let strip_mode = StripMode::from_run_args(&args)?;
     let resolution = resolve_metadata_path(request.metadata.as_deref())?;
 
     let metadata_dir = path_parent_or_current(&resolution.path);
@@ -2670,7 +2671,13 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
 
         let file_started = Instant::now();
         let progress = TerminalSpinner::start(spinner, "writing metadata".to_string());
-        let result = apply_tags_to_image(&file_output.image, &frame.tags, dry_run, &args);
+        let result = apply_tags_to_image(
+            &file_output.image,
+            &frame.tags,
+            dry_run,
+            &args,
+            strip_mode.as_ref(),
+        );
         progress.finish();
         let elapsed_ms = file_started.elapsed().as_millis();
         summary.add(&result);
@@ -2841,7 +2848,6 @@ struct StripMode {
 }
 
 impl StripMode {
-    #[cfg(test)]
     fn all() -> Self {
         Self {
             base: StripBaseMode::All,
@@ -2890,24 +2896,46 @@ impl StripMode {
     }
 
     fn from_args(args: &StripArgs) -> Result<Self, String> {
-        if !args.keep.is_empty() && args.privacy {
+        Self::from_parts(false, &args.keep, &args.remove, args.privacy)
+            .map(|mode| mode.unwrap_or_else(Self::all))
+    }
+
+    fn from_run_args(args: &RunArgs) -> Result<Option<Self>, String> {
+        Self::from_parts(args.strip, &args.keep, &args.remove, args.privacy)
+    }
+
+    fn from_parts(
+        strip: bool,
+        keep: &[String],
+        remove: &[String],
+        privacy: bool,
+    ) -> Result<Option<Self>, String> {
+        if strip && (!keep.is_empty() || !remove.is_empty() || privacy) {
+            return Err(
+                "--strip cannot be combined with --keep, --remove, or --privacy".to_string(),
+            );
+        }
+        if !keep.is_empty() && privacy {
             return Err("--keep and --privacy cannot be combined".to_string());
         }
+        if strip {
+            return Ok(Some(Self::all()));
+        }
 
-        let remove = (!args.remove.is_empty())
-            .then(|| TagSelectorSet::from_values(&args.remove))
+        let remove = (!remove.is_empty())
+            .then(|| TagSelectorSet::from_values(remove))
             .transpose()?;
-        let base = if !args.keep.is_empty() {
-            StripBaseMode::Keep(TagSelectorSet::from_values(&args.keep)?)
-        } else if args.privacy {
+        let base = if !keep.is_empty() {
+            StripBaseMode::Keep(TagSelectorSet::from_values(keep)?)
+        } else if privacy {
             StripBaseMode::Privacy
         } else if remove.is_some() {
             StripBaseMode::None
         } else {
-            StripBaseMode::All
+            return Ok(None);
         };
 
-        Ok(Self { base, remove })
+        Ok(Some(Self { base, remove }))
     }
 
     fn name(&self) -> &'static str {
@@ -3808,6 +3836,9 @@ fn collect_run_tags_from_mapping(mapping: &Mapping) -> Result<Vec<RunTag>, Strin
 #[derive(Debug, Clone, Default)]
 struct RunFileResult {
     written: usize,
+    strip_attempted: bool,
+    stripped: bool,
+    removed_tags: usize,
     skipped: Vec<String>,
     warnings: Vec<String>,
     errors: Vec<String>,
@@ -3816,6 +3847,8 @@ struct RunFileResult {
 #[derive(Debug, Clone, Default)]
 struct RunSummary {
     written_tags: usize,
+    stripped_files: usize,
+    removed_tags: usize,
     skipped_tags: usize,
     skipped_files: usize,
     warnings: usize,
@@ -3826,6 +3859,8 @@ struct RunSummary {
 impl RunSummary {
     fn add(&mut self, result: &RunFileResult) {
         self.written_tags += result.written;
+        self.stripped_files += usize::from(result.stripped);
+        self.removed_tags += result.removed_tags;
         self.skipped_tags += result.skipped.len();
         self.warnings += result.warnings.len() + result.skipped.len();
         self.errors += result.errors.len();
@@ -3976,6 +4011,7 @@ fn apply_tags_to_image(
     tags: &[RunTag],
     dry_run: bool,
     args: &RunArgs,
+    strip_mode: Option<&StripMode>,
 ) -> RunFileResult {
     let mut result = RunFileResult::default();
     let mut writable_tags = Vec::new();
@@ -4009,20 +4045,14 @@ fn apply_tags_to_image(
         }
     }
 
-    if dry_run {
-        result.written = writable_tags
-            .iter()
-            .filter(|tag| !matches!(tag, WritableExifTag::UserComment(_)))
-            .count()
-            + custom_tags.len();
-        return result;
-    }
-
-    if args.strip {
-        if let Err(error) = WritableMetadata::file_clear_metadata(image) {
-            result
-                .errors
-                .push(format!("failed to strip EXIF metadata: {error}"));
+    if let Some(strip_mode) = strip_mode {
+        let strip_result = strip_metadata_from_image(image, dry_run, false, strip_mode);
+        result.strip_attempted = true;
+        result.stripped = strip_result.stripped;
+        result.removed_tags = strip_result.removed_tags;
+        result.warnings.extend(strip_result.warnings);
+        result.errors.extend(strip_result.errors);
+        if !result.errors.is_empty() {
             return result;
         }
     }
@@ -4056,6 +4086,11 @@ fn apply_tags_to_image(
         } else {
             1
         };
+    }
+
+    if dry_run {
+        result.written = pending_written;
+        return result;
     }
 
     if pending_written > 0 {
@@ -4178,6 +4213,14 @@ fn append_run_file_header(rendered: &mut String, file: &RunFileOutput) {
 }
 
 fn append_run_file_result(rendered: &mut String, file: &RunFileOutput) {
+    if file.result.strip_attempted {
+        let action = if file.dry_run {
+            "would strip EXIF"
+        } else {
+            "stripped EXIF"
+        };
+        rendered.push_str(&format!("{action}: {} tags\n", file.result.removed_tags));
+    }
     let action = if file.dry_run { "would write" } else { "wrote" };
     rendered.push_str(&format!("{action} {} tags\n", file.result.written));
     rendered.push_str(&format!("took {}\n", format_run_duration(file.elapsed_ms)));
@@ -4226,6 +4269,8 @@ fn append_run_overview_group(rendered: &mut String, first_group: &mut bool, summ
     append_run_overview_row(rendered, "errors", summary.errors);
     append_run_overview_row(rendered, "warnings", summary.warnings);
     append_run_overview_row(rendered, "written", summary.written_tags);
+    append_run_overview_row(rendered, "stripped", summary.stripped_files);
+    append_run_overview_row(rendered, "removed tags", summary.removed_tags);
     append_run_overview_row(rendered, "skipped", summary.skipped_tags);
     append_run_overview_row(rendered, "files skipped", summary.skipped_files);
     append_run_overview_row(rendered, "took", format_run_duration(summary.elapsed_ms));
@@ -4702,6 +4747,9 @@ mod tests {
             metadata_or_targets: Some(PathBuf::from("*.jpg")),
             targets: None,
             strip: false,
+            keep: Vec::new(),
+            remove: Vec::new(),
+            privacy: false,
             no_overwrite: false,
             extensions: Vec::new(),
             recursive: false,
@@ -5103,6 +5151,323 @@ mod tests {
     }
 
     #[test]
+    fn run_strip_clears_existing_tags_before_writing() {
+        let directory = temporary_test_directory("run-strip-all");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(&image, [("Make", "Nikon"), ("Model", "F3")]);
+        let args = RunArgs {
+            strip: true,
+            ..default_run_args()
+        };
+        let tags = vec![RunTag {
+            name: "Artist".to_string(),
+            value: YamlValue::String("Harry Merritt".to_string()),
+        }];
+
+        let result = apply_tags_to_image(
+            &image,
+            &tags,
+            false,
+            &args,
+            StripMode::from_run_args(&args)
+                .expect("run strip mode should parse")
+                .as_ref(),
+        );
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.stripped);
+        assert_eq!(result.written, 1);
+        let names = exif_tag_names(&image);
+        assert!(!names.contains("Make"));
+        assert!(!names.contains("Model"));
+        assert!(names.contains("Artist"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn run_keep_preserves_named_tags_before_writing() {
+        let directory = temporary_test_directory("run-keep");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(
+            &image,
+            [
+                ("Make", "Nikon"),
+                ("Model", "F3"),
+                ("Artist", "Harry Merritt"),
+            ],
+        );
+        let args = RunArgs {
+            keep: vec!["Make".to_string()],
+            ..default_run_args()
+        };
+        let tags = vec![RunTag {
+            name: "FNumber".to_string(),
+            value: YamlValue::String("5.6".to_string()),
+        }];
+
+        let result = apply_tags_to_image(
+            &image,
+            &tags,
+            false,
+            &args,
+            StripMode::from_run_args(&args)
+                .expect("run strip mode should parse")
+                .as_ref(),
+        );
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.stripped);
+        assert_eq!(result.removed_tags, 2);
+        assert_eq!(result.written, 1);
+        let names = exif_tag_names(&image);
+        assert!(names.contains("Make"));
+        assert!(!names.contains("Model"));
+        assert!(!names.contains("Artist"));
+        assert!(names.contains("FNumber"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn run_remove_removes_named_tags_before_writing() {
+        let directory = temporary_test_directory("run-remove");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(
+            &image,
+            [
+                ("Make", "Nikon"),
+                ("Model", "F3"),
+                ("Artist", "Harry Merritt"),
+            ],
+        );
+        let args = RunArgs {
+            remove: vec!["Model".to_string()],
+            ..default_run_args()
+        };
+        let tags = vec![RunTag {
+            name: "FNumber".to_string(),
+            value: YamlValue::String("5.6".to_string()),
+        }];
+
+        let result = apply_tags_to_image(
+            &image,
+            &tags,
+            false,
+            &args,
+            StripMode::from_run_args(&args)
+                .expect("run strip mode should parse")
+                .as_ref(),
+        );
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.stripped);
+        assert_eq!(result.removed_tags, 1);
+        let names = exif_tag_names(&image);
+        assert!(names.contains("Make"));
+        assert!(!names.contains("Model"));
+        assert!(names.contains("Artist"));
+        assert!(names.contains("FNumber"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn run_privacy_removes_sensitive_tags_before_writing() {
+        let directory = temporary_test_directory("run-privacy");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(
+            &image,
+            [
+                ("Make", "Nikon"),
+                ("Artist", "Harry Merritt"),
+                ("DateTimeOriginal", "2026-05-22"),
+                ("FNumber", "5.6"),
+            ],
+        );
+        let args = RunArgs {
+            privacy: true,
+            ..default_run_args()
+        };
+        let tags = vec![RunTag {
+            name: "Model".to_string(),
+            value: YamlValue::String("F3".to_string()),
+        }];
+
+        let result = apply_tags_to_image(
+            &image,
+            &tags,
+            false,
+            &args,
+            StripMode::from_run_args(&args)
+                .expect("run strip mode should parse")
+                .as_ref(),
+        );
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.stripped);
+        assert_eq!(result.removed_tags, 2);
+        let names = exif_tag_names(&image);
+        assert!(names.contains("Make"));
+        assert!(names.contains("FNumber"));
+        assert!(names.contains("Model"));
+        assert!(!names.contains("Artist"));
+        assert!(!names.contains("DateTimeOriginal"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn run_privacy_preserves_unknown_tags_unless_explicitly_removed() {
+        let args = RunArgs {
+            privacy: true,
+            ..default_run_args()
+        };
+        let mode = StripMode::from_run_args(&args)
+            .expect("run privacy mode should parse")
+            .expect("run privacy should create a strip mode");
+        let exif = parse_raw_exif(&[
+            tiff_ascii_entry(0x013b, b"A\0"),
+            tiff_short_entry(0xfde8, 42),
+        ]);
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+
+        let targets = strip_removal_targets(&exif, &mode, true, &mut warnings, &mut errors);
+        let tag_ids = targets
+            .iter()
+            .map(|target| target.tag_id)
+            .collect::<HashSet<_>>();
+        let names = targets
+            .into_iter()
+            .map(|target| target.name)
+            .collect::<HashSet<_>>();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(names.contains("Artist"));
+        assert!(!tag_ids.contains(&0xfde8));
+    }
+
+    #[test]
+    fn run_privacy_with_remove_removes_extra_tag_before_writing() {
+        let directory = temporary_test_directory("run-privacy-remove");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(
+            &image,
+            [
+                ("Make", "Nikon"),
+                ("Artist", "Harry Merritt"),
+                ("DateTimeOriginal", "2026-05-22"),
+                ("FNumber", "5.6"),
+            ],
+        );
+        let args = RunArgs {
+            privacy: true,
+            remove: vec!["FNumber".to_string()],
+            ..default_run_args()
+        };
+        let tags = vec![RunTag {
+            name: "Model".to_string(),
+            value: YamlValue::String("F3".to_string()),
+        }];
+
+        let result = apply_tags_to_image(
+            &image,
+            &tags,
+            false,
+            &args,
+            StripMode::from_run_args(&args)
+                .expect("run strip mode should parse")
+                .as_ref(),
+        );
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.stripped);
+        assert_eq!(result.removed_tags, 3);
+        let names = exif_tag_names(&image);
+        assert!(names.contains("Make"));
+        assert!(names.contains("Model"));
+        assert!(!names.contains("FNumber"));
+        assert!(!names.contains("Artist"));
+        assert!(!names.contains("DateTimeOriginal"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn run_remove_allows_no_overwrite_to_write_removed_tag() {
+        let directory = temporary_test_directory("run-remove-no-overwrite");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(&image, [("Model", "F3")]);
+        let args = RunArgs {
+            remove: vec!["Model".to_string()],
+            no_overwrite: true,
+            ..default_run_args()
+        };
+        let tags = vec![RunTag {
+            name: "Model".to_string(),
+            value: YamlValue::String("FM2".to_string()),
+        }];
+
+        let result = apply_tags_to_image(
+            &image,
+            &tags,
+            false,
+            &args,
+            StripMode::from_run_args(&args)
+                .expect("run strip mode should parse")
+                .as_ref(),
+        );
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.skipped.is_empty(), "{:?}", result.skipped);
+        assert!(result.stripped);
+        assert_eq!(result.removed_tags, 1);
+        assert_eq!(result.written, 1);
+        assert!(exif_tag_names(&image).contains("Model"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn run_strip_dry_run_reports_without_modifying_file() {
+        let directory = temporary_test_directory("run-strip-dry-run");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(&image, [("Make", "Nikon")]);
+        let before = std::fs::read(&image).expect("image should be readable");
+        let args = RunArgs {
+            remove: vec!["Make".to_string()],
+            ..default_run_args()
+        };
+        let tags = vec![RunTag {
+            name: "Model".to_string(),
+            value: YamlValue::String("F3".to_string()),
+        }];
+
+        let result = apply_tags_to_image(
+            &image,
+            &tags,
+            true,
+            &args,
+            StripMode::from_run_args(&args)
+                .expect("run strip mode should parse")
+                .as_ref(),
+        );
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.stripped);
+        assert_eq!(result.removed_tags, 1);
+        assert_eq!(result.written, 1);
+        assert_eq!(
+            std::fs::read(&image).expect("image should remain readable"),
+            before
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn run_plan_merges_global_and_frame_tags() {
         let directory = temporary_test_directory("run-plan-merge");
         let metadata = directory.join(METADATA_FILE_NAME);
@@ -5307,6 +5672,8 @@ frames:
         assert!(plain.contains("errors         0"));
         assert!(plain.contains("warnings       1"));
         assert!(plain.contains("written        3"));
+        assert!(plain.contains("stripped       0"));
+        assert!(plain.contains("removed tags   0"));
         assert!(plain.contains("skipped        0"));
         assert!(plain.contains("files skipped  1"));
         assert!(plain.contains("took           42ms"));
@@ -5345,6 +5712,48 @@ frames:
         assert!(
             plain.contains("file: nested\\image.jpg") || plain.contains("file: nested/image.jpg")
         );
+    }
+
+    #[test]
+    fn run_file_output_renders_strip_status_before_write_status() {
+        let file = RunFileOutput {
+            label: "image.jpg".to_string(),
+            image: PathBuf::from("image.jpg"),
+            result: RunFileResult {
+                written: 2,
+                strip_attempted: true,
+                stripped: true,
+                removed_tags: 3,
+                ..RunFileResult::default()
+            },
+            elapsed_ms: 12,
+            dry_run: false,
+        };
+
+        let rendered = strip_ansi_codes(&format_run_file_output(&file));
+
+        assert!(rendered.contains("image.jpg\nstripped EXIF: 3 tags\nwrote 2 tags\ntook 12ms"));
+    }
+
+    #[test]
+    fn run_file_output_renders_dry_run_strip_status() {
+        let file = RunFileOutput {
+            label: "image.jpg".to_string(),
+            image: PathBuf::from("image.jpg"),
+            result: RunFileResult {
+                written: 1,
+                strip_attempted: true,
+                stripped: true,
+                removed_tags: 1,
+                ..RunFileResult::default()
+            },
+            elapsed_ms: 12,
+            dry_run: true,
+        };
+
+        let rendered = strip_ansi_codes(&format_run_file_output(&file));
+
+        assert!(rendered.contains("image.jpg\nwould strip EXIF: 1 tags\nwould write 1 tags"));
     }
 
     #[test]
@@ -5567,6 +5976,9 @@ frames:
             metadata_or_targets: None,
             targets: None,
             strip: false,
+            keep: Vec::new(),
+            remove: Vec::new(),
+            privacy: false,
             no_overwrite: false,
             extensions: Vec::new(),
             recursive: false,
@@ -5582,7 +5994,7 @@ frames:
             },
         ];
 
-        let result = apply_tags_to_image(Path::new("image.jpg"), &tags, true, &args);
+        let result = apply_tags_to_image(Path::new("image.jpg"), &tags, true, &args, None);
 
         assert_eq!(result.written, 2);
         assert!(result.warnings.is_empty());
@@ -7131,12 +7543,29 @@ frames:
             metadata_or_targets: None,
             targets: None,
             strip: false,
+            keep: Vec::new(),
+            remove: Vec::new(),
+            privacy: false,
             no_overwrite: false,
             extensions: Vec::new(),
             recursive: false,
         };
-        let result = apply_tags_to_image(image, &tags, false, &args);
+        let result = apply_tags_to_image(image, &tags, false, &args, None);
         assert!(result.errors.is_empty(), "{:?}", result.errors);
+    }
+
+    fn default_run_args() -> RunArgs {
+        RunArgs {
+            metadata_or_targets: None,
+            targets: None,
+            strip: false,
+            keep: Vec::new(),
+            remove: Vec::new(),
+            privacy: false,
+            no_overwrite: false,
+            extensions: Vec::new(),
+            recursive: false,
+        }
     }
 
     fn exif_tag_names(image: &Path) -> HashSet<String> {
