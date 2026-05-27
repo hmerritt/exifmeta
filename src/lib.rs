@@ -2827,54 +2827,137 @@ struct StripFileOutput {
 }
 
 #[derive(Debug, Clone)]
-enum StripMode {
+enum StripBaseMode {
     All,
+    None,
     Keep(TagSelectorSet),
-    Remove(TagSelectorSet),
     Privacy,
 }
 
+#[derive(Debug, Clone)]
+struct StripMode {
+    base: StripBaseMode,
+    remove: Option<TagSelectorSet>,
+}
+
 impl StripMode {
+    #[cfg(test)]
+    fn all() -> Self {
+        Self {
+            base: StripBaseMode::All,
+            remove: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn keep(selectors: TagSelectorSet) -> Self {
+        Self {
+            base: StripBaseMode::Keep(selectors),
+            remove: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn remove(selectors: TagSelectorSet) -> Self {
+        Self {
+            base: StripBaseMode::None,
+            remove: Some(selectors),
+        }
+    }
+
+    #[cfg(test)]
+    fn privacy() -> Self {
+        Self {
+            base: StripBaseMode::Privacy,
+            remove: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn keep_with_remove(keep: TagSelectorSet, remove: TagSelectorSet) -> Self {
+        Self {
+            base: StripBaseMode::Keep(keep),
+            remove: Some(remove),
+        }
+    }
+
+    #[cfg(test)]
+    fn privacy_with_remove(remove: TagSelectorSet) -> Self {
+        Self {
+            base: StripBaseMode::Privacy,
+            remove: Some(remove),
+        }
+    }
+
     fn from_args(args: &StripArgs) -> Result<Self, String> {
-        let modes = usize::from(!args.keep.is_empty())
-            + usize::from(!args.remove.is_empty())
-            + usize::from(args.privacy);
-        if modes > 1 {
-            return Err("--keep, --remove, and --privacy cannot be combined".to_string());
+        if !args.keep.is_empty() && args.privacy {
+            return Err("--keep and --privacy cannot be combined".to_string());
         }
 
-        if !args.keep.is_empty() {
-            return Ok(Self::Keep(TagSelectorSet::from_values(&args.keep)?));
-        }
+        let remove = (!args.remove.is_empty())
+            .then(|| TagSelectorSet::from_values(&args.remove))
+            .transpose()?;
+        let base = if !args.keep.is_empty() {
+            StripBaseMode::Keep(TagSelectorSet::from_values(&args.keep)?)
+        } else if args.privacy {
+            StripBaseMode::Privacy
+        } else if remove.is_some() {
+            StripBaseMode::None
+        } else {
+            StripBaseMode::All
+        };
 
-        if !args.remove.is_empty() {
-            return Ok(Self::Remove(TagSelectorSet::from_values(&args.remove)?));
-        }
-
-        if args.privacy {
-            return Ok(Self::Privacy);
-        }
-
-        Ok(Self::All)
+        Ok(Self { base, remove })
     }
 
     fn name(&self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Keep(_) => "keep",
-            Self::Remove(_) => "remove",
-            Self::Privacy => "privacy",
+        match &self.base {
+            StripBaseMode::All => "all",
+            StripBaseMode::None => "remove",
+            StripBaseMode::Keep(_) => "keep",
+            StripBaseMode::Privacy => "privacy",
         }
     }
 
-    fn should_remove(&self, field: &Field) -> bool {
-        match self {
-            Self::All => true,
-            Self::Keep(selectors) => !selectors.matches_field(field),
-            Self::Remove(selectors) => selectors.matches_field(field),
-            Self::Privacy => is_privacy_strip_field(field),
+    fn is_full_strip(&self) -> bool {
+        matches!(self.base, StripBaseMode::All) && self.remove.is_none()
+    }
+
+    fn removal_decision(&self, field: &Field) -> StripRemovalDecision {
+        if self
+            .remove
+            .as_ref()
+            .is_some_and(|selectors| selectors.matches_field(field))
+        {
+            return StripRemovalDecision::Explicit;
+        }
+
+        if match &self.base {
+            StripBaseMode::All => true,
+            StripBaseMode::None => false,
+            StripBaseMode::Keep(selectors) => !selectors.matches_field(field),
+            StripBaseMode::Privacy => is_privacy_strip_field(field),
+        } {
+            StripRemovalDecision::Base
+        } else {
+            StripRemovalDecision::Keep
         }
     }
+
+    fn should_remove(&self, field: &Field, is_tiff: bool) -> bool {
+        match self.removal_decision(field) {
+            StripRemovalDecision::Explicit => true,
+            StripRemovalDecision::Base => !(is_tiff && is_required_tiff_structural_field(field)),
+            StripRemovalDecision::Keep => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StripRemovalDecision {
+    Keep,
+    Base,
+    Explicit,
 }
 
 #[derive(Debug, Clone)]
@@ -2985,9 +3068,10 @@ fn strip_metadata_from_image(
     mode: &StripMode,
 ) -> StripFileResult {
     let mut result = StripFileResult::default();
+    let is_tiff = is_tiff_image(image);
     let before = match read_metadata(image) {
         Ok(metadata) => Some(metadata),
-        Err(error) if !matches!(mode, StripMode::All) || verify => {
+        Err(error) if !mode.is_full_strip() || verify => {
             result
                 .errors
                 .push(format!("failed to read EXIF metadata: {error}"));
@@ -2998,56 +3082,65 @@ fn strip_metadata_from_image(
 
     let planned_removals = before
         .as_ref()
-        .map(|metadata| strip_removal_targets(&metadata.exif, mode, &mut result.warnings))
+        .map(|metadata| {
+            strip_removal_targets(
+                &metadata.exif,
+                mode,
+                is_tiff,
+                &mut result.warnings,
+                &mut result.errors,
+            )
+        })
         .unwrap_or_default();
     result.removed_tags = planned_removals.len();
 
-    if dry_run {
-        result.stripped = matches!(mode, StripMode::All) || result.removed_tags > 0;
+    if !result.errors.is_empty() {
         return result;
     }
 
-    match mode {
-        StripMode::All => {
-            if let Err(error) = WritableMetadata::file_clear_metadata(image) {
+    if dry_run {
+        result.stripped = mode.is_full_strip() || result.removed_tags > 0;
+        return result;
+    }
+
+    if mode.is_full_strip() {
+        if let Err(error) = WritableMetadata::file_clear_metadata(image) {
+            result
+                .errors
+                .push(format!("failed to strip EXIF metadata: {error}"));
+            return result;
+        }
+        result.stripped = true;
+    } else {
+        if planned_removals.is_empty() {
+            result.stripped = false;
+        } else {
+            let mut metadata = match WritableMetadata::new_from_path(image) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    result
+                        .errors
+                        .push(format!("failed to read writable EXIF metadata: {error}"));
+                    return result;
+                }
+            };
+
+            for target in &planned_removals {
+                if metadata.remove_tag_by_hex_group(target.tag_id, target.group) == 0 {
+                    result.warnings.push(format!(
+                        "could not find writable EXIF tag `{}` to remove",
+                        target.name
+                    ));
+                }
+            }
+
+            if let Err(error) = metadata.write_to_file(image) {
                 result
                     .errors
-                    .push(format!("failed to strip EXIF metadata: {error}"));
+                    .push(format!("failed to write stripped EXIF metadata: {error}"));
                 return result;
             }
             result.stripped = true;
-        }
-        StripMode::Keep(_) | StripMode::Remove(_) | StripMode::Privacy => {
-            if planned_removals.is_empty() {
-                result.stripped = false;
-            } else {
-                let mut metadata = match WritableMetadata::new_from_path(image) {
-                    Ok(metadata) => metadata,
-                    Err(error) => {
-                        result
-                            .errors
-                            .push(format!("failed to read writable EXIF metadata: {error}"));
-                        return result;
-                    }
-                };
-
-                for target in &planned_removals {
-                    if metadata.remove_tag_by_hex_group(target.tag_id, target.group) == 0 {
-                        result.warnings.push(format!(
-                            "could not find writable EXIF tag `{}` to remove",
-                            target.name
-                        ));
-                    }
-                }
-
-                if let Err(error) = metadata.write_to_file(image) {
-                    result
-                        .errors
-                        .push(format!("failed to write stripped EXIF metadata: {error}"));
-                    return result;
-                }
-                result.stripped = true;
-            }
         }
     }
 
@@ -3073,14 +3166,29 @@ struct StripRemovalTarget {
 fn strip_removal_targets(
     exif: &Exif,
     mode: &StripMode,
+    is_tiff: bool,
     warnings: &mut Vec<String>,
+    errors: &mut Vec<String>,
 ) -> Vec<StripRemovalTarget> {
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
 
     for field in exif.fields() {
-        if !mode.should_remove(field) {
-            continue;
+        match mode.removal_decision(field) {
+            StripRemovalDecision::Keep => continue,
+            StripRemovalDecision::Base if is_tiff && is_required_tiff_structural_field(field) => {
+                continue;
+            }
+            StripRemovalDecision::Explicit
+                if is_tiff && is_required_tiff_structural_field(field) =>
+            {
+                errors.push(format!(
+                    "cannot remove required TIFF tag `{}`: TIFF cannot be written without it",
+                    field.tag
+                ));
+                continue;
+            }
+            StripRemovalDecision::Base | StripRemovalDecision::Explicit => {}
         }
 
         let Some(group) = writable_group_from_context(field.tag.context()) else {
@@ -3105,6 +3213,28 @@ fn strip_removal_targets(
     targets
 }
 
+fn is_tiff_image(image: &Path) -> bool {
+    detect_file_kind(image).file_type == "TIFF"
+}
+
+fn is_required_tiff_structural_field(field: &Field) -> bool {
+    field.tag.context() == Context::Tiff
+        && matches!(
+            field.tag.to_string().as_str(),
+            "ImageWidth"
+                | "ImageLength"
+                | "ImageHeight"
+                | "Compression"
+                | "PhotometricInterpretation"
+                | "StripOffsets"
+                | "RowsPerStrip"
+                | "StripByteCounts"
+                | "XResolution"
+                | "YResolution"
+                | "ResolutionUnit"
+        )
+}
+
 fn writable_group_from_context(context: Context) -> Option<ExifTagGroup> {
     match context {
         Context::Tiff => Some(ExifTagGroup::GENERIC),
@@ -3117,27 +3247,17 @@ fn writable_group_from_context(context: Context) -> Option<ExifTagGroup> {
 
 fn verify_strip_result(image: &Path, mode: &StripMode) -> Result<(), String> {
     let metadata = read_metadata(image)?;
-    match mode {
-        StripMode::All => {
-            if metadata.exif.fields().next().is_none() {
-                Ok(())
-            } else {
-                Err("EXIF metadata remains".to_string())
-            }
-        }
-        StripMode::Keep(_) | StripMode::Remove(_) | StripMode::Privacy => {
-            let remaining = metadata
-                .exif
-                .fields()
-                .filter(|field| mode.should_remove(field))
-                .map(|field| field.tag.to_string())
-                .collect::<Vec<_>>();
-            if remaining.is_empty() {
-                Ok(())
-            } else {
-                Err(format!("EXIF tags remain: {}", remaining.join(", ")))
-            }
-        }
+    let is_tiff = is_tiff_image(image);
+    let remaining = metadata
+        .exif
+        .fields()
+        .filter(|field| mode.should_remove(field, is_tiff))
+        .map(|field| field.tag.to_string())
+        .collect::<Vec<_>>();
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("EXIF tags remain: {}", remaining.join(", ")))
     }
 }
 
@@ -4616,7 +4736,7 @@ mod tests {
         let contents = [0xff, 0xd8, 0xff, 0xd9];
         std::fs::write(&image, contents).expect("jpg should be written");
 
-        let result = strip_metadata_from_image(&image, true, true, &StripMode::All);
+        let result = strip_metadata_from_image(&image, true, true, &StripMode::all());
 
         assert!(result.stripped);
         assert!(!result.verified);
@@ -4636,7 +4756,7 @@ mod tests {
         let image = directory.join("image.webp");
         std::fs::write(&image, b"RIFF\x04\0\0\0WEBP").expect("webp should be written");
 
-        let result = strip_metadata_from_image(&image, false, false, &StripMode::All);
+        let result = strip_metadata_from_image(&image, false, false, &StripMode::all());
 
         assert!(!result.stripped);
         assert_eq!(result.errors.len(), 1);
@@ -4732,7 +4852,7 @@ mod tests {
             ],
         );
 
-        let mode = StripMode::Keep(
+        let mode = StripMode::keep(
             TagSelectorSet::from_values(&["Make".to_string()]).expect("selector should parse"),
         );
         let result = strip_metadata_from_image(&image, false, true, &mode);
@@ -4743,6 +4863,38 @@ mod tests {
         assert_eq!(result.removed_tags, 2);
         let names = exif_tag_names(&image);
         assert!(names.contains("Make"));
+        assert!(!names.contains("Model"));
+        assert!(!names.contains("Artist"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn strip_keep_with_remove_prefers_explicit_remove() {
+        let directory = temporary_test_directory("strip-keep-with-remove");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(
+            &image,
+            [
+                ("Make", "Nikon"),
+                ("Model", "F3"),
+                ("Artist", "Harry Merritt"),
+            ],
+        );
+
+        let mode = StripMode::keep_with_remove(
+            TagSelectorSet::from_values(&["Make".to_string()]).expect("keep selector should parse"),
+            TagSelectorSet::from_values(&["Make".to_string()])
+                .expect("remove selector should parse"),
+        );
+        let result = strip_metadata_from_image(&image, false, true, &mode);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.stripped);
+        assert!(result.verified);
+        assert_eq!(result.removed_tags, 3);
+        let names = exif_tag_names(&image);
+        assert!(!names.contains("Make"));
         assert!(!names.contains("Model"));
         assert!(!names.contains("Artist"));
 
@@ -4762,7 +4914,7 @@ mod tests {
             ],
         );
 
-        let mode = StripMode::Remove(
+        let mode = StripMode::remove(
             TagSelectorSet::from_values(&["Model".to_string()]).expect("selector should parse"),
         );
         let result = strip_metadata_from_image(&image, false, true, &mode);
@@ -4793,7 +4945,7 @@ mod tests {
             ],
         );
 
-        let result = strip_metadata_from_image(&image, false, true, &StripMode::Privacy);
+        let result = strip_metadata_from_image(&image, false, true, &StripMode::privacy());
 
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert!(result.stripped);
@@ -4809,6 +4961,90 @@ mod tests {
     }
 
     #[test]
+    fn strip_privacy_with_remove_removes_extra_tag() {
+        let directory = temporary_test_directory("strip-privacy-with-remove");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(
+            &image,
+            [
+                ("Make", "Nikon"),
+                ("Artist", "Harry Merritt"),
+                ("DateTimeOriginal", "2026-05-22"),
+                ("FNumber", "5.6"),
+            ],
+        );
+
+        let mode = StripMode::privacy_with_remove(
+            TagSelectorSet::from_values(&["FNumber".to_string()])
+                .expect("remove selector should parse"),
+        );
+        let result = strip_metadata_from_image(&image, false, true, &mode);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.stripped);
+        assert!(result.verified);
+        assert_eq!(result.removed_tags, 3);
+        let names = exif_tag_names(&image);
+        assert!(names.contains("Make"));
+        assert!(!names.contains("FNumber"));
+        assert!(!names.contains("Artist"));
+        assert!(!names.contains("DateTimeOriginal"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn strip_selective_tiff_preserves_required_structural_tags() {
+        let exif = parse_raw_exif(&[
+            tiff_long_entry(0x0100, 640),
+            tiff_long_entry(0x0101, 480),
+            tiff_ascii_entry(0x010e, b"A\0"),
+            tiff_ascii_entry(0x013b, b"B\0"),
+        ]);
+        let mode = StripMode::keep(
+            TagSelectorSet::from_values(&["Make".to_string()]).expect("selector should parse"),
+        );
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+
+        let targets = strip_removal_targets(&exif, &mode, true, &mut warnings, &mut errors);
+        let names = targets
+            .into_iter()
+            .map(|target| target.name)
+            .collect::<HashSet<_>>();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!names.contains("ImageWidth"));
+        assert!(!names.contains("ImageLength"));
+        assert!(names.contains("ImageDescription"));
+        assert!(names.contains("Artist"));
+    }
+
+    #[test]
+    fn strip_remove_required_tiff_structural_tag_fails_before_write() {
+        let exif = parse_raw_exif(&[
+            tiff_long_entry(0x0100, 640),
+            tiff_ascii_entry(0x010e, b"A\0"),
+        ]);
+        let mode = StripMode::remove(
+            TagSelectorSet::from_values(&["ImageWidth".to_string()])
+                .expect("selector should parse"),
+        );
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+
+        let targets = strip_removal_targets(&exif, &mode, true, &mut warnings, &mut errors);
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(targets.is_empty());
+        assert_eq!(
+            errors,
+            vec!["cannot remove required TIFF tag `ImageWidth`: TIFF cannot be written without it"]
+        );
+    }
+
+    #[test]
     fn strip_does_not_touch_xmp_sidecars() {
         let directory = temporary_test_directory("strip-sidecars-untouched");
         let image = directory.join("image.jpg");
@@ -4818,7 +5054,7 @@ mod tests {
         std::fs::write(&sidecar_stem, "stem sidecar").expect("stem sidecar should be written");
         std::fs::write(&sidecar_full, "full sidecar").expect("full sidecar should be written");
 
-        let result = strip_metadata_from_image(&image, false, false, &StripMode::All);
+        let result = strip_metadata_from_image(&image, false, false, &StripMode::all());
 
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert_eq!(

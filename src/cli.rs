@@ -83,7 +83,7 @@ pub struct StripArgs {
         long,
         value_delimiter = ',',
         value_name = "TAGS",
-        conflicts_with_all = ["remove", "privacy"],
+        conflicts_with = "privacy",
         help = "Strip all EXIF tags except the comma-separated tag names"
     )]
     pub keep: Vec<String>,
@@ -92,7 +92,6 @@ pub struct StripArgs {
         long,
         value_delimiter = ',',
         value_name = "TAGS",
-        conflicts_with_all = ["keep", "privacy"],
         help = "Remove only the comma-separated EXIF tag names"
     )]
     pub remove: Vec<String>,
@@ -114,7 +113,7 @@ pub struct StripArgs {
 
     #[arg(
         long,
-        conflicts_with_all = ["keep", "remove"],
+        conflicts_with = "keep",
         help = "Remove privacy-sensitive EXIF tags while keeping harmless technical tags"
     )]
     pub privacy: bool,
@@ -316,16 +315,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_strip_remove_with_keep() {
+        let cli = Cli::try_parse_from(["exifmeta", "strip", "--keep", "Make", "--remove", "Model"])
+            .expect("strip remove should compose with keep");
+
+        let Command::Strip(args) = cli.command else {
+            panic!("expected strip command");
+        };
+
+        assert_eq!(args.keep, ["Make"]);
+        assert_eq!(args.remove, ["Model"]);
+    }
+
+    #[test]
+    fn parses_strip_remove_with_privacy() {
+        let cli = Cli::try_parse_from(["exifmeta", "strip", "--privacy", "--remove", "FNumber"])
+            .expect("strip remove should compose with privacy");
+
+        let Command::Strip(args) = cli.command else {
+            panic!("expected strip command");
+        };
+
+        assert!(args.privacy);
+        assert_eq!(args.remove, ["FNumber"]);
+    }
+
+    #[test]
     fn rejects_conflicting_strip_modes() {
-        assert!(
-            Cli::try_parse_from(["exifmeta", "strip", "--keep", "Make", "--remove", "Model"])
-                .is_err()
-        );
         assert!(Cli::try_parse_from(["exifmeta", "strip", "--privacy", "--keep", "Make"]).is_err());
-        assert!(
-            Cli::try_parse_from(["exifmeta", "strip", "--privacy", "--remove", "GPSLatitude"])
-                .is_err()
-        );
     }
 
     #[test]
