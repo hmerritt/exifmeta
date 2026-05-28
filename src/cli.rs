@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
 #[command(name = "exifmeta")]
-#[command(about = "Read metadata.yaml and write EXIF metadata to image files")]
+#[command(about = "Read metadata.yml and write EXIF metadata to image files")]
 #[command(version, propagate_version = true)]
 pub struct Cli {
     #[arg(long, global = true, help = "Simulate actions without changing files")]
@@ -16,16 +16,16 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
 pub enum Command {
-    #[command(about = "Create a template metadata.yaml file")]
+    #[command(about = "Create a template metadata.yml file")]
     New(NewArgs),
 
-    #[command(about = "Check metadata.yaml is valid")]
+    #[command(about = "Check metadata.yml is valid")]
     Check(CheckArgs),
 
     #[command(about = "Read and pretty-print the current EXIF data of an image file")]
     Read(ReadArgs),
 
-    #[command(about = "Read metadata.yaml and write EXIF data to target image files")]
+    #[command(about = "Read metadata.yml and write EXIF data to target image files")]
     Write(WriteArgs),
 
     #[command(about = "Remove all existing EXIF metadata from target image files")]
@@ -513,14 +513,14 @@ mod tests {
 
     #[test]
     fn parses_check_path() {
-        let cli = Cli::try_parse_from(["exifmeta", "check", "some/metadata.yaml"])
+        let cli = Cli::try_parse_from(["exifmeta", "check", "some/metadata.yml"])
             .expect("check path should parse");
 
         let Command::Check(args) = cli.command else {
             panic!("expected check command");
         };
 
-        assert_eq!(args.path, Some(PathBuf::from("some/metadata.yaml")));
+        assert_eq!(args.path, Some(PathBuf::from("some/metadata.yml")));
     }
 
     #[test]

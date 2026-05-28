@@ -46,8 +46,8 @@ const GEONAMES_DATABASE: &[u8] = include_bytes!("../assets/geonames/cities1000.s
 const NEAREST_LOCATION_LIMIT: usize = 5;
 const NEAREST_CITY_MINIMUM_POPULATION: i64 = 200_000;
 const EARTH_RADIUS_KM: f64 = 6_371.0088;
-const METADATA_FILE_NAME: &str = "metadata.yaml";
-const METADATA_YML_FILE_NAME: &str = "metadata.yml";
+const METADATA_FILE_NAME: &str = "metadata.yml";
+const LEGACY_METADATA_FILE_NAME: &str = "metadata.yaml";
 const CUSTOM_TAG_PAYLOAD_MARKER: &str = concat!("exifmeta-v", env!("CARGO_PKG_VERSION"), "\n");
 const LEGACY_CUSTOM_TAG_PAYLOAD_PREFIX: &[u8] = b"exifmeta-custom-tags-v1\n";
 const USER_COMMENT_ASCII_PREFIX: &[u8] = b"ASCII\0\0\0";
@@ -2508,7 +2508,7 @@ fn build_check_output(path: Option<&Path>) -> CheckOutput {
         }
     };
 
-    match check_metadata_yaml(&resolution.path, &yaml) {
+    match check_metadata_file(&resolution.path, &yaml) {
         Ok(report) => {
             output.exif = Some(TagStageReport {
                 tags: report.exif_tags,
@@ -2792,34 +2792,34 @@ fn is_location_lookup_warning(warning: &str) -> bool {
 }
 
 fn resolve_metadata_path_in_directory(directory: &Path) -> Result<MetadataPathResolution, String> {
-    let yaml_path = directory.join(METADATA_FILE_NAME);
-    let yml_path = directory.join(METADATA_YML_FILE_NAME);
-    let yaml_exists = yaml_path.is_file();
+    let yml_path = directory.join(METADATA_FILE_NAME);
+    let yaml_path = directory.join(LEGACY_METADATA_FILE_NAME);
     let yml_exists = yml_path.is_file();
+    let yaml_exists = yaml_path.is_file();
 
-    if yaml_exists {
+    if yml_exists {
         let mut warnings = Vec::new();
-        if yml_exists {
+        if yaml_exists {
             warnings.push(format!(
                 "{} also exists and was ignored",
-                yml_path.display()
+                yaml_path.display()
             ));
         }
         return Ok(MetadataPathResolution {
-            path: yaml_path,
+            path: yml_path,
             warnings,
         });
     }
 
-    if yml_exists {
+    if yaml_exists {
         return Ok(MetadataPathResolution {
-            path: yml_path,
+            path: yaml_path,
             warnings: Vec::new(),
         });
     }
 
     Err(format!(
-        "no metadata.yaml or metadata.yml found in {}",
+        "no metadata.yml or metadata.yaml found in {}",
         directory.display()
     ))
 }
@@ -2841,7 +2841,7 @@ struct TagCounts {
     unknown_names: Vec<String>,
 }
 
-fn check_metadata_yaml(metadata_path: &Path, yaml: &YamlValue) -> Result<CheckReport, String> {
+fn check_metadata_file(metadata_path: &Path, yaml: &YamlValue) -> Result<CheckReport, String> {
     let root = yaml
         .as_mapping()
         .ok_or_else(|| "metadata YAML root must be a mapping".to_string())?;
@@ -3377,7 +3377,7 @@ fn write_command(dry_run: bool, args: WriteArgs) -> Result<(), String> {
         .map_err(|error| format!("failed to read {}: {error}", resolution.path.display()))?;
     let yaml = serde_yaml::from_str::<YamlValue>(&contents)
         .map_err(|error| format!("failed to parse {}: {error}", resolution.path.display()))?;
-    check_metadata_yaml(&resolution.path, &yaml)?;
+    check_metadata_file(&resolution.path, &yaml)?;
 
     let plan = build_write_plan(&resolution.path, &yaml, &targets)?;
     let mut summary = WriteSummary::default();
@@ -6077,7 +6077,7 @@ mod tests {
         );
 
         assert!(
-            matches!(result, Err(CliError::Warning(message)) if message.contains("metadata.yaml already exists"))
+            matches!(result, Err(CliError::Warning(message)) if message.contains("metadata.yml already exists"))
         );
         assert_eq!(
             std::fs::read_to_string(&metadata).expect("metadata file should be readable"),
@@ -6142,33 +6142,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_metadata_path_prefers_yaml_over_yml() {
-        let directory = temporary_test_directory("check-prefers-yaml");
-        let yaml = directory.join(METADATA_FILE_NAME);
-        let yml = directory.join(METADATA_YML_FILE_NAME);
+    fn resolve_metadata_path_prefers_yml_over_legacy_yaml() {
+        let directory = temporary_test_directory("check-prefers-yml");
+        let yml = directory.join(METADATA_FILE_NAME);
+        let yaml = directory.join(LEGACY_METADATA_FILE_NAME);
         std::fs::write(&yaml, "exif: {}").expect("yaml metadata should be written");
         std::fs::write(&yml, "exif: {}").expect("yml metadata should be written");
 
         let resolution =
             resolve_metadata_path(Some(&directory)).expect("metadata path should resolve");
 
-        assert_eq!(resolution.path, yaml);
+        assert_eq!(resolution.path, yml);
         assert_eq!(resolution.warnings.len(), 1);
-        assert!(resolution.warnings[0].contains("metadata.yml"));
+        assert!(resolution.warnings[0].contains("metadata.yaml"));
 
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn resolve_metadata_path_falls_back_to_yml() {
-        let directory = temporary_test_directory("check-fallback-yml");
-        let yml = directory.join(METADATA_YML_FILE_NAME);
-        std::fs::write(&yml, "exif: {}").expect("yml metadata should be written");
+    fn resolve_metadata_path_falls_back_to_legacy_yaml() {
+        let directory = temporary_test_directory("check-fallback-yaml");
+        let yaml = directory.join(LEGACY_METADATA_FILE_NAME);
+        std::fs::write(&yaml, "exif: {}").expect("yaml metadata should be written");
 
         let resolution =
             resolve_metadata_path(Some(&directory)).expect("metadata path should resolve");
 
-        assert_eq!(resolution.path, yml);
+        assert_eq!(resolution.path, yaml);
         assert!(resolution.warnings.is_empty());
 
         let _ = std::fs::remove_dir_all(directory);
@@ -6180,7 +6180,7 @@ mod tests {
 
         let result = resolve_metadata_path(Some(&directory));
 
-        assert!(matches!(result, Err(message) if message.contains("no metadata.yaml")));
+        assert!(matches!(result, Err(message) if message.contains("no metadata.yml")));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -7181,7 +7181,7 @@ frames:
         colored::control::set_override(true);
         let image = PathBuf::from("image.jpg");
         let output = WriteOutput {
-            metadata_path: PathBuf::from("metadata.yaml"),
+            metadata_path: PathBuf::from("metadata.yml"),
             dry_run: true,
             target_count: 3,
             file_warnings: Vec::new(),
@@ -7253,7 +7253,7 @@ frames:
     fn write_output_prints_path_for_non_current_directory_files() {
         colored::control::set_override(true);
         let output = WriteOutput {
-            metadata_path: PathBuf::from("metadata.yaml"),
+            metadata_path: PathBuf::from("metadata.yml"),
             dry_run: true,
             target_count: 1,
             file_warnings: Vec::new(),
@@ -7642,7 +7642,7 @@ frames:
         let yaml = serde_yaml::from_str::<YamlValue>("- not\n- a mapping")
             .expect("test YAML should parse");
 
-        let result = check_metadata_yaml(Path::new("metadata.yaml"), &yaml);
+        let result = check_metadata_file(Path::new("metadata.yml"), &yaml);
 
         assert!(matches!(result, Err(message) if message.contains("root must be a mapping")));
     }
@@ -7660,7 +7660,7 @@ exif:
         )
         .expect("test YAML should parse");
 
-        let report = check_metadata_yaml(Path::new("metadata.yaml"), &yaml)
+        let report = check_metadata_file(Path::new("metadata.yml"), &yaml)
             .expect("metadata should pass checks");
 
         assert_eq!(report.exif_tags.standard, 3);
@@ -7690,7 +7690,7 @@ frames:
         .expect("test YAML should parse");
         std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
 
-        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
+        let report = check_metadata_file(&metadata, &yaml).expect("metadata should pass checks");
 
         assert_eq!(report.frame_tags.standard, 2);
         assert_eq!(report.frame_tags.unknown, 1);
@@ -7724,7 +7724,7 @@ frames:
 "#,
         )
         .expect("test YAML should parse");
-        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
+        let report = check_metadata_file(&metadata, &yaml).expect("metadata should pass checks");
 
         assert_eq!(report.frame_tags, TagCounts::default());
         assert_eq!(report.frames.frames.len(), 1);
@@ -7737,7 +7737,7 @@ frames:
 "#,
         )
         .expect("test YAML should parse");
-        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
+        let report = check_metadata_file(&metadata, &yaml).expect("metadata should pass checks");
 
         assert_eq!(report.frames.file_count, 1);
         assert!(report.frames.frames.is_empty());
@@ -7759,7 +7759,7 @@ frames:
         .expect("test YAML should parse");
         std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
 
-        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
+        let report = check_metadata_file(&metadata, &yaml).expect("metadata should pass checks");
 
         assert!(report.location_matches.is_empty());
         assert!(
@@ -7818,7 +7818,7 @@ frames:
         std::fs::write(directory.join("one.jpg"), []).expect("test image should be written");
         std::fs::write(directory.join("two.jpg"), []).expect("test image should be written");
 
-        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
+        let report = check_metadata_file(&metadata, &yaml).expect("metadata should pass checks");
 
         assert!(report.location_matches.is_empty());
         assert!(
@@ -7845,7 +7845,7 @@ frames:
         .expect("test YAML should parse");
         std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
 
-        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
+        let report = check_metadata_file(&metadata, &yaml).expect("metadata should pass checks");
 
         assert!(report.location_matches.is_empty());
         assert!(
@@ -7874,7 +7874,7 @@ frames:
         .expect("test YAML should parse");
         std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
 
-        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
+        let report = check_metadata_file(&metadata, &yaml).expect("metadata should pass checks");
 
         assert!(
             !report
@@ -7959,7 +7959,7 @@ frames:
     #[test]
     fn check_overview_renders_success_with_warnings() {
         let output = CheckOutput {
-            file_warnings: vec!["metadata.yml ignored because metadata.yaml exists".to_string()],
+            file_warnings: vec!["metadata.yaml ignored because metadata.yml exists".to_string()],
             ..CheckOutput::default()
         };
         let rendered = strip_ansi_codes(&format_check_output(&output));
@@ -7972,8 +7972,8 @@ frames:
     #[test]
     fn check_overview_renders_error_when_errors_exist() {
         let output = CheckOutput {
-            file_errors: vec!["failed to parse metadata.yaml".to_string()],
-            file_warnings: vec!["metadata.yml ignored because metadata.yaml exists".to_string()],
+            file_errors: vec!["failed to parse metadata.yml".to_string()],
+            file_warnings: vec!["metadata.yaml ignored because metadata.yml exists".to_string()],
             ..CheckOutput::default()
         };
         let rendered = strip_ansi_codes(&format_check_output(&output));
@@ -8016,7 +8016,7 @@ frames:
         colored::control::set_override(true);
 
         let output = CheckOutput {
-            file_warnings: vec!["metadata.yml ignored because metadata.yaml exists".to_string()],
+            file_warnings: vec!["metadata.yaml ignored because metadata.yml exists".to_string()],
             ..CheckOutput::default()
         };
         let rendered = format_check_output(&output);
@@ -8030,8 +8030,8 @@ frames:
         colored::control::set_override(true);
 
         let output = CheckOutput {
-            file_errors: vec!["failed to parse metadata.yaml".to_string()],
-            file_warnings: vec!["metadata.yml ignored because metadata.yaml exists".to_string()],
+            file_errors: vec!["failed to parse metadata.yml".to_string()],
+            file_warnings: vec!["metadata.yaml ignored because metadata.yml exists".to_string()],
             ..CheckOutput::default()
         };
         let rendered = format_check_output(&output);

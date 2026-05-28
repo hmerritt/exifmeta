@@ -6,7 +6,7 @@
 
 EXIF tool for photographers.
 
-A simple program to read a standardised `metadata.yaml` file and write the data as EXIF to all image files in the same directory.
+A simple program to read a standardised `metadata.yml` file and write the data as EXIF to all image files in the same directory.
 
 ## Features ⚡
 
@@ -18,10 +18,10 @@ A simple program to read a standardised `metadata.yaml` file and write the data 
 
 | Command       | Function                                                                             |
 | :------------ | :----------------------------------------------------------------------------------- |
-| `new`         | Create template `metadata.yaml` file                                                 |
-| `check`       | Checks `metadata.yaml` is valid                                                      |
+| `new`         | Create template `metadata.yml` file                                                  |
+| `check`       | Checks `metadata.yml` is valid                                                       |
 | `read`        | Read and pretty-print the current EXIF data of a specific image file                 |
-| `write`       | Main function; reads `metadata.yaml` file and writes EXIF data to target image files |
+| `write`       | Main function; reads `metadata.yml` file and writes EXIF data to target image files  |
 | `strip`       | Removes all existing EXIF metadata from target image files                           |
 | `interactive` | Interactively browse folders and read image EXIF data                                |
 
@@ -49,7 +49,7 @@ A simple program to read a standardised `metadata.yaml` file and write the data 
 - TIFF
 - WebP (only lossless and extended)
 
-## `metadata.yaml` file
+## `metadata.yml` file
 
 - [EXIF Tags reference](https://exiftool.org/TagNames/EXIF.html)
 - [Locations reference](https://www.geonames.org)

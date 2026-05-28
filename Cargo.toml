@@ -2,7 +2,7 @@
 name = "exifmeta"
 version = "1.2.0"
 edition = "2024"
-description = "EXIF tool for photographers. Reads a metadata.yaml and writes EXIF to one or many image files"
+description = "EXIF tool for photographers. Reads a metadata.yml and writes EXIF to one or many image files"
 license = "MIT"
 
 [dependencies]

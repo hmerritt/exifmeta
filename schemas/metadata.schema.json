@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/hmerritt/exif-medadata/master/schemas/metadata.schema.json",
   "title": "exifmeta metadata",
-  "description": "Schema for exifmeta metadata.yaml and metadata.yml files.",
+  "description": "Schema for exifmeta metadata.yml files.",
   "type": "object",
   "properties": {
     "exif": {
