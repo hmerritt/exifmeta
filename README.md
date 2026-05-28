@@ -53,6 +53,7 @@ A simple program to read a standardised `metadata.yaml` file and write the data 
 See example files in [`./examples`](./examples/metadata.yml) directory. `examples/metadata.yml`:
 
 ```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/hmerritt/exif-medadata/master/schemas/metadata.schema.json
 # ───────────────────────────────────────────────
 # Custom Properties
 # These values will not be written as EXIF, and are meant for personal organisational purposes — e.g. private metadata for your shoot

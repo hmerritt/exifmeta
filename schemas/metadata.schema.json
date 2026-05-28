@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/hmerritt/exif-medadata/master/schemas/metadata.schema.json",
+  "title": "exifmeta metadata",
+  "description": "Schema for exifmeta metadata.yaml and metadata.yml files.",
+  "type": "object",
+  "properties": {
+    "exif": {
+      "$ref": "#/$defs/tagMapping",
+      "description": "Global EXIF and custom tags applied to every target image."
+    },
+    "frames": {
+      "description": "Per-frame or per-file EXIF and custom tags.",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/frameValue"
+          }
+        }
+      ]
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "frameValue": {
+      "description": "Frame metadata may be omitted, written as a mapping, or written as a sequence of single-tag mappings.",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/tagMapping"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tagEntry"
+          }
+        }
+      ]
+    },
+    "tagEntry": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/tagValue"
+      }
+    },
+    "tagMapping": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/tagValue"
+      }
+    },
+    "tagValue": {
+      "description": "EXIF and custom tag values accepted by exifmeta.",
+      "type": [
+        "null",
+        "string",
+        "number",
+        "integer",
+        "boolean",
+        "array",
+        "object"
+      ]
+    }
+  }
+}

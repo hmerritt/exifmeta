@@ -43,7 +43,9 @@ const PRETTY_UNKNOWN_VALUE_DISPLAY_LIMIT: usize = 120;
 const PRETTY_KNOWN_VALUE_DISPLAY_LIMIT: usize = 2000;
 const PRETTY_UNKNOWN_VALUE_OMITTED_LABEL: &str = "<long value omitted>";
 const PRETTY_UNKNOWN_VALUE_OMITTED_HINT: &str = " (use `--format raw` to view)";
-const METADATA_TEMPLATE: &str = r#"# ───────────────────────────────────────────────
+const METADATA_TEMPLATE: &str = r#"# yaml-language-server: $schema=https://raw.githubusercontent.com/hmerritt/exif-medadata/master/schemas/metadata.schema.json
+
+# ───────────────────────────────────────────────
 # Metadata file for images in this directory. Used by exifmeta, https://github.com/hmerritt/exifmeta
 # ───────────────────────────────────────────────
 
