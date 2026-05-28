@@ -725,20 +725,78 @@ fn interactive_preview(entry: &InteractiveEntry) -> InteractivePreviewContent {
         InteractiveEntryKind::Parent | InteractiveEntryKind::Directory => {
             render_directory_preview(&entry.path)
         }
-        InteractiveEntryKind::File => {
-            InteractivePreviewContent::plain(inspect_preview(&entry.path))
-        }
+        InteractiveEntryKind::File => inspect_preview(&entry.path),
     }
 }
 
-fn inspect_preview(image: &Path) -> String {
+fn inspect_preview(image: &Path) -> InteractivePreviewContent {
     match read_metadata(image) {
-        Ok(metadata) => strip_windows_verbatim_prefixes(&strip_ansi_codes(&format_inspect_output(
-            image,
-            &metadata,
-            InspectFormat::Pretty,
-        ))),
-        Err(error) => format!("Failed to inspect {}\n\n{error}", display_path(image)),
+        Ok(metadata) => {
+            let output = strip_windows_verbatim_prefixes(&format_inspect_output(
+                image,
+                &metadata,
+                InspectFormat::Pretty,
+            ));
+            InteractivePreviewContent::Lines(ansi_to_preview_lines(&output))
+        }
+        Err(error) => InteractivePreviewContent::plain(format!(
+            "Failed to inspect {}\n\n{error}",
+            display_path(image)
+        )),
+    }
+}
+
+fn ansi_to_preview_lines(value: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut spans = Vec::new();
+    let mut text = String::new();
+    let mut style = Style::default();
+    let mut chars = value.chars().peekable();
+
+    while let Some(char) = chars.next() {
+        if char == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            let mut codes = String::new();
+            for code_char in chars.by_ref() {
+                if code_char == 'm' {
+                    break;
+                }
+                codes.push(code_char);
+            }
+            push_preview_span(&mut spans, &mut text, style);
+            apply_ansi_style_codes(&codes, &mut style);
+        } else if char == '\n' {
+            push_preview_span(&mut spans, &mut text, style);
+            lines.push(Line::from(std::mem::take(&mut spans)));
+        } else {
+            text.push(char);
+        }
+    }
+
+    push_preview_span(&mut spans, &mut text, style);
+    lines.push(Line::from(spans));
+    lines
+}
+
+fn push_preview_span(spans: &mut Vec<Span<'static>>, text: &mut String, style: Style) {
+    if !text.is_empty() {
+        spans.push(Span::styled(std::mem::take(text), style));
+    }
+}
+
+fn apply_ansi_style_codes(codes: &str, style: &mut Style) {
+    let codes = if codes.is_empty() { "0" } else { codes };
+    for code in codes.split(';').filter_map(|code| code.parse::<u16>().ok()) {
+        match code {
+            0 => *style = Style::default(),
+            1 => *style = style.add_modifier(Modifier::BOLD),
+            22 => *style = style.remove_modifier(Modifier::BOLD),
+            33 => *style = style.fg(Color::Yellow),
+            39 => *style = Style { fg: None, ..*style },
+            94 => *style = style.fg(Color::LightBlue),
+            96 => *style = style.fg(Color::LightCyan),
+            _ => {}
+        }
     }
 }
 
@@ -879,26 +937,6 @@ fn rendered_line_count(value: &str, width: u16) -> usize {
         .map(|line| line.chars().count().max(1).div_ceil(width))
         .sum::<usize>()
         .max(1)
-}
-
-fn strip_ansi_codes(value: &str) -> String {
-    let mut output = String::new();
-    let mut chars = value.chars().peekable();
-
-    while let Some(char) = chars.next() {
-        if char == '\u{1b}' && chars.peek() == Some(&'[') {
-            chars.next();
-            for char in chars.by_ref() {
-                if char == 'm' {
-                    break;
-                }
-            }
-        } else {
-            output.push(char);
-        }
-    }
-
-    output
 }
 
 fn read_metadata(image: &Path) -> Result<InspectMetadata, String> {
@@ -5502,9 +5540,42 @@ mod tests {
         let missing = temporary_test_path("interactive-missing.jpg");
 
         let preview = inspect_preview(&missing);
+        let preview = preview
+            .as_plain()
+            .expect("missing image preview should be plain text");
 
         assert!(preview.contains("Failed to inspect"));
         assert!(preview.contains("failed to open"));
+    }
+
+    #[test]
+    fn interactive_inspect_preview_preserves_inspect_colours() {
+        let directory = temporary_test_directory("interactive-inspect-colours");
+        let image = directory.join("image.jpg");
+        std::fs::write(&image, [0xff, 0xd8, 0xff, 0xd9]).expect("jpg should be written");
+
+        let preview = inspect_preview(&image);
+        let lines = preview
+            .as_lines()
+            .expect("inspect preview should render styled lines");
+
+        assert_eq!(line_text(&lines[0]), "<No EXIF metadata found>");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn ansi_preview_lines_preserve_inspect_styles() {
+        let lines = ansi_to_preview_lines(
+            "\u{1b}[94mblue\u{1b}[0m plain\n\u{1b}[96mcyan\u{1b}[0m \u{1b}[33myellow\u{1b}[0m",
+        );
+
+        assert_eq!(line_text(&lines[0]), "blue plain");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::LightBlue));
+        assert_eq!(lines[0].spans[1].style, Style::default());
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::LightCyan));
+        assert_eq!(lines[1].spans[1].style, Style::default());
+        assert_eq!(lines[1].spans[2].style.fg, Some(Color::Yellow));
     }
 
     #[test]
