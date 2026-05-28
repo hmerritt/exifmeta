@@ -4,26 +4,32 @@
 
 [![Release](https://img.shields.io/github/v/release/hmerritt/exifmeta?link=https%3A%2F%2Fgithub.com%2Fhmerritt%2Fexifmeta%2Freleases%2Flatest)](https://github.com/hmerritt/exifmeta/releases/latest) [![Downloads](https://img.shields.io/github/downloads/hmerritt/exifmeta/total?link=https%3A%2F%2Fgithub.com%2Fhmerritt%2Fexifmeta%2Freleases%2Flatest)](https://github.com/hmerritt/exifmeta/releases/latest) [![Coverage](https://img.shields.io/coverallsCoverage/github/hmerritt/exifmeta)](https://coveralls.io/github/hmerritt/exifmeta?branch=master)
 
-EXIF tool for photographers.
+EXIF read/write/remove tool — useful for film photographers.
 
-A simple program to read a standardised `metadata.yml` file and write the data as EXIF to all image files in the same directory.
+- [Download 💾](https://github.com/hmerritt/exifmeta/releases/latest)
+- [Features](#features-)
+- [CLI Commands](#cli-commands)
+- [Usage](#usage)
 
 ## Features ⚡
 
-- EXIF viewer
-- Custom EXIF properties are supported
-- Automatically bulk add EXIF to images in the current directory
+- Read EXIF
+- Write EXIF
+- Remove/Strip EXIF
+- Read/Write **custom** EXIF tags
+- Easily write to all images in the current directory (using a `metadata.yml` template file)
+- Includes an embeded database of locations that can search GPS data to find the nearest town/city; this happens **instantly**, completely offline, without any internet connection required!
 
 ## CLI Commands
 
-| Command       | Function                                                               |
-| :------------ | :--------------------------------------------------------------------- |
-| `new`         | Create `metadata.yml` file                                             |
-| `check`       | Checks `metadata.yml` file is valid                                    |
-| `read`        | Read an image file's EXIF tags                                         |
-| `write`       | Writes EXIF tags defined in `metadata.yml` to target image files       |
-| `strip`       | Tool to remove all (or a select few) EXIF tags from target image files |
-| `interactive` | Interactively browse folders and read image EXIF tags                  |
+| Command                       | Function                                                               |
+| :---------------------------- | :--------------------------------------------------------------------- |
+| [`new`](#new)                 | Create `metadata.yml` file                                             |
+| [`check`](#check)             | Checks `metadata.yml` file is valid                                    |
+| [`read`](#read)               | Read an image file's EXIF tags                                         |
+| [`write`](#write)             | Writes EXIF tags defined in `metadata.yml` to target image files       |
+| [`strip`](#strip)             | Tool to remove all (or a select few) EXIF tags from target image files |
+| [`interactive`](#interactive) | Interactively browse folders and read image EXIF tags                  |
 
 ### Flags
 
@@ -38,7 +44,6 @@ A simple program to read a standardised `metadata.yml` file and write the data a
 | `--keep`         | With `write` or `strip`, remove all EXIF tags except the comma-separated tag names                                                         |
 | `--remove`       | With `write` or `strip`, remove the comma-separated tag names; can combine with `--keep` or `--privacy` and takes precedence               |
 | `--privacy`      | With `write` or `strip`, remove known privacy-sensitive EXIF tags while keeping harmless technical and unknown tags                        |
-| `--json`         | Emit machine-readable JSON output for `strip`                                                                                              |
 
 ### Supported Image File Formats
 
@@ -49,12 +54,127 @@ A simple program to read a standardised `metadata.yml` file and write the data a
 - TIFF
 - WebP (only lossless and extended)
 
-## `metadata.yml` file
+## Usage
+
+### `new`
+
+Create a `metadata.yml` file in the current directory. This creates a template file you can edit and add your own EXIF tags and organisational data to.
+
+```sh
+exifmeta new
+```
+
+Optionally, specify a directory
+
+```sh
+exifmeta new "Photos/shoot-001"
+```
+
+### `check`
+
+Checks `metadata.yml` file is valid. If anything is wrong, the exact error will be shown and how to fix it.
+
+Common reasons for the check to fail:
+
+- The `metadata.yml` file does not exist
+- The YAML fails to parse (the file is invalid)
+- There are formatting errors or invalid tags
+
+```sh
+exifmeta check
+```
+
+```sh
+exifmeta check "Photos/shoot-001"
+```
+
+### `write`
+
+Write the EXIF tags from `metadata.yml` to images.
+
+This writes to all images in the current directory:
+
+```sh
+exifmeta write metadata.yml
+```
+
+You can also write to one image:
+
+```sh
+exifmeta write metadata.yml "10.tif"
+```
+
+### `read`
+
+Read and print the EXIF tags from one image.
+
+```sh
+exifmeta read "10.tif"
+```
+
+### `strip`
+
+Remove EXIF tags from images.
+
+This removes EXIF from all images in the current directory:
+
+```sh
+exifmeta strip
+```
+
+You can also keep/remove specific EXIF tags, but keep a select few:
+
+```sh
+exifmeta strip --keep "Make,Model,LensMake,LensModel"
+```
+
+```sh
+exifmeta strip --remove "GPSLatitude,GPSLongitude"
+```
+
+A special flag `--privacy` exists to only strip all identifiable tags (such as all GPS tags):
+
+```sh
+exifmeta strip --privacy
+```
+
+### `interactive`
+
+Open an interactive browser for folders and images.
+
+```sh
+exifmeta interactive
+```
+
+You can also open a specific directory:
+
+```sh
+exifmeta interactive "Photos/shoot-001"
+```
+
+### `metadata.yml` file
+
+This file is used to write EXIF tags, and can be used to either write to a single file or many at once (an entire directory of images).
+
+An example `metadata.yml` file that sets the camera and lens make+model:
+
+```yml
+exif:
+    # Camera & Lens
+    Make: Zenza Bronica
+    Model: ETRS
+    LensMake: Zenza Bronica
+    LensModel: Zenzanon 75mm f/2.8
+    FocalLength: 75mm
+    MaxApertureValue: 2.8
+```
+
+---
 
 - [EXIF Tags reference](https://exiftool.org/TagNames/EXIF.html)
 - [Locations reference](https://www.geonames.org)
 
-See example files in [`./examples`](./examples/metadata.yml) directory. `examples/metadata.yml`:
+See an [example `metadata.yml`](./examples/metadata.yml) file in [`./examples`](./examples/metadata.yml) directory.
 
 ---
 
