@@ -6,6 +6,7 @@ use std::ptr::NonNull;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, Sender},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -175,20 +176,31 @@ fn interactive_command(args: InteractiveArgs) -> Result<(), String> {
     let mut terminal = InteractiveTerminal::enter()?;
 
     loop {
+        app.drain_preview_results();
+
         terminal
             .terminal
             .draw(|frame| render_interactive(frame, &mut app))
             .map_err(|error| format!("failed to draw interactive UI: {error}"))?;
 
-        let event =
-            event::read().map_err(|error| format!("failed to read terminal event: {error}"))?;
-        if app.handle_event(event)? {
-            break;
+        if event::poll(INTERACTIVE_PREVIEW_TICK)
+            .map_err(|error| format!("failed to poll terminal event: {error}"))?
+        {
+            let event =
+                event::read().map_err(|error| format!("failed to read terminal event: {error}"))?;
+            if app.handle_event(event)? {
+                break;
+            }
         }
+
+        app.tick_preview_spinner();
     }
 
     Ok(())
 }
+
+const INTERACTIVE_PREVIEW_TICK: Duration = Duration::from_millis(80);
+const INTERACTIVE_PREVIEW_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
 struct InteractiveTerminal {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
@@ -229,12 +241,31 @@ struct InteractiveApp {
     preview_viewport_width: u16,
     preview_viewport_height: u16,
     focus: InteractiveFocus,
+    preview_sender: Sender<InteractivePreviewResult>,
+    preview_receiver: Receiver<InteractivePreviewResult>,
+    preview_request_id: u64,
+    preview_loading: bool,
+    preview_spinner_frame: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InteractiveFocus {
     List,
     Preview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveDirectorySelection {
+    First,
+    ReselectChild,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InteractivePreviewResult {
+    request_id: u64,
+    kind: InteractiveEntryKind,
+    path: PathBuf,
+    preview: String,
 }
 
 impl InteractiveApp {
@@ -249,6 +280,7 @@ impl InteractiveApp {
         }
 
         let entries = interactive_entries(&current_dir)?;
+        let (preview_sender, preview_receiver) = mpsc::channel();
         let mut app = Self {
             current_dir,
             entries,
@@ -258,8 +290,13 @@ impl InteractiveApp {
             preview_viewport_width: 0,
             preview_viewport_height: 0,
             focus: InteractiveFocus::List,
+            preview_sender,
+            preview_receiver,
+            preview_request_id: 0,
+            preview_loading: false,
+            preview_spinner_frame: 0,
         };
-        app.refresh_preview();
+        app.request_preview_for_selection();
         Ok(app)
     }
 
@@ -400,14 +437,14 @@ impl InteractiveApp {
     fn select_previous(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
-            self.refresh_preview();
+            self.request_preview_for_selection();
         }
     }
 
     fn select_next(&mut self) {
         if self.selected + 1 < self.entries.len() {
             self.selected += 1;
-            self.refresh_preview();
+            self.request_preview_for_selection();
         }
     }
 
@@ -417,9 +454,8 @@ impl InteractiveApp {
         };
 
         match entry.kind {
-            InteractiveEntryKind::Parent | InteractiveEntryKind::Directory => {
-                self.open_directory(entry.path.clone())
-            }
+            InteractiveEntryKind::Parent => self.open_parent(),
+            InteractiveEntryKind::Directory => self.open_directory(entry.path.clone()),
             InteractiveEntryKind::File => Ok(()),
         }
     }
@@ -442,26 +478,100 @@ impl InteractiveApp {
         let Some(parent) = self.current_dir.parent() else {
             return Ok(());
         };
-        self.open_directory(parent.to_path_buf())
+        self.open_directory_at(
+            parent.to_path_buf(),
+            InteractiveDirectorySelection::ReselectChild,
+        )
     }
 
     fn open_directory(&mut self, directory: PathBuf) -> Result<(), String> {
+        self.open_directory_at(directory, InteractiveDirectorySelection::First)
+    }
+
+    fn open_directory_at(
+        &mut self,
+        directory: PathBuf,
+        selection: InteractiveDirectorySelection,
+    ) -> Result<(), String> {
+        let previous_dir = self.current_dir.clone();
         self.current_dir = fs::canonicalize(&directory).map_err(|error| {
             format!("failed to read directory {}: {error}", directory.display())
         })?;
         self.entries = interactive_entries(&self.current_dir)?;
-        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
-        self.refresh_preview();
+        self.selected = match selection {
+            InteractiveDirectorySelection::First => 0,
+            InteractiveDirectorySelection::ReselectChild => self
+                .entries
+                .iter()
+                .position(|entry| entry.path == previous_dir)
+                .unwrap_or(0),
+        };
+        self.request_preview_for_selection();
         Ok(())
     }
 
-    fn refresh_preview(&mut self) {
+    fn request_preview_for_selection(&mut self) {
         self.preview_scroll = 0;
         self.focus = InteractiveFocus::List;
-        self.preview = match self.entries.get(self.selected) {
-            Some(entry) => interactive_preview(entry),
-            None => "No supported image files or folders found.".to_string(),
+        self.preview_request_id = self.preview_request_id.wrapping_add(1);
+        self.preview_spinner_frame = 0;
+
+        let Some(entry) = self.entries.get(self.selected).cloned() else {
+            self.preview_loading = false;
+            self.preview = "No supported image files or folders found.".to_string();
+            return;
         };
+
+        self.preview_loading = true;
+        self.preview = loading_preview(&entry, self.preview_spinner_frame);
+        let request_id = self.preview_request_id;
+        let sender = self.preview_sender.clone();
+
+        thread::spawn(move || {
+            let preview = interactive_preview(&entry);
+            let _ = sender.send(InteractivePreviewResult {
+                request_id,
+                kind: entry.kind,
+                path: entry.path,
+                preview,
+            });
+        });
+    }
+
+    fn drain_preview_results(&mut self) {
+        while let Ok(result) = self.preview_receiver.try_recv() {
+            self.apply_preview_result(result);
+        }
+    }
+
+    fn apply_preview_result(&mut self, result: InteractivePreviewResult) {
+        if result.request_id != self.preview_request_id
+            || !self.selected_entry_matches(result.kind, &result.path)
+        {
+            return;
+        }
+
+        self.preview = result.preview;
+        self.preview_loading = false;
+        self.clamp_preview_scroll();
+    }
+
+    fn selected_entry_matches(&self, kind: InteractiveEntryKind, path: &Path) -> bool {
+        self.entries
+            .get(self.selected)
+            .is_some_and(|entry| entry.kind == kind && entry.path == path)
+    }
+
+    fn tick_preview_spinner(&mut self) {
+        if !self.preview_loading {
+            return;
+        }
+
+        self.preview_spinner_frame =
+            (self.preview_spinner_frame + 1) % INTERACTIVE_PREVIEW_SPINNER_FRAMES.len();
+        if let Some(entry) = self.entries.get(self.selected) {
+            self.preview = loading_preview(entry, self.preview_spinner_frame);
+        }
     }
 
     fn set_preview_viewport(&mut self, width: u16, height: u16) {
@@ -560,21 +670,62 @@ fn interactive_entries(directory: &Path) -> Result<Vec<InteractiveEntry>, String
 
 fn interactive_preview(entry: &InteractiveEntry) -> String {
     match entry.kind {
-        InteractiveEntryKind::Parent => format!("Parent directory\n\n{}", entry.path.display()),
-        InteractiveEntryKind::Directory => format!("Folder\n\n{}", entry.path.display()),
+        InteractiveEntryKind::Parent => render_directory_preview("Parent directory", &entry.path),
+        InteractiveEntryKind::Directory => render_directory_preview("Folder", &entry.path),
         InteractiveEntryKind::File => inspect_preview(&entry.path),
     }
 }
 
 fn inspect_preview(image: &Path) -> String {
     match read_metadata(image) {
-        Ok(metadata) => strip_ansi_codes(&format_inspect_output(
+        Ok(metadata) => strip_windows_verbatim_prefixes(&strip_ansi_codes(&format_inspect_output(
             image,
             &metadata,
             InspectFormat::Pretty,
-        )),
-        Err(error) => format!("Failed to inspect {}\n\n{error}", image.display()),
+        ))),
+        Err(error) => format!("Failed to inspect {}\n\n{error}", display_path(image)),
     }
+}
+
+fn render_directory_preview(title: &str, directory: &Path) -> String {
+    match interactive_entries(directory) {
+        Ok(entries) => {
+            let mut preview = format!("{title}\n\n{}\n\nContents:", display_path(directory));
+            if entries.is_empty() {
+                preview.push_str("\nNo supported image files or folders found.");
+            } else {
+                for entry in entries {
+                    preview.push_str("\n  ");
+                    preview.push_str(&entry.label);
+                }
+            }
+            preview
+        }
+        Err(error) => format!(
+            "Failed to read folder {}\n\n{error}",
+            display_path(directory)
+        ),
+    }
+}
+
+fn loading_preview(entry: &InteractiveEntry, spinner_frame: usize) -> String {
+    let spinner = INTERACTIVE_PREVIEW_SPINNER_FRAMES
+        .get(spinner_frame)
+        .copied()
+        .unwrap_or(INTERACTIVE_PREVIEW_SPINNER_FRAMES[0]);
+    let action = match entry.kind {
+        InteractiveEntryKind::Parent | InteractiveEntryKind::Directory => "Loading folder preview",
+        InteractiveEntryKind::File => "Reading EXIF preview",
+    };
+    format!("{spinner} {action}\n\n{}", display_path(&entry.path))
+}
+
+fn display_path(path: &Path) -> String {
+    strip_windows_verbatim_prefixes(&path.display().to_string())
+}
+
+fn strip_windows_verbatim_prefixes(value: &str) -> String {
+    value.replace("\\\\?\\UNC\\", "\\\\").replace("\\\\?\\", "")
 }
 
 fn render_interactive(frame: &mut ratatui::Frame<'_>, app: &mut InteractiveApp) {
@@ -604,7 +755,7 @@ fn render_interactive(frame: &mut ratatui::Frame<'_>, app: &mut InteractiveApp) 
     let files = List::new(items)
         .block(
             Block::default()
-                .title(format!(" {} ", app.current_dir.display()))
+                .title(format!(" {} ", display_path(&app.current_dir)))
                 .borders(Borders::ALL),
         )
         .highlight_style(
@@ -5221,12 +5372,13 @@ mod tests {
         app.open_selected().expect("selected folder should open");
 
         assert_eq!(app.current_dir, fs::canonicalize(&nested).unwrap());
+        assert_eq!(app.selected, 0);
         assert!(app.entries.iter().any(|entry| entry.label == "image.jpg"));
 
         app.open_parent().expect("parent should open");
 
         assert_eq!(app.current_dir, fs::canonicalize(&directory).unwrap());
-        assert!(app.selected < app.entries.len());
+        assert_eq!(app.entries[app.selected].label, "nested/");
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -5243,8 +5395,15 @@ mod tests {
             .iter()
             .position(|entry| entry.label == "image.jpg")
             .expect("image entry should exist");
-        app.refresh_preview();
+        app.request_preview_for_selection();
 
+        assert!(app.preview_loading);
+        assert!(app.preview.contains("Reading EXIF preview"));
+
+        let result = preview_result_for_selected(&app, "<No EXIF metadata found>");
+        app.apply_preview_result(result);
+
+        assert!(!app.preview_loading);
         assert!(app.preview.contains("<No EXIF metadata found>"));
 
         let _ = std::fs::remove_dir_all(directory);
@@ -5273,7 +5432,7 @@ mod tests {
         app.open_directory(nested)
             .expect("nested directory should open");
 
-        assert!(app.selected < app.entries.len());
+        assert_eq!(app.selected, 0);
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -5371,7 +5530,7 @@ mod tests {
             .iter()
             .position(|entry| entry.label == "image.jpg")
             .expect("image entry should exist");
-        app.refresh_preview();
+        app.request_preview_for_selection();
         let start_dir = app.current_dir.clone();
 
         app.handle_event(key_event(KeyCode::Right, KeyEventKind::Press))
@@ -5477,8 +5636,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
+    #[test]
+    fn interactive_display_path_removes_windows_verbatim_prefixes() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Users\photos")),
+            r"C:\Users\photos"
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\photos")),
+            r"\\server\share\photos"
+        );
+    }
+
+    #[test]
+    fn interactive_matching_preview_result_updates_panel() {
+        let directory = temporary_test_directory("interactive-preview-result");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "image.jpg")
+            .expect("image entry should exist");
+        app.request_preview_for_selection();
+
+        app.apply_preview_result(preview_result_for_selected(&app, "ready preview"));
+
+        assert!(!app.preview_loading);
+        assert_eq!(app.preview, "ready preview");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_stale_preview_result_is_discarded() {
+        let directory = temporary_test_directory("interactive-stale-preview");
+        std::fs::write(directory.join("a.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("first jpg should be written");
+        std::fs::write(directory.join("b.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("second jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "a.jpg")
+            .expect("first image entry should exist");
+        app.request_preview_for_selection();
+        let stale = preview_result_for_selected(&app, "stale preview");
+
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "b.jpg")
+            .expect("second image entry should exist");
+        app.request_preview_for_selection();
+        let loading_preview = app.preview.clone();
+
+        app.apply_preview_result(stale);
+
+        assert!(app.preview_loading);
+        assert_eq!(app.preview, loading_preview);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_directory_preview_renders_browsable_entries_only() {
+        let directory = temporary_test_directory("interactive-directory-preview");
+        let nested = directory.join("nested");
+        std::fs::create_dir(&nested).expect("nested directory should be created");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+        std::fs::write(directory.join("notes.txt"), "not browsable")
+            .expect("text file should be written");
+
+        let preview = render_directory_preview("Folder", &directory);
+
+        assert!(preview.contains("nested/"));
+        assert!(preview.contains("image.jpg"));
+        assert!(!preview.contains("notes.txt"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     fn key_event(code: KeyCode, kind: KeyEventKind) -> Event {
         Event::Key(KeyEvent::new_with_kind(code, KeyModifiers::empty(), kind))
+    }
+
+    fn preview_result_for_selected(
+        app: &InteractiveApp,
+        preview: &str,
+    ) -> InteractivePreviewResult {
+        let entry = app
+            .entries
+            .get(app.selected)
+            .expect("selected entry should exist");
+
+        InteractivePreviewResult {
+            request_id: app.preview_request_id,
+            kind: entry.kind,
+            path: entry.path.clone(),
+            preview: preview.to_string(),
+        }
     }
 
     #[test]
