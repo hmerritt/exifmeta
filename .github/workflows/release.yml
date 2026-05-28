@@ -25,9 +25,6 @@ jobs:
           - name: windows-x86_64
             target: x86_64-pc-windows-gnu
             binary: exifmeta.exe
-          - name: android-aarch64
-            target: aarch64-linux-android
-            binary: exifmeta
     steps:
       - name: Checkout
         uses: actions/checkout@v4
