@@ -685,8 +685,9 @@ fn interactive_entries(directory: &Path) -> Result<Vec<InteractiveEntry>, String
 
 fn interactive_preview(entry: &InteractiveEntry) -> String {
     match entry.kind {
-        InteractiveEntryKind::Parent => render_directory_preview("Parent directory", &entry.path),
-        InteractiveEntryKind::Directory => render_directory_preview("Folder", &entry.path),
+        InteractiveEntryKind::Parent | InteractiveEntryKind::Directory => {
+            render_directory_preview(&entry.path)
+        }
         InteractiveEntryKind::File => inspect_preview(&entry.path),
     }
 }
@@ -702,14 +703,14 @@ fn inspect_preview(image: &Path) -> String {
     }
 }
 
-fn render_directory_preview(title: &str, directory: &Path) -> String {
+fn render_directory_preview(directory: &Path) -> String {
     match interactive_entries(directory) {
         Ok(entries) => {
             let entries = entries
                 .into_iter()
                 .filter(|entry| entry.kind != InteractiveEntryKind::Parent)
                 .collect::<Vec<_>>();
-            let mut preview = format!("{title}\n\n{}", display_path(directory));
+            let mut preview = display_path(directory);
             if entries.is_empty() {
                 "<No directories or photos in this directory>".to_string()
             } else {
@@ -728,15 +729,14 @@ fn render_directory_preview(title: &str, directory: &Path) -> String {
 }
 
 fn loading_preview(entry: &InteractiveEntry, spinner: SpinnerPreset) -> String {
-    let action = match entry.kind {
-        InteractiveEntryKind::Parent | InteractiveEntryKind::Directory => "Loading folder preview",
-        InteractiveEntryKind::File => "Reading EXIF preview",
-    };
-    format!(
-        "{} {action}\n\n{}",
-        spinner.frame(),
-        display_path(&entry.path)
-    )
+    match entry.kind {
+        InteractiveEntryKind::Parent | InteractiveEntryKind::Directory => format!(
+            "{} Loading folder preview\n\n{}",
+            spinner.frame(),
+            display_path(&entry.path)
+        ),
+        InteractiveEntryKind::File => format!("{} Reading EXIF preview", spinner.frame()),
+    }
 }
 
 fn display_path(path: &Path) -> String {
@@ -745,6 +745,13 @@ fn display_path(path: &Path) -> String {
 
 fn strip_windows_verbatim_prefixes(value: &str) -> String {
     value.replace("\\\\?\\UNC\\", "\\\\").replace("\\\\?\\", "")
+}
+
+fn selected_preview_title(app: &InteractiveApp) -> &'static str {
+    match app.entries.get(app.selected).map(|entry| entry.kind) {
+        Some(InteractiveEntryKind::Parent | InteractiveEntryKind::Directory) => "Directory",
+        Some(InteractiveEntryKind::File) | None => "Inspect",
+    }
 }
 
 fn render_interactive(frame: &mut ratatui::Frame<'_>, app: &mut InteractiveApp) {
@@ -797,7 +804,7 @@ fn render_interactive(frame: &mut ratatui::Frame<'_>, app: &mut InteractiveApp) 
     let preview = Paragraph::new(app.preview.as_str())
         .block(
             Block::default()
-                .title(" Inspect ")
+                .title(format!(" {} ", selected_preview_title(app)))
                 .borders(Borders::ALL)
                 .border_style(preview_block_style),
         )
@@ -5738,10 +5745,12 @@ mod tests {
         std::fs::write(directory.join("notes.txt"), "not browsable")
             .expect("text file should be written");
 
-        let preview = render_directory_preview("Folder", &directory);
+        let preview = render_directory_preview(&directory);
 
         assert!(!preview.contains("Contents:"));
         assert!(!preview.contains("../"));
+        assert!(!preview.contains("Folder"));
+        assert!(!preview.contains("Parent directory"));
         assert!(preview.contains("nested/"));
         assert!(preview.contains("image.jpg"));
         assert!(!preview.contains("notes.txt"));
@@ -5753,9 +5762,42 @@ mod tests {
     fn interactive_empty_directory_preview_renders_empty_message_only() {
         let directory = temporary_test_directory("interactive-empty-directory-preview");
 
-        let preview = render_directory_preview("Folder", &directory);
+        let preview = render_directory_preview(&directory);
 
         assert_eq!(preview, "<No directories or photos in this directory>");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_preview_title_tracks_selected_entry_kind() {
+        let directory = temporary_test_directory("interactive-preview-title");
+        let nested = directory.join("nested");
+        std::fs::create_dir(&nested).expect("nested directory should be created");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.kind == InteractiveEntryKind::Parent)
+            .expect("parent entry should exist");
+        assert_eq!(selected_preview_title(&app), "Directory");
+
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "nested/")
+            .expect("nested entry should exist");
+        assert_eq!(selected_preview_title(&app), "Directory");
+
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "image.jpg")
+            .expect("image entry should exist");
+        assert_eq!(selected_preview_title(&app), "Inspect");
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -5785,6 +5827,9 @@ mod tests {
         assert!(app.preview_loading_visible);
         assert!(app.preview.contains("Reading EXIF preview"));
         assert!(app.preview.starts_with(app.preview_spinner.frame()));
+        assert!(!app.preview.contains("image.jpg"));
+        assert!(!app.preview.contains(&display_path(&directory)));
+        assert!(!app.preview.contains("\n\n"));
 
         let _ = std::fs::remove_dir_all(directory);
     }
