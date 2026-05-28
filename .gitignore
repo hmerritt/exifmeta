@@ -14,6 +14,7 @@ cities1000.txt
 !examples/*jpeg
 !examples/*png
 !examples/*tif
+!assets/icon.png
 
 # metadata files linguring around
 metadata.yml

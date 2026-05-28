@@ -1,4 +1,8 @@
+<img src="./assets/icon.png" draggable="false" width="100px" />
+
 # Exif Metadata
+
+![GitHub Release](https://img.shields.io/github/v/release/hmerritt/exifmeta) [![CI](https://github.com/hmerritt/exifmeta/actions/workflows/ci.yml/badge.svg)](https://github.com/hmerritt/exifmeta/actions/workflows/ci.yml)
 
 EXIF tool for photographers.
 
@@ -185,8 +189,8 @@ During import, the script validates that each GeoNames row has 19 tab-separated 
 - [https://github.com/TechnikTobi/little_exif](TechnikTobi/little_exif) — A library for reading and writing EXIF data in pure Rust.
 - [GeoNames](https://www.geonames.org/) — The GeoNames geographical database `cities1000.zip`. Used to match location names to EXIF GPS data.
 
-#### Features (maybe)
+---
 
-```
-
-```
+<small>
+    <a href="https://www.flaticon.com/free-icons/ui" title="ui icons">Ui icons created by smashingstocks - Flaticon</a>
+</small>
