@@ -2,7 +2,7 @@
 
 # Exif Metadata
 
-![GitHub Release](https://img.shields.io/github/v/release/hmerritt/exifmeta) [![CI](https://github.com/hmerritt/exifmeta/actions/workflows/ci.yml/badge.svg)](https://github.com/hmerritt/exifmeta/actions/workflows/ci.yml) [![Coverage Status](https://coveralls.io/repos/github/hmerritt/exifmeta/badge.svg?branch=master)](https://coveralls.io/github/hmerritt/exifmeta?branch=master)
+[![Release](https://img.shields.io/github/v/release/hmerritt/exifmeta?link=https%3A%2F%2Fgithub.com%2Fhmerritt%2Fexifmeta%2Freleases%2Flatest)](https://github.com/hmerritt/exifmeta/releases/latest) [![Downloads](https://img.shields.io/github/downloads/hmerritt/exifmeta/total?link=https%3A%2F%2Fgithub.com%2Fhmerritt%2Fexifmeta%2Freleases%2Flatest)](https://github.com/hmerritt/exifmeta/releases/latest) [![Coverage](https://img.shields.io/coverallsCoverage/github/hmerritt/exifmeta)](https://coveralls.io/github/hmerritt/exifmeta?branch=master)
 
 EXIF tool for photographers.
 
