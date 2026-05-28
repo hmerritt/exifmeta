@@ -18,7 +18,7 @@ A simple program to read a standardised `metadata.yaml` file and write the data 
 | `init`        | Create template `metadata.yaml` file                                                 |
 | `validate`    | Checks `metadata.yaml` is valid                                                      |
 | `inspect`     | Read and pretty-print the current EXIF data of a specific image file                 |
-| `interactive` | Interactively read and set EXIF data for any image                                   |
+| `interactive` | Interactively browse folders and inspect image EXIF data                             |
 | `strip`       | Removes all existing EXIF metadata from target image files                           |
 
 ### Flags

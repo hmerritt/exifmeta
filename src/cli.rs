@@ -28,8 +28,8 @@ pub enum Command {
     #[command(about = "Read and pretty-print the current EXIF data of an image file")]
     Inspect(InspectArgs),
 
-    #[command(about = "Interactively read and set EXIF data for an image")]
-    Interactive,
+    #[command(about = "Interactively browse folders and inspect image EXIF data")]
+    Interactive(InteractiveArgs),
 
     #[command(about = "Remove all existing EXIF metadata from target image files")]
     Strip(StripArgs),
@@ -45,6 +45,12 @@ pub struct InitArgs {
 pub struct ValidateArgs {
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct InteractiveArgs {
+    #[arg(value_name = "DIRECTORY", default_value = ".")]
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -207,6 +213,30 @@ mod tests {
         };
 
         assert_eq!(args.path, PathBuf::from("some/other/directory"));
+    }
+
+    #[test]
+    fn parses_interactive_default_path() {
+        let cli =
+            Cli::try_parse_from(["exifmeta", "interactive"]).expect("interactive should parse");
+
+        let Command::Interactive(args) = cli.command else {
+            panic!("expected interactive command");
+        };
+
+        assert_eq!(args.path, PathBuf::from("."));
+    }
+
+    #[test]
+    fn parses_interactive_path() {
+        let cli = Cli::try_parse_from(["exifmeta", "interactive", "some/photos"])
+            .expect("interactive path should parse");
+
+        let Command::Interactive(args) = cli.command else {
+            panic!("expected interactive command");
+        };
+
+        assert_eq!(args.path, PathBuf::from("some/photos"));
     }
 
     #[test]

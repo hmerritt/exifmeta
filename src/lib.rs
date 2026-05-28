@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::{
@@ -12,11 +12,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
 use colored::Colorize;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use exif::{Context, Error as ExifError, Exif, Field, Reader, Tag, Value};
 use little_exif::exif_tag::ExifTag as WritableExifTag;
 use little_exif::ifd::ExifTagGroup;
 use little_exif::metadata::Metadata as WritableMetadata;
 use little_exif::rational::uR64;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use rattles::presets::prelude as spinners;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, DatabaseName, params, params_from_iter};
@@ -27,7 +38,8 @@ pub mod cli;
 pub mod version;
 
 pub use cli::{
-    Cli, Command, InitArgs, InspectArgs, InspectFormat, RunArgs, StripArgs, ValidateArgs,
+    Cli, Command, InitArgs, InspectArgs, InspectFormat, InteractiveArgs, RunArgs, StripArgs,
+    ValidateArgs,
 };
 
 const GEONAMES_DATABASE: &[u8] = include_bytes!("../assets/geonames/cities1000.sqlite");
@@ -125,7 +137,11 @@ impl From<String> for CliError {
 }
 
 pub fn run(cli: Cli) -> Result<(), CliError> {
-    if !matches!(&cli.command, Command::Strip(args) if args.json) {
+    if !matches!(
+        &cli.command,
+        Command::Strip(args) if args.json
+    ) && !matches!(&cli.command, Command::Interactive(_))
+    {
         version::print_title();
     }
 
@@ -134,7 +150,7 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
         Command::Init(args) => init_command(cli.dry_run, args),
         Command::Validate(args) => validate_command(args),
         Command::Inspect(args) => inspect_command(args).map_err(Into::into),
-        Command::Interactive => stub_command(cli.dry_run, "interactive").map_err(Into::into),
+        Command::Interactive(args) => interactive_command(args).map_err(Into::into),
         Command::Strip(args) => strip_command(cli.dry_run, args),
     }
 }
@@ -152,6 +168,371 @@ fn inspect_command(args: InspectArgs) -> Result<(), String> {
     println!("{output}");
 
     Ok(())
+}
+
+fn interactive_command(args: InteractiveArgs) -> Result<(), String> {
+    let mut app = InteractiveApp::new(&args.path)?;
+    let mut terminal = InteractiveTerminal::enter()?;
+
+    loop {
+        terminal
+            .terminal
+            .draw(|frame| render_interactive(frame, &app))
+            .map_err(|error| format!("failed to draw interactive UI: {error}"))?;
+
+        let event =
+            event::read().map_err(|error| format!("failed to read terminal event: {error}"))?;
+        if app.handle_event(event)? {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+struct InteractiveTerminal {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl InteractiveTerminal {
+    fn enter() -> Result<Self, String> {
+        enable_raw_mode().map_err(|error| format!("failed to enable raw mode: {error}"))?;
+        let mut stdout = io::stdout();
+        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(format!("failed to enter alternate screen: {error}"));
+        }
+
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)
+            .map_err(|error| format!("failed to initialize terminal: {error}"))?;
+
+        Ok(Self { terminal })
+    }
+}
+
+impl Drop for InteractiveTerminal {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+#[derive(Debug)]
+struct InteractiveApp {
+    current_dir: PathBuf,
+    entries: Vec<InteractiveEntry>,
+    selected: usize,
+    preview: String,
+    preview_scroll: u16,
+}
+
+impl InteractiveApp {
+    fn new(path: &Path) -> Result<Self, String> {
+        let current_dir = fs::canonicalize(path)
+            .map_err(|error| format!("failed to read directory {}: {error}", path.display()))?;
+        if !current_dir.is_dir() {
+            return Err(format!(
+                "interactive path is not a directory: {}",
+                current_dir.display()
+            ));
+        }
+
+        let entries = interactive_entries(&current_dir)?;
+        let mut app = Self {
+            current_dir,
+            entries,
+            selected: 0,
+            preview: String::new(),
+            preview_scroll: 0,
+        };
+        app.refresh_preview();
+        Ok(app)
+    }
+
+    fn handle_event(&mut self, event: Event) -> Result<bool, String> {
+        let Event::Key(key) = event else {
+            return Ok(false);
+        };
+
+        if key.kind != KeyEventKind::Press {
+            return Ok(false);
+        }
+
+        match key {
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Esc, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('q'),
+                ..
+            } => Ok(true),
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => {
+                self.select_previous();
+                Ok(false)
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => {
+                self.select_next();
+                Ok(false)
+            }
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => {
+                self.open_selected()?;
+                Ok(false)
+            }
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => {
+                self.open_parent()?;
+                Ok(false)
+            }
+            KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            } => {
+                self.preview_scroll = self.preview_scroll.saturating_sub(8);
+                Ok(false)
+            }
+            KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            } => {
+                self.preview_scroll = self.preview_scroll.saturating_add(8);
+                Ok(false)
+            }
+            KeyEvent {
+                code: KeyCode::Home,
+                ..
+            } => {
+                self.preview_scroll = 0;
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn select_previous(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+            self.refresh_preview();
+        }
+    }
+
+    fn select_next(&mut self) {
+        if self.selected + 1 < self.entries.len() {
+            self.selected += 1;
+            self.refresh_preview();
+        }
+    }
+
+    fn open_selected(&mut self) -> Result<(), String> {
+        let Some(entry) = self.entries.get(self.selected) else {
+            return Ok(());
+        };
+
+        match entry.kind {
+            InteractiveEntryKind::Parent | InteractiveEntryKind::Directory => {
+                self.open_directory(entry.path.clone())
+            }
+            InteractiveEntryKind::File => Ok(()),
+        }
+    }
+
+    fn open_parent(&mut self) -> Result<(), String> {
+        let Some(parent) = self.current_dir.parent() else {
+            return Ok(());
+        };
+        self.open_directory(parent.to_path_buf())
+    }
+
+    fn open_directory(&mut self, directory: PathBuf) -> Result<(), String> {
+        self.current_dir = fs::canonicalize(&directory).map_err(|error| {
+            format!("failed to read directory {}: {error}", directory.display())
+        })?;
+        self.entries = interactive_entries(&self.current_dir)?;
+        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        self.preview_scroll = 0;
+        self.refresh_preview();
+        Ok(())
+    }
+
+    fn refresh_preview(&mut self) {
+        self.preview_scroll = 0;
+        self.preview = match self.entries.get(self.selected) {
+            Some(entry) => interactive_preview(entry),
+            None => "No supported image files or folders found.".to_string(),
+        };
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InteractiveEntry {
+    kind: InteractiveEntryKind,
+    label: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveEntryKind {
+    Parent,
+    Directory,
+    File,
+}
+
+fn interactive_entries(directory: &Path) -> Result<Vec<InteractiveEntry>, String> {
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("failed to read directory {}: {error}", directory.display()))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read directory entry in {}: {error}",
+                directory.display()
+            )
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            directories.push(InteractiveEntry {
+                kind: InteractiveEntryKind::Directory,
+                label: format!("{}/", file_name(&path)),
+                path,
+            });
+        } else if path.is_file() && is_supported_image_file(&path) {
+            files.push(InteractiveEntry {
+                kind: InteractiveEntryKind::File,
+                label: file_name(&path),
+                path,
+            });
+        }
+    }
+
+    directories.sort_by_key(|entry| entry.label.to_ascii_lowercase());
+    files.sort_by_key(|entry| entry.label.to_ascii_lowercase());
+
+    let mut result = Vec::new();
+    if let Some(parent) = directory.parent() {
+        result.push(InteractiveEntry {
+            kind: InteractiveEntryKind::Parent,
+            label: "../".to_string(),
+            path: parent.to_path_buf(),
+        });
+    }
+    result.extend(directories);
+    result.extend(files);
+    Ok(result)
+}
+
+fn interactive_preview(entry: &InteractiveEntry) -> String {
+    match entry.kind {
+        InteractiveEntryKind::Parent => format!("Parent directory\n\n{}", entry.path.display()),
+        InteractiveEntryKind::Directory => format!(
+            "Folder\n\n{}\n\nPress Right or Enter to open.",
+            entry.path.display()
+        ),
+        InteractiveEntryKind::File => inspect_preview(&entry.path),
+    }
+}
+
+fn inspect_preview(image: &Path) -> String {
+    match read_metadata(image) {
+        Ok(metadata) => strip_ansi_codes(&format_inspect_output(
+            image,
+            &metadata,
+            InspectFormat::Pretty,
+        )),
+        Err(error) => format!("Failed to inspect {}\n\n{error}", image.display()),
+    }
+}
+
+fn render_interactive(frame: &mut ratatui::Frame<'_>, app: &InteractiveApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(frame.area());
+
+    let items = app
+        .entries
+        .iter()
+        .map(|entry| {
+            let style = match entry.kind {
+                InteractiveEntryKind::Parent => Style::default().fg(Color::Yellow),
+                InteractiveEntryKind::Directory => Style::default().fg(Color::Cyan),
+                InteractiveEntryKind::File => Style::default(),
+            };
+            ListItem::new(Line::from(Span::styled(entry.label.clone(), style)))
+        })
+        .collect::<Vec<_>>();
+
+    let mut list_state = ListState::default();
+    if !items.is_empty() {
+        list_state.select(Some(app.selected));
+    }
+
+    let files = List::new(items)
+        .block(
+            Block::default()
+                .title(format!(" {} ", app.current_dir.display()))
+                .borders(Borders::ALL),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(files, chunks[0], &mut list_state);
+
+    let preview = Paragraph::new(app.preview.as_str())
+        .block(Block::default().title(" Inspect ").borders(Borders::ALL))
+        .scroll((app.preview_scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(preview, chunks[1]);
+}
+
+fn strip_ansi_codes(value: &str) -> String {
+    let mut output = String::new();
+    let mut chars = value.chars().peekable();
+
+    while let Some(char) = chars.next() {
+        if char == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for char in chars.by_ref() {
+                if char == 'm' {
+                    break;
+                }
+            }
+        } else {
+            output.push(char);
+        }
+    }
+
+    output
 }
 
 fn read_metadata(image: &Path) -> Result<InspectMetadata, String> {
@@ -4657,21 +5038,196 @@ fn rational_with_denominator(value: f64, denominator: u32) -> uR64 {
     }
 }
 
-fn stub_command(dry_run: bool, command: &str) -> Result<(), String> {
-    if dry_run {
-        println!("{command}: not implemented yet (dry-run)");
-    } else {
-        println!("{command}: not implemented yet");
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use exif::{Context, Tag};
+
+    #[test]
+    fn interactive_entries_include_folders_and_supported_files_only() {
+        let directory = temporary_test_directory("interactive-entries");
+        let nested = directory.join("nested");
+        std::fs::create_dir(&nested).expect("nested directory should be created");
+        std::fs::write(directory.join("a.txt"), "not an image")
+            .expect("text file should be written");
+        std::fs::write(directory.join("b.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+        std::fs::write(directory.join("c.tif"), [0x49, 0x49, 0x2a, 0x00])
+            .expect("tif should be written");
+
+        let entries = interactive_entries(&directory).expect("entries should be listed");
+        let labels = entries
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, ["../", "nested/", "b.jpg", "c.tif"]);
+        assert_eq!(entries[0].kind, InteractiveEntryKind::Parent);
+        assert_eq!(entries[1].kind, InteractiveEntryKind::Directory);
+        assert_eq!(entries[2].kind, InteractiveEntryKind::File);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_app_navigates_into_child_and_back_to_parent() {
+        let directory = temporary_test_directory("interactive-navigation");
+        let nested = directory.join("nested");
+        std::fs::create_dir(&nested).expect("nested directory should be created");
+        std::fs::write(nested.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "nested/")
+            .expect("nested entry should exist");
+        app.open_selected().expect("selected folder should open");
+
+        assert_eq!(app.current_dir, fs::canonicalize(&nested).unwrap());
+        assert!(app.entries.iter().any(|entry| entry.label == "image.jpg"));
+
+        app.open_parent().expect("parent should open");
+
+        assert_eq!(app.current_dir, fs::canonicalize(&directory).unwrap());
+        assert!(app.selected < app.entries.len());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_app_selection_updates_preview() {
+        let directory = temporary_test_directory("interactive-preview");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "image.jpg")
+            .expect("image entry should exist");
+        app.refresh_preview();
+
+        assert!(app.preview.contains("<No EXIF metadata found>"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_inspect_preview_reports_missing_file_errors() {
+        let missing = temporary_test_path("interactive-missing.jpg");
+
+        let preview = inspect_preview(&missing);
+
+        assert!(preview.contains("Failed to inspect"));
+        assert!(preview.contains("failed to open"));
+    }
+
+    #[test]
+    fn interactive_app_preserves_valid_selection_after_directory_refresh() {
+        let directory = temporary_test_directory("interactive-selection");
+        let nested = directory.join("nested");
+        std::fs::create_dir(&nested).expect("nested directory should be created");
+        std::fs::write(directory.join("z.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        app.selected = usize::MAX;
+        app.open_directory(nested)
+            .expect("nested directory should open");
+
+        assert!(app.selected < app.entries.len());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_key_press_moves_selection_once() {
+        let directory = temporary_test_directory("interactive-key-press");
+        std::fs::write(directory.join("a.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("first jpg should be written");
+        std::fs::write(directory.join("b.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("second jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        let start = app.selected;
+
+        app.handle_event(key_event(KeyCode::Down, KeyEventKind::Press))
+            .expect("key press should be handled");
+
+        assert_eq!(app.selected, start + 1);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_key_release_does_not_move_selection() {
+        let directory = temporary_test_directory("interactive-key-release");
+        std::fs::write(directory.join("a.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("first jpg should be written");
+        std::fs::write(directory.join("b.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("second jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        let start = app.selected;
+
+        app.handle_event(key_event(KeyCode::Down, KeyEventKind::Release))
+            .expect("key release should be ignored");
+
+        assert_eq!(app.selected, start);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_key_repeat_does_not_move_selection() {
+        let directory = temporary_test_directory("interactive-key-repeat");
+        std::fs::write(directory.join("a.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("first jpg should be written");
+        std::fs::write(directory.join("b.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("second jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        let start = app.selected;
+
+        app.handle_event(key_event(KeyCode::Down, KeyEventKind::Repeat))
+            .expect("key repeat should be ignored");
+
+        assert_eq!(app.selected, start);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_navigation_keys_still_open_child_and_parent_on_press() {
+        let directory = temporary_test_directory("interactive-key-navigation");
+        let nested = directory.join("nested");
+        std::fs::create_dir(&nested).expect("nested directory should be created");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "nested/")
+            .expect("nested entry should exist");
+
+        app.handle_event(key_event(KeyCode::Right, KeyEventKind::Press))
+            .expect("right press should open child");
+        assert_eq!(app.current_dir, fs::canonicalize(&nested).unwrap());
+
+        app.handle_event(key_event(KeyCode::Left, KeyEventKind::Press))
+            .expect("left press should open parent");
+        assert_eq!(app.current_dir, fs::canonicalize(&directory).unwrap());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    fn key_event(code: KeyCode, kind: KeyEventKind) -> Event {
+        Event::Key(KeyEvent::new_with_kind(code, KeyModifiers::empty(), kind))
+    }
 
     #[test]
     fn renders_metadata_template_values() {
