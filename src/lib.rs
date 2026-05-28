@@ -200,7 +200,6 @@ fn interactive_command(args: InteractiveArgs) -> Result<(), String> {
 }
 
 const INTERACTIVE_PREVIEW_TICK: Duration = Duration::from_millis(80);
-const INTERACTIVE_PREVIEW_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
 struct InteractiveTerminal {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
@@ -245,7 +244,9 @@ struct InteractiveApp {
     preview_receiver: Receiver<InteractivePreviewResult>,
     preview_request_id: u64,
     preview_loading: bool,
-    preview_spinner_frame: usize,
+    preview_loading_visible: bool,
+    preview_loading_deadline: Option<Instant>,
+    preview_spinner: SpinnerPreset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,7 +295,9 @@ impl InteractiveApp {
             preview_receiver,
             preview_request_id: 0,
             preview_loading: false,
-            preview_spinner_frame: 0,
+            preview_loading_visible: false,
+            preview_loading_deadline: None,
+            preview_spinner: SpinnerPreset::random(),
         };
         app.request_preview_for_selection();
         Ok(app)
@@ -514,16 +517,18 @@ impl InteractiveApp {
         self.preview_scroll = 0;
         self.focus = InteractiveFocus::List;
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
-        self.preview_spinner_frame = 0;
 
         let Some(entry) = self.entries.get(self.selected).cloned() else {
             self.preview_loading = false;
+            self.preview_loading_visible = false;
+            self.preview_loading_deadline = None;
             self.preview = "No supported image files or folders found.".to_string();
             return;
         };
 
         self.preview_loading = true;
-        self.preview = loading_preview(&entry, self.preview_spinner_frame);
+        self.preview_loading_visible = false;
+        self.preview_loading_deadline = Some(Instant::now() + INTERACTIVE_PREVIEW_TICK);
         let request_id = self.preview_request_id;
         let sender = self.preview_sender.clone();
 
@@ -553,6 +558,8 @@ impl InteractiveApp {
 
         self.preview = result.preview;
         self.preview_loading = false;
+        self.preview_loading_visible = false;
+        self.preview_loading_deadline = None;
         self.clamp_preview_scroll();
     }
 
@@ -567,10 +574,18 @@ impl InteractiveApp {
             return;
         }
 
-        self.preview_spinner_frame =
-            (self.preview_spinner_frame + 1) % INTERACTIVE_PREVIEW_SPINNER_FRAMES.len();
+        if !self.preview_loading_visible {
+            if self
+                .preview_loading_deadline
+                .is_some_and(|deadline| Instant::now() < deadline)
+            {
+                return;
+            }
+            self.preview_loading_visible = true;
+        }
+
         if let Some(entry) = self.entries.get(self.selected) {
-            self.preview = loading_preview(entry, self.preview_spinner_frame);
+            self.preview = loading_preview(entry, self.preview_spinner);
         }
     }
 
@@ -690,16 +705,20 @@ fn inspect_preview(image: &Path) -> String {
 fn render_directory_preview(title: &str, directory: &Path) -> String {
     match interactive_entries(directory) {
         Ok(entries) => {
-            let mut preview = format!("{title}\n\n{}\n\nContents:", display_path(directory));
+            let entries = entries
+                .into_iter()
+                .filter(|entry| entry.kind != InteractiveEntryKind::Parent)
+                .collect::<Vec<_>>();
+            let mut preview = format!("{title}\n\n{}", display_path(directory));
             if entries.is_empty() {
-                preview.push_str("\nNo supported image files or folders found.");
+                "<No directories or photos in this directory>".to_string()
             } else {
                 for entry in entries {
                     preview.push_str("\n  ");
                     preview.push_str(&entry.label);
                 }
+                preview
             }
-            preview
         }
         Err(error) => format!(
             "Failed to read folder {}\n\n{error}",
@@ -708,16 +727,16 @@ fn render_directory_preview(title: &str, directory: &Path) -> String {
     }
 }
 
-fn loading_preview(entry: &InteractiveEntry, spinner_frame: usize) -> String {
-    let spinner = INTERACTIVE_PREVIEW_SPINNER_FRAMES
-        .get(spinner_frame)
-        .copied()
-        .unwrap_or(INTERACTIVE_PREVIEW_SPINNER_FRAMES[0]);
+fn loading_preview(entry: &InteractiveEntry, spinner: SpinnerPreset) -> String {
     let action = match entry.kind {
         InteractiveEntryKind::Parent | InteractiveEntryKind::Directory => "Loading folder preview",
         InteractiveEntryKind::File => "Reading EXIF preview",
     };
-    format!("{spinner} {action}\n\n{}", display_path(&entry.path))
+    format!(
+        "{} {action}\n\n{}",
+        spinner.frame(),
+        display_path(&entry.path)
+    )
 }
 
 fn display_path(path: &Path) -> String {
@@ -5395,15 +5414,18 @@ mod tests {
             .iter()
             .position(|entry| entry.label == "image.jpg")
             .expect("image entry should exist");
+        app.preview = "previous preview".to_string();
         app.request_preview_for_selection();
 
         assert!(app.preview_loading);
-        assert!(app.preview.contains("Reading EXIF preview"));
+        assert!(!app.preview_loading_visible);
+        assert_eq!(app.preview, "previous preview");
 
         let result = preview_result_for_selected(&app, "<No EXIF metadata found>");
         app.apply_preview_result(result);
 
         assert!(!app.preview_loading);
+        assert!(!app.preview_loading_visible);
         assert!(app.preview.contains("<No EXIF metadata found>"));
 
         let _ = std::fs::remove_dir_all(directory);
@@ -5665,6 +5687,7 @@ mod tests {
         app.apply_preview_result(preview_result_for_selected(&app, "ready preview"));
 
         assert!(!app.preview_loading);
+        assert!(!app.preview_loading_visible);
         assert_eq!(app.preview, "ready preview");
 
         let _ = std::fs::remove_dir_all(directory);
@@ -5692,13 +5715,15 @@ mod tests {
             .iter()
             .position(|entry| entry.label == "b.jpg")
             .expect("second image entry should exist");
+        app.preview = "previous preview".to_string();
         app.request_preview_for_selection();
-        let loading_preview = app.preview.clone();
+        let previous_preview = app.preview.clone();
 
         app.apply_preview_result(stale);
 
         assert!(app.preview_loading);
-        assert_eq!(app.preview, loading_preview);
+        assert!(!app.preview_loading_visible);
+        assert_eq!(app.preview, previous_preview);
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -5715,9 +5740,51 @@ mod tests {
 
         let preview = render_directory_preview("Folder", &directory);
 
+        assert!(!preview.contains("Contents:"));
+        assert!(!preview.contains("../"));
         assert!(preview.contains("nested/"));
         assert!(preview.contains("image.jpg"));
         assert!(!preview.contains("notes.txt"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_empty_directory_preview_renders_empty_message_only() {
+        let directory = temporary_test_directory("interactive-empty-directory-preview");
+
+        let preview = render_directory_preview("Folder", &directory);
+
+        assert_eq!(preview, "<No directories or photos in this directory>");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_preview_loading_appears_after_delay() {
+        let directory = temporary_test_directory("interactive-loading-delay");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "image.jpg")
+            .expect("image entry should exist");
+        app.preview = "previous preview".to_string();
+        app.request_preview_for_selection();
+
+        app.tick_preview_spinner();
+        assert!(!app.preview_loading_visible);
+        assert_eq!(app.preview, "previous preview");
+
+        app.preview_loading_deadline = Some(Instant::now());
+        app.tick_preview_spinner();
+
+        assert!(app.preview_loading_visible);
+        assert!(app.preview.contains("Reading EXIF preview"));
+        assert!(app.preview.starts_with(app.preview_spinner.frame()));
 
         let _ = std::fs::remove_dir_all(directory);
     }
