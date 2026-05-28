@@ -16,14 +16,14 @@ A simple program to read a standardised `metadata.yml` file and write the data a
 
 ## CLI Commands
 
-| Command       | Function                                                                             |
-| :------------ | :----------------------------------------------------------------------------------- |
-| `new`         | Create template `metadata.yml` file                                                  |
-| `check`       | Checks `metadata.yml` is valid                                                       |
-| `read`        | Read and pretty-print the current EXIF data of a specific image file                 |
-| `write`       | Main function; reads `metadata.yml` file and writes EXIF data to target image files  |
-| `strip`       | Removes all existing EXIF metadata from target image files                           |
-| `interactive` | Interactively browse folders and read image EXIF data                                |
+| Command       | Function                                                               |
+| :------------ | :--------------------------------------------------------------------- |
+| `new`         | Create `metadata.yml` file                                             |
+| `check`       | Checks `metadata.yml` file is valid                                    |
+| `read`        | Read an image file's EXIF tags                                         |
+| `write`       | Writes EXIF tags defined in `metadata.yml` to target image files       |
+| `strip`       | Tool to remove all (or a select few) EXIF tags from target image files |
+| `interactive` | Interactively browse folders and read image EXIF tags                  |
 
 ### Flags
 

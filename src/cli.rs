@@ -16,22 +16,22 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
 pub enum Command {
-    #[command(about = "Create a template metadata.yml file")]
+    #[command(about = "Create metadata.yml file")]
     New(NewArgs),
 
-    #[command(about = "Check metadata.yml is valid")]
+    #[command(about = "Checks metadata.yml file is valid")]
     Check(CheckArgs),
 
-    #[command(about = "Read and pretty-print the current EXIF data of an image file")]
+    #[command(about = "Read an image file's EXIF tags")]
     Read(ReadArgs),
 
-    #[command(about = "Read metadata.yml and write EXIF data to target image files")]
+    #[command(about = "Writes EXIF tags defined in metadata.yml to target image files")]
     Write(WriteArgs),
 
-    #[command(about = "Remove all existing EXIF metadata from target image files")]
+    #[command(about = "Tool to remove all (or a select few) EXIF tags from target image files")]
     Strip(StripArgs),
 
-    #[command(about = "Interactively browse folders and read image EXIF data")]
+    #[command(about = "Interactively browse folders and read image EXIF tags")]
     Interactive(InteractiveArgs),
 }
 
@@ -208,6 +208,27 @@ mod tests {
             help_position >= previous_position,
             "expected generated help command to appear after app commands:\n{help}"
         );
+    }
+
+    #[test]
+    fn help_lists_readme_command_descriptions() {
+        let mut command = Cli::command();
+        let help = command.render_help().to_string();
+        let expected_descriptions = [
+            "Create metadata.yml file",
+            "Checks metadata.yml file is valid",
+            "Read an image file's EXIF tags",
+            "Writes EXIF tags defined in metadata.yml to target image files",
+            "Tool to remove all (or a select few) EXIF tags from target image files",
+            "Interactively browse folders and read image EXIF tags",
+        ];
+
+        for expected_description in expected_descriptions {
+            assert!(
+                help.contains(expected_description),
+                "expected help to include README command description {expected_description:?}:\n{help}"
+            );
+        }
     }
 
     #[test]
