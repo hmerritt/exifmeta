@@ -27,7 +27,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use rattles::presets::prelude as spinners;
 use rusqlite::types::Value as SqlValue;
@@ -235,7 +235,7 @@ struct InteractiveApp {
     current_dir: PathBuf,
     entries: Vec<InteractiveEntry>,
     selected: usize,
-    preview: String,
+    preview: InteractivePreviewContent,
     preview_scroll: u16,
     preview_viewport_width: u16,
     preview_viewport_height: u16,
@@ -266,7 +266,42 @@ struct InteractivePreviewResult {
     request_id: u64,
     kind: InteractiveEntryKind,
     path: PathBuf,
-    preview: String,
+    preview: InteractivePreviewContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InteractivePreviewContent {
+    Plain(String),
+    Lines(Vec<Line<'static>>),
+}
+
+impl InteractivePreviewContent {
+    fn plain(value: impl Into<String>) -> Self {
+        Self::Plain(value.into())
+    }
+
+    fn rendered_line_count(&self, width: u16) -> usize {
+        match self {
+            Self::Plain(value) => rendered_line_count(value, width),
+            Self::Lines(lines) => lines.len().max(1),
+        }
+    }
+
+    #[cfg(test)]
+    fn as_plain(&self) -> Option<&str> {
+        match self {
+            Self::Plain(value) => Some(value.as_str()),
+            Self::Lines(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn as_lines(&self) -> Option<&[Line<'static>]> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Lines(lines) => Some(lines.as_slice()),
+        }
+    }
 }
 
 impl InteractiveApp {
@@ -286,7 +321,7 @@ impl InteractiveApp {
             current_dir,
             entries,
             selected: 0,
-            preview: String::new(),
+            preview: InteractivePreviewContent::plain(""),
             preview_scroll: 0,
             preview_viewport_width: 0,
             preview_viewport_height: 0,
@@ -522,7 +557,8 @@ impl InteractiveApp {
             self.preview_loading = false;
             self.preview_loading_visible = false;
             self.preview_loading_deadline = None;
-            self.preview = "No supported image files or folders found.".to_string();
+            self.preview =
+                InteractivePreviewContent::plain("No supported image files or folders found.");
             return;
         };
 
@@ -617,7 +653,8 @@ impl InteractiveApp {
     }
 
     fn max_preview_scroll(&self) -> u16 {
-        rendered_line_count(&self.preview, self.preview_viewport_width)
+        self.preview
+            .rendered_line_count(self.preview_viewport_width)
             .saturating_sub(usize::from(self.preview_viewport_height))
             .min(usize::from(u16::MAX)) as u16
     }
@@ -683,12 +720,14 @@ fn interactive_entries(directory: &Path) -> Result<Vec<InteractiveEntry>, String
     Ok(result)
 }
 
-fn interactive_preview(entry: &InteractiveEntry) -> String {
+fn interactive_preview(entry: &InteractiveEntry) -> InteractivePreviewContent {
     match entry.kind {
         InteractiveEntryKind::Parent | InteractiveEntryKind::Directory => {
             render_directory_preview(&entry.path)
         }
-        InteractiveEntryKind::File => inspect_preview(&entry.path),
+        InteractiveEntryKind::File => {
+            InteractivePreviewContent::plain(inspect_preview(&entry.path))
+        }
     }
 }
 
@@ -703,39 +742,45 @@ fn inspect_preview(image: &Path) -> String {
     }
 }
 
-fn render_directory_preview(directory: &Path) -> String {
+fn render_directory_preview(directory: &Path) -> InteractivePreviewContent {
     match interactive_entries(directory) {
         Ok(entries) => {
             let entries = entries
                 .into_iter()
                 .filter(|entry| entry.kind != InteractiveEntryKind::Parent)
                 .collect::<Vec<_>>();
-            let mut preview = display_path(directory);
+            let mut lines = vec![Line::default()];
             if entries.is_empty() {
-                "<No directories or photos in this directory>".to_string()
+                lines.push(Line::from("<No directories or photos in this directory>"));
             } else {
                 for entry in entries {
-                    preview.push_str("\n  ");
-                    preview.push_str(&entry.label);
+                    lines.push(Line::from(Span::styled(
+                        entry.label,
+                        interactive_entry_style(entry.kind),
+                    )));
                 }
-                preview
             }
+            InteractivePreviewContent::Lines(lines)
         }
-        Err(error) => format!(
+        Err(error) => InteractivePreviewContent::plain(format!(
             "Failed to read folder {}\n\n{error}",
             display_path(directory)
-        ),
+        )),
     }
 }
 
-fn loading_preview(entry: &InteractiveEntry, spinner: SpinnerPreset) -> String {
+fn loading_preview(entry: &InteractiveEntry, spinner: SpinnerPreset) -> InteractivePreviewContent {
     match entry.kind {
-        InteractiveEntryKind::Parent | InteractiveEntryKind::Directory => format!(
-            "{} Loading folder preview\n\n{}",
-            spinner.frame(),
-            display_path(&entry.path)
-        ),
-        InteractiveEntryKind::File => format!("{} Reading EXIF preview", spinner.frame()),
+        InteractiveEntryKind::Parent | InteractiveEntryKind::Directory => {
+            InteractivePreviewContent::plain(format!(
+                "{} Loading folder preview\n\n{}",
+                spinner.frame(),
+                display_path(&entry.path)
+            ))
+        }
+        InteractiveEntryKind::File => {
+            InteractivePreviewContent::plain(format!("{} Reading EXIF preview", spinner.frame()))
+        }
     }
 }
 
@@ -754,6 +799,14 @@ fn selected_preview_title(app: &InteractiveApp) -> &'static str {
     }
 }
 
+fn interactive_entry_style(kind: InteractiveEntryKind) -> Style {
+    match kind {
+        InteractiveEntryKind::Parent => Style::default().fg(Color::Yellow),
+        InteractiveEntryKind::Directory => Style::default().fg(Color::Cyan),
+        InteractiveEntryKind::File => Style::default(),
+    }
+}
+
 fn render_interactive(frame: &mut ratatui::Frame<'_>, app: &mut InteractiveApp) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -764,12 +817,10 @@ fn render_interactive(frame: &mut ratatui::Frame<'_>, app: &mut InteractiveApp) 
         .entries
         .iter()
         .map(|entry| {
-            let style = match entry.kind {
-                InteractiveEntryKind::Parent => Style::default().fg(Color::Yellow),
-                InteractiveEntryKind::Directory => Style::default().fg(Color::Cyan),
-                InteractiveEntryKind::File => Style::default(),
-            };
-            ListItem::new(Line::from(Span::styled(entry.label.clone(), style)))
+            ListItem::new(Line::from(Span::styled(
+                entry.label.clone(),
+                interactive_entry_style(entry.kind),
+            )))
         })
         .collect::<Vec<_>>();
 
@@ -801,7 +852,11 @@ fn render_interactive(frame: &mut ratatui::Frame<'_>, app: &mut InteractiveApp) 
         InteractiveFocus::List => Style::default(),
         InteractiveFocus::Preview => Style::default().fg(Color::Green),
     };
-    let preview = Paragraph::new(app.preview.as_str())
+    let preview_text = match &app.preview {
+        InteractivePreviewContent::Plain(value) => Text::from(value.as_str()),
+        InteractivePreviewContent::Lines(lines) => Text::from(lines.clone()),
+    };
+    let preview = Paragraph::new(preview_text)
         .block(
             Block::default()
                 .title(format!(" {} ", selected_preview_title(app)))
@@ -5421,19 +5476,23 @@ mod tests {
             .iter()
             .position(|entry| entry.label == "image.jpg")
             .expect("image entry should exist");
-        app.preview = "previous preview".to_string();
+        app.preview = InteractivePreviewContent::plain("previous preview");
         app.request_preview_for_selection();
 
         assert!(app.preview_loading);
         assert!(!app.preview_loading_visible);
-        assert_eq!(app.preview, "previous preview");
+        assert_eq!(app.preview.as_plain(), Some("previous preview"));
 
         let result = preview_result_for_selected(&app, "<No EXIF metadata found>");
         app.apply_preview_result(result);
 
         assert!(!app.preview_loading);
         assert!(!app.preview_loading_visible);
-        assert!(app.preview.contains("<No EXIF metadata found>"));
+        assert!(
+            app.preview
+                .as_plain()
+                .is_some_and(|preview| preview.contains("<No EXIF metadata found>"))
+        );
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -5579,10 +5638,12 @@ mod tests {
 
         let mut app = InteractiveApp::new(&directory).expect("app should initialize");
         app.focus = InteractiveFocus::Preview;
-        app.preview = (0..20)
-            .map(|index| format!("line {index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        app.preview = InteractivePreviewContent::plain(
+            (0..20)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         app.set_preview_viewport(80, 5);
         let selected = app.selected;
 
@@ -5640,10 +5701,12 @@ mod tests {
 
         let mut app = InteractiveApp::new(&directory).expect("app should initialize");
         app.focus = InteractiveFocus::Preview;
-        app.preview = (0..12)
-            .map(|index| format!("line {index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        app.preview = InteractivePreviewContent::plain(
+            (0..12)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         app.set_preview_viewport(80, 5);
 
         app.handle_event(key_event(KeyCode::PageDown, KeyEventKind::Press))
@@ -5695,7 +5758,7 @@ mod tests {
 
         assert!(!app.preview_loading);
         assert!(!app.preview_loading_visible);
-        assert_eq!(app.preview, "ready preview");
+        assert_eq!(app.preview.as_plain(), Some("ready preview"));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -5722,7 +5785,7 @@ mod tests {
             .iter()
             .position(|entry| entry.label == "b.jpg")
             .expect("second image entry should exist");
-        app.preview = "previous preview".to_string();
+        app.preview = InteractivePreviewContent::plain("previous preview");
         app.request_preview_for_selection();
         let previous_preview = app.preview.clone();
 
@@ -5746,14 +5809,28 @@ mod tests {
             .expect("text file should be written");
 
         let preview = render_directory_preview(&directory);
+        let lines = preview
+            .as_lines()
+            .expect("directory preview should render styled lines");
 
-        assert!(!preview.contains("Contents:"));
-        assert!(!preview.contains("../"));
-        assert!(!preview.contains("Folder"));
-        assert!(!preview.contains("Parent directory"));
-        assert!(preview.contains("nested/"));
-        assert!(preview.contains("image.jpg"));
-        assert!(!preview.contains("notes.txt"));
+        assert!(line_text(&lines[0]).is_empty());
+        assert_eq!(line_text(&lines[1]), "nested/");
+        assert_eq!(
+            lines[1].spans[0].style,
+            interactive_entry_style(InteractiveEntryKind::Directory)
+        );
+        assert_eq!(line_text(&lines[2]), "image.jpg");
+        assert_eq!(
+            lines[2].spans[0].style,
+            interactive_entry_style(InteractiveEntryKind::File)
+        );
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(!rendered.contains(&display_path(&directory)));
+        assert!(!rendered.contains("Contents:"));
+        assert!(!rendered.contains("../"));
+        assert!(!rendered.contains("Folder"));
+        assert!(!rendered.contains("Parent directory"));
+        assert!(!rendered.contains("notes.txt"));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -5763,8 +5840,16 @@ mod tests {
         let directory = temporary_test_directory("interactive-empty-directory-preview");
 
         let preview = render_directory_preview(&directory);
+        let lines = preview
+            .as_lines()
+            .expect("directory preview should render styled lines");
 
-        assert_eq!(preview, "<No directories or photos in this directory>");
+        assert_eq!(lines.len(), 2);
+        assert!(line_text(&lines[0]).is_empty());
+        assert_eq!(
+            line_text(&lines[1]),
+            "<No directories or photos in this directory>"
+        );
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -5814,22 +5899,26 @@ mod tests {
             .iter()
             .position(|entry| entry.label == "image.jpg")
             .expect("image entry should exist");
-        app.preview = "previous preview".to_string();
+        app.preview = InteractivePreviewContent::plain("previous preview");
         app.request_preview_for_selection();
 
         app.tick_preview_spinner();
         assert!(!app.preview_loading_visible);
-        assert_eq!(app.preview, "previous preview");
+        assert_eq!(app.preview.as_plain(), Some("previous preview"));
 
         app.preview_loading_deadline = Some(Instant::now());
         app.tick_preview_spinner();
 
         assert!(app.preview_loading_visible);
-        assert!(app.preview.contains("Reading EXIF preview"));
-        assert!(app.preview.starts_with(app.preview_spinner.frame()));
-        assert!(!app.preview.contains("image.jpg"));
-        assert!(!app.preview.contains(&display_path(&directory)));
-        assert!(!app.preview.contains("\n\n"));
+        let preview = app
+            .preview
+            .as_plain()
+            .expect("loading preview should be plain text");
+        assert!(preview.contains("Reading EXIF preview"));
+        assert!(preview.starts_with(app.preview_spinner.frame()));
+        assert!(!preview.contains("image.jpg"));
+        assert!(!preview.contains(&display_path(&directory)));
+        assert!(!preview.contains("\n\n"));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -5851,8 +5940,15 @@ mod tests {
             request_id: app.preview_request_id,
             kind: entry.kind,
             path: entry.path.clone(),
-            preview: preview.to_string(),
+            preview: InteractivePreviewContent::plain(preview),
         }
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
     }
 
     #[test]
