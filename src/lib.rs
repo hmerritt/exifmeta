@@ -177,7 +177,7 @@ fn interactive_command(args: InteractiveArgs) -> Result<(), String> {
     loop {
         terminal
             .terminal
-            .draw(|frame| render_interactive(frame, &app))
+            .draw(|frame| render_interactive(frame, &mut app))
             .map_err(|error| format!("failed to draw interactive UI: {error}"))?;
 
         let event =
@@ -226,6 +226,15 @@ struct InteractiveApp {
     selected: usize,
     preview: String,
     preview_scroll: u16,
+    preview_viewport_width: u16,
+    preview_viewport_height: u16,
+    focus: InteractiveFocus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveFocus {
+    List,
+    Preview,
 }
 
 impl InteractiveApp {
@@ -246,6 +255,9 @@ impl InteractiveApp {
             selected: 0,
             preview: String::new(),
             preview_scroll: 0,
+            preview_viewport_width: 0,
+            preview_viewport_height: 0,
+            focus: InteractiveFocus::List,
         };
         app.refresh_preview();
         Ok(app)
@@ -267,12 +279,32 @@ impl InteractiveApp {
                 ..
             }
             | KeyEvent {
-                code: KeyCode::Esc, ..
-            }
-            | KeyEvent {
                 code: KeyCode::Char('q'),
                 ..
             } => Ok(true),
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                if self.focus == InteractiveFocus::Preview {
+                    self.focus = InteractiveFocus::List;
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            }
+            _ => self.handle_focused_key(key),
+        }
+    }
+
+    fn handle_focused_key(&mut self, key: KeyEvent) -> Result<bool, String> {
+        match self.focus {
+            InteractiveFocus::List => self.handle_list_key(key),
+            InteractiveFocus::Preview => Ok(self.handle_preview_key(key)),
+        }
+    }
+
+    fn handle_list_key(&mut self, key: KeyEvent) -> Result<bool, String> {
+        match key {
             KeyEvent {
                 code: KeyCode::Up, ..
             } => {
@@ -294,7 +326,7 @@ impl InteractiveApp {
                 code: KeyCode::Enter,
                 ..
             } => {
-                self.open_selected()?;
+                self.focus_preview_if_file_or_open_selected()?;
                 Ok(false)
             }
             KeyEvent {
@@ -308,28 +340,60 @@ impl InteractiveApp {
                 self.open_parent()?;
                 Ok(false)
             }
+            _ => Ok(false),
+        }
+    }
+
+    fn handle_preview_key(&mut self, key: KeyEvent) -> bool {
+        match key {
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => {
+                self.scroll_preview_by(-1);
+                false
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => {
+                self.scroll_preview_by(1);
+                false
+            }
             KeyEvent {
                 code: KeyCode::PageUp,
                 ..
             } => {
-                self.preview_scroll = self.preview_scroll.saturating_sub(8);
-                Ok(false)
+                self.scroll_preview_by(-8);
+                false
             }
             KeyEvent {
                 code: KeyCode::PageDown,
                 ..
             } => {
-                self.preview_scroll = self.preview_scroll.saturating_add(8);
-                Ok(false)
+                self.scroll_preview_by(8);
+                false
             }
             KeyEvent {
                 code: KeyCode::Home,
                 ..
             } => {
-                self.preview_scroll = 0;
-                Ok(false)
+                self.scroll_preview_to_top();
+                false
             }
-            _ => Ok(false),
+            KeyEvent {
+                code: KeyCode::End, ..
+            } => {
+                self.scroll_preview_to_bottom();
+                false
+            }
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
+            } => {
+                self.focus = InteractiveFocus::List;
+                false
+            }
+            _ => false,
         }
     }
 
@@ -360,6 +424,20 @@ impl InteractiveApp {
         }
     }
 
+    fn focus_preview_if_file_or_open_selected(&mut self) -> Result<(), String> {
+        let Some(entry) = self.entries.get(self.selected) else {
+            return Ok(());
+        };
+
+        match entry.kind {
+            InteractiveEntryKind::Parent | InteractiveEntryKind::Directory => self.open_selected(),
+            InteractiveEntryKind::File => {
+                self.focus = InteractiveFocus::Preview;
+                Ok(())
+            }
+        }
+    }
+
     fn open_parent(&mut self) -> Result<(), String> {
         let Some(parent) = self.current_dir.parent() else {
             return Ok(());
@@ -373,17 +451,50 @@ impl InteractiveApp {
         })?;
         self.entries = interactive_entries(&self.current_dir)?;
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
-        self.preview_scroll = 0;
         self.refresh_preview();
         Ok(())
     }
 
     fn refresh_preview(&mut self) {
         self.preview_scroll = 0;
+        self.focus = InteractiveFocus::List;
         self.preview = match self.entries.get(self.selected) {
             Some(entry) => interactive_preview(entry),
             None => "No supported image files or folders found.".to_string(),
         };
+    }
+
+    fn set_preview_viewport(&mut self, width: u16, height: u16) {
+        self.preview_viewport_width = width;
+        self.preview_viewport_height = height;
+        self.clamp_preview_scroll();
+    }
+
+    fn scroll_preview_by(&mut self, lines: i16) {
+        if lines.is_negative() {
+            self.preview_scroll = self.preview_scroll.saturating_sub(lines.unsigned_abs());
+        } else {
+            self.preview_scroll = self.preview_scroll.saturating_add(lines as u16);
+        }
+        self.clamp_preview_scroll();
+    }
+
+    fn scroll_preview_to_top(&mut self) {
+        self.preview_scroll = 0;
+    }
+
+    fn scroll_preview_to_bottom(&mut self) {
+        self.preview_scroll = self.max_preview_scroll();
+    }
+
+    fn clamp_preview_scroll(&mut self) {
+        self.preview_scroll = self.preview_scroll.min(self.max_preview_scroll());
+    }
+
+    fn max_preview_scroll(&self) -> u16 {
+        rendered_line_count(&self.preview, self.preview_viewport_width)
+            .saturating_sub(usize::from(self.preview_viewport_height))
+            .min(usize::from(u16::MAX)) as u16
     }
 }
 
@@ -450,10 +561,7 @@ fn interactive_entries(directory: &Path) -> Result<Vec<InteractiveEntry>, String
 fn interactive_preview(entry: &InteractiveEntry) -> String {
     match entry.kind {
         InteractiveEntryKind::Parent => format!("Parent directory\n\n{}", entry.path.display()),
-        InteractiveEntryKind::Directory => format!(
-            "Folder\n\n{}\n\nPress Right or Enter to open.",
-            entry.path.display()
-        ),
+        InteractiveEntryKind::Directory => format!("Folder\n\n{}", entry.path.display()),
         InteractiveEntryKind::File => inspect_preview(&entry.path),
     }
 }
@@ -469,7 +577,7 @@ fn inspect_preview(image: &Path) -> String {
     }
 }
 
-fn render_interactive(frame: &mut ratatui::Frame<'_>, app: &InteractiveApp) {
+fn render_interactive(frame: &mut ratatui::Frame<'_>, app: &mut InteractiveApp) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
@@ -508,11 +616,37 @@ fn render_interactive(frame: &mut ratatui::Frame<'_>, app: &InteractiveApp) {
         .highlight_symbol("> ");
     frame.render_stateful_widget(files, chunks[0], &mut list_state);
 
+    let preview_inner_width = chunks[1].width.saturating_sub(2);
+    let preview_inner_height = chunks[1].height.saturating_sub(2);
+    app.set_preview_viewport(preview_inner_width, preview_inner_height);
+
+    let preview_block_style = match app.focus {
+        InteractiveFocus::List => Style::default(),
+        InteractiveFocus::Preview => Style::default().fg(Color::Green),
+    };
     let preview = Paragraph::new(app.preview.as_str())
-        .block(Block::default().title(" Inspect ").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(" Inspect ")
+                .borders(Borders::ALL)
+                .border_style(preview_block_style),
+        )
         .scroll((app.preview_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(preview, chunks[1]);
+}
+
+fn rendered_line_count(value: &str, width: u16) -> usize {
+    let width = usize::from(width);
+    if width == 0 {
+        return value.lines().count().max(1);
+    }
+
+    value
+        .split('\n')
+        .map(|line| line.chars().count().max(1).div_ceil(width))
+        .sum::<usize>()
+        .max(1)
 }
 
 fn strip_ansi_codes(value: &str) -> String {
@@ -5221,6 +5355,124 @@ mod tests {
         app.handle_event(key_event(KeyCode::Left, KeyEventKind::Press))
             .expect("left press should open parent");
         assert_eq!(app.current_dir, fs::canonicalize(&directory).unwrap());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_right_on_file_focuses_preview_without_changing_directory() {
+        let directory = temporary_test_directory("interactive-file-focus");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "image.jpg")
+            .expect("image entry should exist");
+        app.refresh_preview();
+        let start_dir = app.current_dir.clone();
+
+        app.handle_event(key_event(KeyCode::Right, KeyEventKind::Press))
+            .expect("right press should focus preview");
+
+        assert_eq!(app.current_dir, start_dir);
+        assert_eq!(app.focus, InteractiveFocus::Preview);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_preview_focus_scrolls_instead_of_moving_selection() {
+        let directory = temporary_test_directory("interactive-preview-scroll");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        app.focus = InteractiveFocus::Preview;
+        app.preview = (0..20)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.set_preview_viewport(80, 5);
+        let selected = app.selected;
+
+        app.handle_event(key_event(KeyCode::Down, KeyEventKind::Press))
+            .expect("down press should scroll preview");
+
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.preview_scroll, 1);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_left_returns_preview_focus_to_list() {
+        let directory = temporary_test_directory("interactive-preview-left");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        app.focus = InteractiveFocus::Preview;
+
+        app.handle_event(key_event(KeyCode::Left, KeyEventKind::Press))
+            .expect("left press should return focus to list");
+
+        assert_eq!(app.focus, InteractiveFocus::List);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_selection_change_resets_preview_focus_and_scroll() {
+        let directory = temporary_test_directory("interactive-selection-focus-reset");
+        std::fs::write(directory.join("a.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("first jpg should be written");
+        std::fs::write(directory.join("b.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("second jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        app.focus = InteractiveFocus::Preview;
+        app.preview_scroll = 4;
+
+        app.select_next();
+
+        assert_eq!(app.focus, InteractiveFocus::List);
+        assert_eq!(app.preview_scroll, 0);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_preview_scroll_clamps_to_viewport() {
+        let directory = temporary_test_directory("interactive-scroll-clamp");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory).expect("app should initialize");
+        app.focus = InteractiveFocus::Preview;
+        app.preview = (0..12)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.set_preview_viewport(80, 5);
+
+        app.handle_event(key_event(KeyCode::PageDown, KeyEventKind::Press))
+            .expect("page down should scroll preview");
+        app.handle_event(key_event(KeyCode::PageDown, KeyEventKind::Press))
+            .expect("page down should clamp preview");
+        assert_eq!(app.preview_scroll, 7);
+
+        app.handle_event(key_event(KeyCode::End, KeyEventKind::Press))
+            .expect("end should scroll to bottom");
+        assert_eq!(app.preview_scroll, 7);
+
+        app.handle_event(key_event(KeyCode::PageUp, KeyEventKind::Press))
+            .expect("page up should scroll preview");
+        app.handle_event(key_event(KeyCode::PageUp, KeyEventKind::Press))
+            .expect("page up should clamp preview");
+        assert_eq!(app.preview_scroll, 0);
 
         let _ = std::fs::remove_dir_all(directory);
     }
