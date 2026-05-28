@@ -5,7 +5,7 @@ use clap::Parser;
 fn main() -> ExitCode {
     let cli = exifmeta::Cli::parse();
 
-    match exifmeta::run(cli) {
+    match exifmeta::write(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(exifmeta::CliError::Error(error)) => {
             eprintln!("error: {error}");

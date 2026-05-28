@@ -39,8 +39,7 @@ pub mod cli;
 pub mod version;
 
 pub use cli::{
-    Cli, Command, InitArgs, InspectArgs, InspectFormat, InteractiveArgs, RunArgs, StripArgs,
-    ValidateArgs,
+    CheckArgs, Cli, Command, InteractiveArgs, NewArgs, ReadArgs, ReadFormat, StripArgs, WriteArgs,
 };
 
 const GEONAMES_DATABASE: &[u8] = include_bytes!("../assets/geonames/cities1000.sqlite");
@@ -137,7 +136,7 @@ impl From<String> for CliError {
     }
 }
 
-pub fn run(cli: Cli) -> Result<(), CliError> {
+pub fn write(cli: Cli) -> Result<(), CliError> {
     if !matches!(
         &cli.command,
         Command::Strip(args) if args.json
@@ -147,23 +146,23 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
     }
 
     match cli.command {
-        Command::Run(args) => run_command(cli.dry_run, args).map_err(Into::into),
-        Command::Init(args) => init_command(cli.dry_run, args),
-        Command::Validate(args) => validate_command(args),
-        Command::Inspect(args) => inspect_command(args).map_err(Into::into),
+        Command::Write(args) => write_command(cli.dry_run, args).map_err(Into::into),
+        Command::New(args) => new_command(cli.dry_run, args),
+        Command::Check(args) => check_command(args),
+        Command::Read(args) => read_command(args).map_err(Into::into),
         Command::Interactive(args) => interactive_command(args).map_err(Into::into),
         Command::Strip(args) => strip_command(cli.dry_run, args),
     }
 }
 
-fn inspect_command(args: InspectArgs) -> Result<(), String> {
+fn read_command(args: ReadArgs) -> Result<(), String> {
     let image = args.image;
-    validate_image_path(&image)?;
+    check_image_path(&image)?;
 
     let progress = TerminalSpinner::start(SpinnerPreset::random(), "reading exif".to_string());
     let metadata = read_metadata(&image);
     let metadata = metadata?;
-    let output = format_inspect_output(&image, &metadata, args.format);
+    let output = format_read_output(&image, &metadata, args.format);
     progress.finish();
 
     println!("{output}");
@@ -725,22 +724,22 @@ fn interactive_preview(entry: &InteractiveEntry) -> InteractivePreviewContent {
         InteractiveEntryKind::Parent | InteractiveEntryKind::Directory => {
             render_directory_preview(&entry.path)
         }
-        InteractiveEntryKind::File => inspect_preview(&entry.path),
+        InteractiveEntryKind::File => read_preview(&entry.path),
     }
 }
 
-fn inspect_preview(image: &Path) -> InteractivePreviewContent {
+fn read_preview(image: &Path) -> InteractivePreviewContent {
     match read_metadata(image) {
         Ok(metadata) => {
-            let output = strip_windows_verbatim_prefixes(&format_inspect_output(
+            let output = strip_windows_verbatim_prefixes(&format_read_output(
                 image,
                 &metadata,
-                InspectFormat::Pretty,
+                ReadFormat::Pretty,
             ));
             InteractivePreviewContent::Lines(ansi_to_preview_lines(&output))
         }
         Err(error) => InteractivePreviewContent::plain(format!(
-            "Failed to inspect {}\n\n{error}",
+            "Failed to read {}\n\n{error}",
             display_path(image)
         )),
     }
@@ -853,7 +852,7 @@ fn strip_windows_verbatim_prefixes(value: &str) -> String {
 fn selected_preview_title(app: &InteractiveApp) -> &'static str {
     match app.entries.get(app.selected).map(|entry| entry.kind) {
         Some(InteractiveEntryKind::Parent | InteractiveEntryKind::Directory) => "Directory",
-        Some(InteractiveEntryKind::File) | None => "Inspect",
+        Some(InteractiveEntryKind::File) | None => "Read",
     }
 }
 
@@ -939,7 +938,7 @@ fn rendered_line_count(value: &str, width: u16) -> usize {
         .max(1)
 }
 
-fn read_metadata(image: &Path) -> Result<InspectMetadata, String> {
+fn read_metadata(image: &Path) -> Result<ReadMetadata, String> {
     let file = File::open(image)
         .map_err(|error| format!("failed to open {}: {error}", image.display()))?;
     let mut reader = BufReader::new(file);
@@ -961,9 +960,9 @@ fn read_metadata(image: &Path) -> Result<InspectMetadata, String> {
             )
         })?;
 
-    let file_info = InspectFileInfo::from_path(image, &exif)?;
+    let file_info = ReadFileInfo::from_path(image, &exif)?;
 
-    Ok(InspectMetadata {
+    Ok(ReadMetadata {
         exif,
         warnings,
         file_info,
@@ -978,17 +977,17 @@ fn empty_exif() -> Exif {
         .expect("embedded empty EXIF should parse")
 }
 
-struct InspectMetadata {
+struct ReadMetadata {
     exif: Exif,
     warnings: Vec<String>,
-    file_info: InspectFileInfo,
+    file_info: ReadFileInfo,
 }
 
-struct InspectFileInfo {
-    rows: Vec<InspectInfoRow>,
+struct ReadFileInfo {
+    rows: Vec<ReadInfoRow>,
 }
 
-impl InspectFileInfo {
+impl ReadFileInfo {
     fn from_path(image: &Path, exif: &Exif) -> Result<Self, String> {
         let metadata = fs::metadata(image).map_err(|error| {
             format!(
@@ -999,45 +998,42 @@ impl InspectFileInfo {
         let file_kind = detect_file_kind(image);
         let mut rows = Vec::new();
 
-        rows.push(InspectInfoRow::new("File Name", file_name(image)));
-        rows.push(InspectInfoRow::new("Directory", directory_name(image)));
-        rows.push(InspectInfoRow::new(
+        rows.push(ReadInfoRow::new("File Name", file_name(image)));
+        rows.push(ReadInfoRow::new("Directory", directory_name(image)));
+        rows.push(ReadInfoRow::new(
             "File Size",
             format_file_size(metadata.len()),
         ));
 
         if let Ok(modified) = metadata.modified() {
-            rows.push(InspectInfoRow::new(
+            rows.push(ReadInfoRow::new(
                 "File Modification Date/Time",
                 format_system_time(modified),
             ));
         }
 
         if let Ok(accessed) = metadata.accessed() {
-            rows.push(InspectInfoRow::new(
+            rows.push(ReadInfoRow::new(
                 "File Access Date/Time",
                 format_system_time(accessed),
             ));
         }
 
         if let Ok(created) = metadata.created() {
-            rows.push(InspectInfoRow::new(
+            rows.push(ReadInfoRow::new(
                 "File Creation Date/Time",
                 format_system_time(created),
             ));
         }
 
-        rows.push(InspectInfoRow::new(
+        rows.push(ReadInfoRow::new(
             "File Permissions",
             format_permissions(&metadata),
         ));
-        rows.push(InspectInfoRow::new("File Type", file_kind.file_type));
-        rows.push(InspectInfoRow::new(
-            "File Type Extension",
-            file_kind.extension,
-        ));
-        rows.push(InspectInfoRow::new("MIME Type", file_kind.mime_type));
-        rows.push(InspectInfoRow::new(
+        rows.push(ReadInfoRow::new("File Type", file_kind.file_type));
+        rows.push(ReadInfoRow::new("File Type Extension", file_kind.extension));
+        rows.push(ReadInfoRow::new("MIME Type", file_kind.mime_type));
+        rows.push(ReadInfoRow::new(
             "Exif Byte Order",
             format_exif_byte_order(exif),
         ));
@@ -1051,12 +1047,12 @@ impl InspectFileInfo {
     }
 }
 
-struct InspectInfoRow {
+struct ReadInfoRow {
     name: String,
     value: String,
 }
 
-impl InspectInfoRow {
+impl ReadInfoRow {
     fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -1065,7 +1061,7 @@ impl InspectInfoRow {
     }
 }
 
-fn validate_image_path(image: &Path) -> Result<(), String> {
+fn check_image_path(image: &Path) -> Result<(), String> {
     if !image.exists() {
         return Err(format!("image does not exist: {}", image.display()));
     }
@@ -1077,11 +1073,7 @@ fn validate_image_path(image: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn format_inspect_output(
-    _image: &Path,
-    metadata: &InspectMetadata,
-    format: InspectFormat,
-) -> String {
+fn format_read_output(_image: &Path, metadata: &ReadMetadata, format: ReadFormat) -> String {
     let mut output = String::new();
     let mut warnings = metadata.warnings.clone();
     let custom_tags = custom_tags_from_exif(&metadata.exif);
@@ -1089,18 +1081,18 @@ fn format_inspect_output(
         .exif
         .fields()
         .filter(|field| {
-            matches!(format, InspectFormat::Raw) || !is_exifmeta_custom_payload_field(field)
+            matches!(format, ReadFormat::Raw) || !is_exifmeta_custom_payload_field(field)
         })
-        .map(|field| InspectRow::from_field(field, &metadata.exif, format))
+        .map(|field| ReadRow::from_field(field, &metadata.exif, format))
         .collect::<Vec<_>>();
 
     if rows.is_empty() && custom_tags.is_empty() {
         output.push_str(&format_empty_exif_message(format));
     } else {
-        sort_inspect_rows(&mut rows);
+        sort_read_rows(&mut rows);
 
         match format {
-            InspectFormat::Pretty => append_pretty_inspect_rows(
+            ReadFormat::Pretty => append_pretty_read_rows(
                 &mut output,
                 &metadata.file_info.rows,
                 &rows,
@@ -1108,7 +1100,7 @@ fn format_inspect_output(
                 &metadata.exif,
                 &mut warnings,
             ),
-            InspectFormat::Raw => append_raw_inspect_rows(&mut output, &rows),
+            ReadFormat::Raw => append_raw_read_rows(&mut output, &rows),
         }
 
         output = output.trim_end().to_string();
@@ -1125,14 +1117,14 @@ fn format_inspect_output(
     output
 }
 
-fn format_empty_exif_message(format: InspectFormat) -> String {
+fn format_empty_exif_message(format: ReadFormat) -> String {
     match format {
-        InspectFormat::Pretty => "<No EXIF metadata found>".yellow().to_string(),
-        InspectFormat::Raw => "<No EXIF metadata found>".to_string(),
+        ReadFormat::Pretty => "<No EXIF metadata found>".yellow().to_string(),
+        ReadFormat::Raw => "<No EXIF metadata found>".to_string(),
     }
 }
 
-fn sort_inspect_rows(rows: &mut [InspectRow]) {
+fn sort_read_rows(rows: &mut [ReadRow]) {
     rows.sort_by(|left, right| {
         left.is_unknown
             .cmp(&right.is_unknown)
@@ -1143,7 +1135,7 @@ fn sort_inspect_rows(rows: &mut [InspectRow]) {
     });
 }
 
-fn append_raw_inspect_rows(output: &mut String, rows: &[InspectRow]) {
+fn append_raw_read_rows(output: &mut String, rows: &[ReadRow]) {
     let context_width = rows.iter().map(|row| row.context.len()).max().unwrap_or(0);
     let name_width = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
 
@@ -1155,28 +1147,26 @@ fn append_raw_inspect_rows(output: &mut String, rows: &[InspectRow]) {
     }
 }
 
-fn append_pretty_inspect_rows(
+fn append_pretty_read_rows(
     output: &mut String,
-    info_rows: &[InspectInfoRow],
-    rows: &[InspectRow],
+    info_rows: &[ReadInfoRow],
+    rows: &[ReadRow],
     custom_tags: &[CustomTag],
     exif: &Exif,
     warnings: &mut Vec<String>,
 ) {
-    let mut pretty_rows = pretty_inspect_rows(info_rows, rows, custom_tags);
+    let mut pretty_rows = pretty_read_rows(info_rows, rows, custom_tags);
     append_nearest_location_rows(&mut pretty_rows, exif, warnings);
     pretty_rows.sort_by(|left, right| {
         left.group
             .output_order()
             .cmp(&right.group.output_order())
-            .then_with(|| {
-                pretty_inspect_row_sort_label(left).cmp(&pretty_inspect_row_sort_label(right))
-            })
+            .then_with(|| pretty_read_row_sort_label(left).cmp(&pretty_read_row_sort_label(right)))
             .then(left.value.cmp(&right.value))
     });
 
     let mut first_group = true;
-    for group in PrettyInspectGroup::OUTPUT_ORDER {
+    for group in PrettyReadGroup::OUTPUT_ORDER {
         let group_rows = pretty_rows
             .iter()
             .filter(|row| row.group == group)
@@ -1191,7 +1181,7 @@ fn append_pretty_inspect_rows(
         }
         first_group = false;
 
-        append_validate_heading(output, group.label());
+        append_check_heading(output, group.label());
 
         let name_width = group_rows
             .iter()
@@ -1206,7 +1196,7 @@ fn append_pretty_inspect_rows(
     }
 }
 
-fn pretty_inspect_row_sort_label(row: &PrettyInspectRow) -> String {
+fn pretty_read_row_sort_label(row: &PrettyReadRow) -> String {
     if let Some(suffix) = row.label.strip_prefix("GPS Nearest Location ") {
         format!("GPS Nearest 0 Location {suffix}")
     } else if row.label == "GPS Nearest City" {
@@ -1216,14 +1206,14 @@ fn pretty_inspect_row_sort_label(row: &PrettyInspectRow) -> String {
     }
 }
 
-fn pretty_inspect_rows(
-    info_rows: &[InspectInfoRow],
-    rows: &[InspectRow],
+fn pretty_read_rows(
+    info_rows: &[ReadInfoRow],
+    rows: &[ReadRow],
     custom_tags: &[CustomTag],
-) -> Vec<PrettyInspectRow> {
+) -> Vec<PrettyReadRow> {
     let mut pretty_rows = info_rows
         .iter()
-        .map(|row| PrettyInspectRow {
+        .map(|row| PrettyReadRow {
             group: classify_info_row(row),
             label: row.name.clone(),
             label_color: None,
@@ -1235,14 +1225,14 @@ fn pretty_inspect_rows(
     let iso_speed_values = rows
         .iter()
         .filter(|row| !is_pretty_omitted_row(row) && row.name == "ISOSpeed")
-        .map(pretty_inspect_value)
+        .map(pretty_read_value)
         .collect::<HashSet<_>>();
     for row in rows {
         if is_pretty_omitted_row(row) {
             continue;
         }
 
-        let value = pretty_inspect_value(row);
+        let value = pretty_read_value(row);
         if is_duplicate_photographic_sensitivity(row, &value, &iso_speed_values) {
             continue;
         }
@@ -1253,7 +1243,7 @@ fn pretty_inspect_rows(
             continue;
         }
 
-        pretty_rows.push(PrettyInspectRow {
+        pretty_rows.push(PrettyReadRow {
             group: classify_exif_row(row),
             label: row.pretty_name.clone(),
             label_color: None,
@@ -1262,8 +1252,8 @@ fn pretty_inspect_rows(
     }
 
     for tag in custom_tags {
-        pretty_rows.push(PrettyInspectRow {
-            group: PrettyInspectGroup::Custom,
+        pretty_rows.push(PrettyReadRow {
+            group: PrettyReadGroup::Custom,
             label: title_case_tag_name(&tag.name),
             label_color: None,
             value: custom_tag_value_label(&tag.value),
@@ -1274,14 +1264,14 @@ fn pretty_inspect_rows(
 }
 
 fn is_duplicate_photographic_sensitivity(
-    row: &InspectRow,
+    row: &ReadRow,
     value: &str,
     iso_speed_values: &HashSet<String>,
 ) -> bool {
     row.name == "PhotographicSensitivity" && iso_speed_values.contains(value)
 }
 
-fn is_pretty_omitted_row(row: &InspectRow) -> bool {
+fn is_pretty_omitted_row(row: &ReadRow) -> bool {
     if row.is_unknown {
         return true;
     }
@@ -1293,7 +1283,7 @@ fn is_pretty_omitted_row(row: &InspectRow) -> bool {
 }
 
 fn append_nearest_location_rows(
-    pretty_rows: &mut Vec<PrettyInspectRow>,
+    pretty_rows: &mut Vec<PrettyReadRow>,
     exif: &Exif,
     warnings: &mut Vec<String>,
 ) {
@@ -1328,13 +1318,13 @@ fn append_nearest_location_rows(
 }
 
 fn append_location_rows(
-    pretty_rows: &mut Vec<PrettyInspectRow>,
+    pretty_rows: &mut Vec<PrettyReadRow>,
     label_prefix: &str,
     locations: &[GeoLocation],
 ) {
     for (index, location) in locations.iter().enumerate() {
-        pretty_rows.push(PrettyInspectRow {
-            group: PrettyInspectGroup::Gps,
+        pretty_rows.push(PrettyReadRow {
+            group: PrettyReadGroup::Gps,
             label: format!("{} {}", label_prefix, index + 1),
             label_color: Some(PrettyLabelColor::Green),
             value: format!(
@@ -1348,7 +1338,7 @@ fn append_location_rows(
 }
 
 fn append_non_duplicate_location_rows(
-    pretty_rows: &mut Vec<PrettyInspectRow>,
+    pretty_rows: &mut Vec<PrettyReadRow>,
     label: &str,
     locations: Vec<GeoLocation>,
     existing_locations: &[GeoLocation],
@@ -1363,13 +1353,9 @@ fn append_non_duplicate_location_rows(
     }
 }
 
-fn append_location_row(
-    pretty_rows: &mut Vec<PrettyInspectRow>,
-    label: &str,
-    location: &GeoLocation,
-) {
-    pretty_rows.push(PrettyInspectRow {
-        group: PrettyInspectGroup::Gps,
+fn append_location_row(pretty_rows: &mut Vec<PrettyReadRow>, label: &str, location: &GeoLocation) {
+    pretty_rows.push(PrettyReadRow {
+        group: PrettyReadGroup::Gps,
         label: label.to_string(),
         label_color: Some(PrettyLabelColor::Green),
         value: format!(
@@ -1403,8 +1389,8 @@ fn gps_coordinates(exif: &Exif) -> Option<(f64, f64)> {
     }
 }
 
-struct PrettyInspectRow {
-    group: PrettyInspectGroup,
+struct PrettyReadRow {
+    group: PrettyReadGroup,
     label: String,
     label_color: Option<PrettyLabelColor>,
     value: String,
@@ -1415,7 +1401,7 @@ enum PrettyLabelColor {
     Green,
 }
 
-impl PrettyInspectRow {
+impl PrettyReadRow {
     fn styled_label(&self) -> String {
         match self.label_color {
             Some(PrettyLabelColor::Green) => self.label.green().to_string(),
@@ -1425,7 +1411,7 @@ impl PrettyInspectRow {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PrettyInspectGroup {
+enum PrettyReadGroup {
     File,
     Camera,
     Film,
@@ -1435,7 +1421,7 @@ enum PrettyInspectGroup {
     Misc,
 }
 
-impl PrettyInspectGroup {
+impl PrettyReadGroup {
     const OUTPUT_ORDER: [Self; 7] = [
         Self::File,
         Self::Camera,
@@ -1471,7 +1457,7 @@ impl PrettyInspectGroup {
     }
 }
 
-fn classify_info_row(row: &InspectInfoRow) -> PrettyInspectGroup {
+fn classify_info_row(row: &ReadInfoRow) -> PrettyReadGroup {
     if normalized_label_matches(
         &row.name,
         &[
@@ -1487,37 +1473,37 @@ fn classify_info_row(row: &InspectInfoRow) -> PrettyInspectGroup {
             "mimetype",
         ],
     ) {
-        PrettyInspectGroup::File
+        PrettyReadGroup::File
     } else {
-        PrettyInspectGroup::Misc
+        PrettyReadGroup::Misc
     }
 }
 
-fn classify_exif_row(row: &InspectRow) -> PrettyInspectGroup {
+fn classify_exif_row(row: &ReadRow) -> PrettyReadGroup {
     if row.context == "Gps"
         || normalized_label_starts_with(&row.name, &["gps"])
         || normalized_label_starts_with(&row.pretty_name, &["gps"])
     {
-        return PrettyInspectGroup::Gps;
+        return PrettyReadGroup::Gps;
     }
 
     if is_film_label(&row.name) || is_film_label(&row.pretty_name) {
-        return PrettyInspectGroup::Film;
+        return PrettyReadGroup::Film;
     }
 
     if is_exposure_label(&row.name) || is_exposure_label(&row.pretty_name) {
-        return PrettyInspectGroup::Exposure;
+        return PrettyReadGroup::Exposure;
     }
 
     if is_camera_label(&row.name) || is_camera_label(&row.pretty_name) {
-        return PrettyInspectGroup::Camera;
+        return PrettyReadGroup::Camera;
     }
 
     if is_file_label(&row.name) || is_file_label(&row.pretty_name) {
-        return PrettyInspectGroup::File;
+        return PrettyReadGroup::File;
     }
 
-    PrettyInspectGroup::Misc
+    PrettyReadGroup::Misc
 }
 
 fn is_file_label(label: &str) -> bool {
@@ -1603,7 +1589,7 @@ fn normalized_label_starts_with(label: &str, prefixes: &[&str]) -> bool {
     prefixes.iter().any(|prefix| label.starts_with(prefix))
 }
 
-fn pretty_inspect_value(row: &InspectRow) -> String {
+fn pretty_read_value(row: &ReadRow) -> String {
     if row.is_unknown && row.value.chars().count() > PRETTY_UNKNOWN_VALUE_DISPLAY_LIMIT {
         return pretty_unknown_value_omitted_message();
     }
@@ -1823,7 +1809,7 @@ fn format_exif_byte_order(exif: &Exif) -> &'static str {
     }
 }
 
-struct InspectRow {
+struct ReadRow {
     is_unknown: bool,
     ifd: usize,
     context: String,
@@ -1833,8 +1819,8 @@ struct InspectRow {
     value: String,
 }
 
-impl InspectRow {
-    fn from_field(field: &Field, exif: &Exif, format: InspectFormat) -> Self {
+impl ReadRow {
+    fn from_field(field: &Field, exif: &Exif, format: ReadFormat) -> Self {
         let is_unknown =
             field.tag.description().is_none() || matches!(field.value, Value::Unknown(..));
         let name = if is_unknown {
@@ -1875,8 +1861,8 @@ impl InspectRow {
     }
 }
 
-fn format_unknown_field_value(value: &Value, format: InspectFormat) -> String {
-    if matches!(format, InspectFormat::Pretty)
+fn format_unknown_field_value(value: &Value, format: ReadFormat) -> String {
+    if matches!(format, ReadFormat::Pretty)
         && unknown_value_payload_len(value)
             .is_some_and(|length| length > PRETTY_UNKNOWN_VALUE_DISPLAY_LIMIT)
     {
@@ -2378,19 +2364,19 @@ fn format_distance(distance_km: f64) -> String {
     }
 }
 
-fn init_command(dry_run: bool, args: InitArgs) -> Result<(), CliError> {
+fn new_command(dry_run: bool, args: NewArgs) -> Result<(), CliError> {
     let directory = args.path;
 
     if !directory.exists() {
         return Err(CliError::Error(format!(
-            "init path does not exist: {}",
+            "new path does not exist: {}",
             directory.display()
         )));
     }
 
     if !directory.is_dir() {
         return Err(CliError::Error(format!(
-            "init path is not a directory: {}",
+            "new path is not a directory: {}",
             directory.display()
         )));
     }
@@ -2412,7 +2398,7 @@ fn init_command(dry_run: bool, args: InitArgs) -> Result<(), CliError> {
 
     if dry_run {
         println!(
-            "init: would create {} (date={today}, frame_count={image_count})",
+            "new: would create {} (date={today}, frame_count={image_count})",
             metadata_path.display()
         );
         return Ok(());
@@ -2473,9 +2459,9 @@ fn is_supported_image_file(path: &Path) -> bool {
     detect_file_kind(path).file_type != "Unknown"
 }
 
-fn validate_command(args: ValidateArgs) -> Result<(), CliError> {
-    let output = build_validate_output(args.path.as_deref());
-    print_validate_output(&output);
+fn check_command(args: CheckArgs) -> Result<(), CliError> {
+    let output = build_check_output(args.path.as_deref());
+    print_check_output(&output);
 
     if output.error_count() == 0 {
         Ok(())
@@ -2484,8 +2470,8 @@ fn validate_command(args: ValidateArgs) -> Result<(), CliError> {
     }
 }
 
-fn build_validate_output(path: Option<&Path>) -> ValidateOutput {
-    let mut output = ValidateOutput::default();
+fn build_check_output(path: Option<&Path>) -> CheckOutput {
+    let mut output = CheckOutput::default();
     let resolution = match resolve_metadata_path(path) {
         Ok(resolution) => resolution,
         Err(error) => {
@@ -2522,7 +2508,7 @@ fn build_validate_output(path: Option<&Path>) -> ValidateOutput {
         }
     };
 
-    match validate_metadata_yaml(&resolution.path, &yaml) {
+    match check_metadata_yaml(&resolution.path, &yaml) {
         Ok(report) => {
             output.exif = Some(TagStageReport {
                 tags: report.exif_tags,
@@ -2537,7 +2523,7 @@ fn build_validate_output(path: Option<&Path>) -> ValidateOutput {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ValidateOutput {
+struct CheckOutput {
     metadata_path: Option<PathBuf>,
     yaml_ok: bool,
     file_warnings: Vec<String>,
@@ -2546,7 +2532,7 @@ struct ValidateOutput {
     frames: Option<FramesStageReport>,
 }
 
-impl ValidateOutput {
+impl CheckOutput {
     fn error_count(&self) -> usize {
         self.file_errors.len()
             + self.frames.as_ref().map_or(0, |frames| {
@@ -2586,28 +2572,24 @@ struct FramesStageReport {
     frames: Vec<FrameReport>,
 }
 
-fn print_validate_output(output: &ValidateOutput) {
-    print!("{}", format_validate_output(output));
+fn print_check_output(output: &CheckOutput) {
+    print!("{}", format_check_output(output));
 }
 
-fn format_validate_output(output: &ValidateOutput) -> String {
+fn format_check_output(output: &CheckOutput) -> String {
     let mut rendered = String::new();
     let mut first_group = true;
 
-    append_validate_file_group(&mut rendered, &mut first_group, output);
-    append_validate_exif_group(&mut rendered, &mut first_group, output);
-    append_validate_frames_group(&mut rendered, &mut first_group, output);
-    append_validate_overview_group(&mut rendered, &mut first_group, output);
+    append_check_file_group(&mut rendered, &mut first_group, output);
+    append_check_exif_group(&mut rendered, &mut first_group, output);
+    append_check_frames_group(&mut rendered, &mut first_group, output);
+    append_check_overview_group(&mut rendered, &mut first_group, output);
 
     rendered
 }
 
-fn append_validate_file_group(
-    output: &mut String,
-    first_group: &mut bool,
-    report: &ValidateOutput,
-) {
-    append_spaced_validate_heading(output, first_group, "file");
+fn append_check_file_group(output: &mut String, first_group: &mut bool, report: &CheckOutput) {
+    append_spaced_check_heading(output, first_group, "file");
 
     if let Some(path) = &report.metadata_path {
         output.push_str(&format!(
@@ -2625,37 +2607,29 @@ fn append_validate_file_group(
     }
 
     for warning in &report.file_warnings {
-        output.push_str(&format!("{}\n", format_validate_warning(warning)));
+        output.push_str(&format!("{}\n", format_check_warning(warning)));
     }
     for error in &report.file_errors {
-        output.push_str(&format!("{}\n", format_validate_error(error)));
+        output.push_str(&format!("{}\n", format_check_error(error)));
     }
 }
 
-fn append_validate_exif_group(
-    output: &mut String,
-    first_group: &mut bool,
-    report: &ValidateOutput,
-) {
-    append_spaced_validate_heading(output, first_group, "exif");
+fn append_check_exif_group(output: &mut String, first_group: &mut bool, report: &CheckOutput) {
+    append_spaced_check_heading(output, first_group, "exif");
 
     let Some(exif) = &report.exif else {
         output.push_str("skipped\n");
         return;
     };
 
-    append_validate_tag_counts(output, &exif.tags);
+    append_check_tag_counts(output, &exif.tags);
     for warning in &exif.warnings {
-        output.push_str(&format!("{}\n", format_validate_warning(warning)));
+        output.push_str(&format!("{}\n", format_check_warning(warning)));
     }
 }
 
-fn append_validate_frames_group(
-    output: &mut String,
-    first_group: &mut bool,
-    report: &ValidateOutput,
-) {
-    append_spaced_validate_heading(output, first_group, "frames");
+fn append_check_frames_group(output: &mut String, first_group: &mut bool, report: &CheckOutput) {
+    append_spaced_check_heading(output, first_group, "frames");
 
     let Some(frames) = &report.frames else {
         output.push_str("skipped\n");
@@ -2671,41 +2645,37 @@ fn append_validate_frames_group(
         output.push_str(&format!("frame numbers: {}\n", frames.frame_number_count));
         output.push_str(&format!("files: {}\n", frames.file_count));
         for warning in &frames.warnings {
-            output.push_str(&format!("{}\n", format_validate_warning(warning)));
+            output.push_str(&format!("{}\n", format_check_warning(warning)));
         }
     }
 
     for frame in &frames.frames {
-        output.push_str(&format!("{}\n", validate_frame_title(frame).bright_cyan()));
-        append_validate_tag_counts(output, &frame.tags);
+        output.push_str(&format!("{}\n", check_frame_title(frame).bright_cyan()));
+        append_check_tag_counts(output, &frame.tags);
         for location_match in &frame.location_matches {
             output.push_str(&format!("{}\n", format_location_match(location_match)));
         }
         for warning in &frame.warnings {
-            output.push_str(&format!("{}\n", format_validate_warning(warning)));
+            output.push_str(&format!("{}\n", format_check_warning(warning)));
         }
         for error in &frame.errors {
-            output.push_str(&format!("{}\n", format_validate_frame_error(error)));
+            output.push_str(&format!("{}\n", format_check_frame_error(error)));
         }
     }
 }
 
-fn append_validate_overview_group(
-    output: &mut String,
-    first_group: &mut bool,
-    report: &ValidateOutput,
-) {
-    append_spaced_validate_heading(output, first_group, "overview");
+fn append_check_overview_group(output: &mut String, first_group: &mut bool, report: &CheckOutput) {
+    append_spaced_check_heading(output, first_group, "overview");
 
     let errors = report.error_count();
     let warnings = report.warning_count();
     output.push_str(&format!(
         "errors      {}\n",
-        format_validate_error_count(errors)
+        format_check_error_count(errors)
     ));
     output.push_str(&format!(
         "warnings    {}\n",
-        format_validate_warning_count(warnings)
+        format_check_warning_count(warnings)
     ));
 
     if errors > 0 {
@@ -2721,7 +2691,7 @@ fn append_validate_overview_group(
     }
 }
 
-fn append_validate_heading(output: &mut String, label: &str) {
+fn append_check_heading(output: &mut String, label: &str) {
     const WIDTH: usize = 50;
     let dash_count = WIDTH.saturating_sub(label.len() + 1);
     output.push_str(&format!(
@@ -2730,21 +2700,21 @@ fn append_validate_heading(output: &mut String, label: &str) {
     ));
 }
 
-fn append_spaced_validate_heading(output: &mut String, first_group: &mut bool, label: &str) {
+fn append_spaced_check_heading(output: &mut String, first_group: &mut bool, label: &str) {
     if *first_group {
         *first_group = false;
     } else {
         output.push('\n');
     }
-    append_validate_heading(output, label);
+    append_check_heading(output, label);
 }
 
-fn append_validate_tag_counts(output: &mut String, counts: &TagCounts) {
+fn append_check_tag_counts(output: &mut String, counts: &TagCounts) {
     output.push_str(&format!("standard tags: {}\n", counts.standard));
     output.push_str(&format!("unknown tags: {}\n", counts.unknown));
 }
 
-fn format_validate_error_count(count: usize) -> String {
+fn format_check_error_count(count: usize) -> String {
     if count > 0 {
         count.to_string().red().to_string()
     } else {
@@ -2752,7 +2722,7 @@ fn format_validate_error_count(count: usize) -> String {
     }
 }
 
-fn format_validate_warning_count(count: usize) -> String {
+fn format_check_warning_count(count: usize) -> String {
     if count > 0 {
         count.to_string().yellow().to_string()
     } else {
@@ -2760,7 +2730,7 @@ fn format_validate_warning_count(count: usize) -> String {
     }
 }
 
-fn validate_frame_title(frame: &FrameReport) -> String {
+fn check_frame_title(frame: &FrameReport) -> String {
     if frame.is_numeric {
         if let Some(file) = &frame.file {
             return format!("{} ← {}", file_name(file), frame.key);
@@ -2782,12 +2752,12 @@ fn format_location_match(location_match: &LocationMatch) -> String {
     )
 }
 
-fn format_validate_error(error: &str) -> String {
+fn format_check_error(error: &str) -> String {
     format!("error: {error}").red().to_string()
 }
 
-fn format_validate_frame_error(error: &str) -> String {
-    format_validate_error(error)
+fn format_check_frame_error(error: &str) -> String {
+    format_check_error(error)
 }
 
 struct MetadataPathResolution {
@@ -2807,7 +2777,7 @@ fn resolve_metadata_path(path: Option<&Path>) -> Result<MetadataPathResolution, 
     }
 }
 
-fn format_validate_warning(warning: &str) -> String {
+fn format_check_warning(warning: &str) -> String {
     let output = format!("warning: {warning}");
 
     if is_location_lookup_warning(warning) {
@@ -2855,7 +2825,7 @@ fn resolve_metadata_path_in_directory(directory: &Path) -> Result<MetadataPathRe
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ValidateReport {
+struct CheckReport {
     exif_tags: TagCounts,
     exif_warnings: Vec<String>,
     frame_tags: TagCounts,
@@ -2871,20 +2841,17 @@ struct TagCounts {
     unknown_names: Vec<String>,
 }
 
-fn validate_metadata_yaml(
-    metadata_path: &Path,
-    yaml: &YamlValue,
-) -> Result<ValidateReport, String> {
+fn check_metadata_yaml(metadata_path: &Path, yaml: &YamlValue) -> Result<CheckReport, String> {
     let root = yaml
         .as_mapping()
         .ok_or_else(|| "metadata YAML root must be a mapping".to_string())?;
-    let mut report = ValidateReport::default();
+    let mut report = CheckReport::default();
 
     if let Some(exif) = yaml_mapping_get(root, "exif") {
         let exif = exif
             .as_mapping()
             .ok_or_else(|| "metadata YAML `exif` key must be a mapping".to_string())?;
-        report.exif_tags = validate_tag_mapping(exif, "exif")?;
+        report.exif_tags = check_tag_mapping(exif, "exif")?;
         report.exif_warnings = tag_warnings("exif", &report.exif_tags);
     }
 
@@ -2895,7 +2862,7 @@ fn validate_metadata_yaml(
             YamlValue::Mapping(frames) => frames,
             _ => return Err("metadata YAML `frames` key must be a mapping".to_string()),
         };
-        let frame_report = validate_frames_mapping(metadata_path, frames)?;
+        let frame_report = check_frames_mapping(metadata_path, frames)?;
         report.frame_tags = frame_report.tags;
         report
             .location_matches
@@ -2935,7 +2902,7 @@ struct FrameValidationReport {
     warnings: Vec<String>,
 }
 
-fn validate_frames_mapping(
+fn check_frames_mapping(
     metadata_path: &Path,
     frames: &Mapping,
 ) -> Result<FrameValidationReport, String> {
@@ -2967,7 +2934,7 @@ fn validate_frames_mapping(
             file: frame_number.and_then(|number| resolved_frame_file(number, &image_files)),
             ..FrameReport::default()
         };
-        validate_frame_reference(
+        check_frame_reference(
             frame_key,
             image_directory,
             &image_files,
@@ -3015,7 +2982,7 @@ fn resolved_frame_file(frame_number: usize, image_files: &[PathBuf]) -> Option<P
     image_files.get(frame_number.checked_sub(1)?).cloned()
 }
 
-fn validate_frame_reference(
+fn check_frame_reference(
     frame_key: &YamlValue,
     image_directory: &Path,
     image_files: &[PathBuf],
@@ -3084,18 +3051,18 @@ fn collect_frame_tag_mapping(
     geonames: &Connection,
     report: &mut FrameReport,
 ) -> Result<(), String> {
-    merge_tag_counts(&mut report.tags, validate_tag_mapping(mapping, "frames")?);
+    merge_tag_counts(&mut report.tags, check_tag_mapping(mapping, "frames")?);
 
     for (key, value) in mapping {
         if key.as_str() == Some("$Location") {
-            validate_location_value(value, geonames, report)?;
+            check_location_value(value, geonames, report)?;
         }
     }
 
     Ok(())
 }
 
-fn validate_location_value(
+fn check_location_value(
     value: &YamlValue,
     geonames: &Connection,
     report: &mut FrameReport,
@@ -3142,7 +3109,7 @@ fn location_name_from_yaml<'a>(
     }
 }
 
-fn validate_tag_mapping(mapping: &Mapping, context: &str) -> Result<TagCounts, String> {
+fn check_tag_mapping(mapping: &Mapping, context: &str) -> Result<TagCounts, String> {
     let mut counts = TagCounts::default();
 
     for (key, _) in mapping {
@@ -3388,14 +3355,14 @@ const STANDARD_EXIF_TAG_NAMES: &[&str] = &[
     "YResolution",
 ];
 
-fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
+fn write_command(dry_run: bool, args: WriteArgs) -> Result<(), String> {
     let started = Instant::now();
-    let request = RunRequest::from_args(&args);
-    let strip_mode = StripMode::from_run_args(&args)?;
+    let request = WriteRequest::from_args(&args);
+    let strip_mode = StripMode::from_write_args(&args)?;
     let resolution = resolve_metadata_path(request.metadata.as_deref())?;
 
     let metadata_dir = path_parent_or_current(&resolution.path);
-    let targets = resolve_run_targets(
+    let targets = resolve_write_targets(
         metadata_dir,
         request.targets.as_deref(),
         args.recursive,
@@ -3410,11 +3377,11 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
         .map_err(|error| format!("failed to read {}: {error}", resolution.path.display()))?;
     let yaml = serde_yaml::from_str::<YamlValue>(&contents)
         .map_err(|error| format!("failed to parse {}: {error}", resolution.path.display()))?;
-    validate_metadata_yaml(&resolution.path, &yaml)?;
+    check_metadata_yaml(&resolution.path, &yaml)?;
 
-    let plan = build_run_plan(&resolution.path, &yaml, &targets)?;
-    let mut summary = RunSummary::default();
-    let mut output = RunOutput {
+    let plan = build_write_plan(&resolution.path, &yaml, &targets)?;
+    let mut summary = WriteSummary::default();
+    let mut output = WriteOutput {
         metadata_path: resolution.path.clone(),
         dry_run,
         target_count: targets.len(),
@@ -3425,8 +3392,8 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
     summary.warnings += output.file_warnings.len();
     let spinner = SpinnerPreset::random();
 
-    print!("{}", format_run_metadata_output(&output));
-    print!("{}", format_run_frames_heading());
+    print!("{}", format_write_metadata_output(&output));
+    print!("{}", format_write_frames_heading());
     flush_stdout();
 
     for image in targets {
@@ -3435,7 +3402,7 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
             output.skipped_files.push(image);
             print!(
                 "{}",
-                format_run_skipped_file_output(
+                format_write_skipped_file_output(
                     output
                         .skipped_files
                         .last()
@@ -3446,14 +3413,14 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
             continue;
         };
 
-        let file_output = RunFileOutput {
+        let file_output = WriteFileOutput {
             label: frame.label,
             image,
-            result: RunFileResult::default(),
+            result: WriteFileResult::default(),
             elapsed_ms: 0,
             dry_run,
         };
-        print!("{}", format_run_file_header_output(&file_output));
+        print!("{}", format_write_file_header_output(&file_output));
         flush_stdout();
 
         let file_started = Instant::now();
@@ -3468,18 +3435,18 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
         progress.finish();
         let elapsed_ms = file_started.elapsed().as_millis();
         summary.add(&result);
-        let file_output = RunFileOutput {
+        let file_output = WriteFileOutput {
             result,
             elapsed_ms,
             ..file_output
         };
-        print!("{}", format_run_file_result_output(&file_output));
+        print!("{}", format_write_file_result_output(&file_output));
         flush_stdout();
         output.files.push(file_output);
     }
 
     summary.elapsed_ms = started.elapsed().as_millis();
-    print!("{}", format_run_overview_output(&summary));
+    print!("{}", format_write_overview_output(&summary));
     flush_stdout();
 
     if summary.errors > 0 {
@@ -3492,7 +3459,7 @@ fn run_command(dry_run: bool, args: RunArgs) -> Result<(), String> {
 fn strip_command(dry_run: bool, args: StripArgs) -> Result<(), CliError> {
     let started = Instant::now();
     let mode = StripMode::from_args(&args).map_err(CliError::Error)?;
-    let targets = resolve_run_targets(
+    let targets = resolve_write_targets(
         Path::new("."),
         args.targets.as_deref(),
         args.recursive,
@@ -3520,7 +3487,7 @@ fn strip_command(dry_run: bool, args: StripArgs) -> Result<(), CliError> {
 
     for image in targets {
         let file_output = StripFileOutput {
-            label: run_file_heading(&image),
+            label: write_file_heading(&image),
             image,
             result: StripFileResult::default(),
             elapsed_ms: 0,
@@ -3687,7 +3654,7 @@ impl StripMode {
             .map(|mode| mode.unwrap_or_else(Self::all))
     }
 
-    fn from_run_args(args: &RunArgs) -> Result<Option<Self>, String> {
+    fn from_write_args(args: &WriteArgs) -> Result<Option<Self>, String> {
         Self::from_parts(args.strip, &args.keep, &args.remove, args.privacy)
     }
 
@@ -4233,7 +4200,7 @@ fn format_strip_overview_output(output: &StripOutput, summary: &StripSummary) ->
 }
 
 fn append_strip_heading_group(rendered: &mut String, first_group: &mut bool, output: &StripOutput) {
-    append_spaced_validate_heading(rendered, first_group, "strip");
+    append_spaced_check_heading(rendered, first_group, "strip");
     rendered.push_str(&format!("mode: {}\n", output.mode));
     rendered.push_str(&format!("targets: {}\n", output.target_count));
     if output.dry_run {
@@ -4242,8 +4209,8 @@ fn append_strip_heading_group(rendered: &mut String, first_group: &mut bool, out
 }
 
 fn append_strip_file_header(rendered: &mut String, file: &StripFileOutput) {
-    append_run_frame_subtitle(rendered, &file.label);
-    append_run_file_path(rendered, &file.image);
+    append_write_frame_subtitle(rendered, &file.label);
+    append_write_file_path(rendered, &file.image);
 }
 
 fn append_strip_file_result(rendered: &mut String, file: &StripFileOutput) {
@@ -4261,12 +4228,15 @@ fn append_strip_file_result(rendered: &mut String, file: &StripFileOutput) {
     if file.result.verified {
         rendered.push_str("verified: no EXIF metadata\n");
     }
-    rendered.push_str(&format!("took {}\n", format_run_duration(file.elapsed_ms)));
+    rendered.push_str(&format!(
+        "took {}\n",
+        format_write_duration(file.elapsed_ms)
+    ));
     for warning in &file.result.warnings {
-        rendered.push_str(&format!("{}\n", format_validate_warning(warning)));
+        rendered.push_str(&format!("{}\n", format_check_warning(warning)));
     }
     for error in &file.result.errors {
-        rendered.push_str(&format!("{}\n", format_validate_error(error)));
+        rendered.push_str(&format!("{}\n", format_check_error(error)));
     }
 }
 
@@ -4276,10 +4246,10 @@ fn append_strip_overview_group(
     output: &StripOutput,
     summary: &StripSummary,
 ) {
-    append_spaced_validate_heading(rendered, first_group, "overview");
-    append_run_overview_row(rendered, "errors", summary.errors);
-    append_run_overview_row(rendered, "warnings", summary.warnings);
-    append_run_overview_row(
+    append_spaced_check_heading(rendered, first_group, "overview");
+    append_write_overview_row(rendered, "errors", summary.errors);
+    append_write_overview_row(rendered, "warnings", summary.warnings);
+    append_write_overview_row(
         rendered,
         if output.dry_run {
             "would strip"
@@ -4288,19 +4258,19 @@ fn append_strip_overview_group(
         },
         summary.stripped_files,
     );
-    append_run_overview_row(rendered, "removed tags", summary.removed_tags);
-    append_run_overview_row(rendered, "verified", summary.verified_files);
-    append_run_overview_row(rendered, "took", format_run_duration(summary.elapsed_ms));
+    append_write_overview_row(rendered, "removed tags", summary.removed_tags);
+    append_write_overview_row(rendered, "verified", summary.verified_files);
+    append_write_overview_row(rendered, "took", format_write_duration(summary.elapsed_ms));
     if summary.errors > 0 {
-        append_run_overview_row(rendered, "status", "fail".red());
+        append_write_overview_row(rendered, "status", "fail".red());
     } else if summary.warnings > 0 {
-        append_run_overview_row(
+        append_write_overview_row(
             rendered,
             "status",
             format!("{} {}", "success".green(), "(with warnings)"),
         );
     } else {
-        append_run_overview_row(rendered, "status", "success".green());
+        append_write_overview_row(rendered, "status", "success".green());
     }
 }
 
@@ -4358,13 +4328,13 @@ fn strip_file_status(file: &StripFileOutput) -> &'static str {
 }
 
 #[derive(Debug, Clone, Default)]
-struct RunRequest {
+struct WriteRequest {
     metadata: Option<PathBuf>,
     targets: Option<String>,
 }
 
-impl RunRequest {
-    fn from_args(args: &RunArgs) -> Self {
+impl WriteRequest {
+    fn from_args(args: &WriteArgs) -> Self {
         match (&args.metadata_or_targets, &args.targets) {
             (Some(metadata), Some(targets)) => Self {
                 metadata: Some(metadata.clone()),
@@ -4404,7 +4374,7 @@ fn path_parent_or_current(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn resolve_run_targets(
+fn resolve_write_targets(
     metadata_dir: &Path,
     target_pattern: Option<&str>,
     recursive: bool,
@@ -4562,19 +4532,19 @@ fn wildcard_match(pattern: &[u8], subject: &[u8]) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct RunTag {
+struct WriteTag {
     name: String,
     value: YamlValue,
 }
 
 #[derive(Debug, Clone, Default)]
-struct RunPlan {
-    global: Vec<RunTag>,
-    frames: BTreeMap<PathBuf, RunFramePlan>,
+struct WritePlan {
+    global: Vec<WriteTag>,
+    frames: BTreeMap<PathBuf, WriteFramePlan>,
 }
 
-impl RunPlan {
-    fn frame_for_image(&self, image: &Path) -> Option<RunFramePlan> {
+impl WritePlan {
+    fn frame_for_image(&self, image: &Path) -> Option<WriteFramePlan> {
         let frame = self.frames.get(image);
         if self.global.is_empty() && frame.is_none_or(|frame| frame.tags.is_empty()) {
             return None;
@@ -4592,22 +4562,22 @@ impl RunPlan {
             }
         }
         normalize_iso_aliases(&mut merged);
-        Some(RunFramePlan {
+        Some(WriteFramePlan {
             label: frame
                 .map(|frame| frame.label.clone())
-                .unwrap_or_else(|| run_file_heading(image)),
+                .unwrap_or_else(|| write_file_heading(image)),
             tags: merged,
         })
     }
 }
 
 #[derive(Debug, Clone, Default)]
-struct RunFramePlan {
+struct WriteFramePlan {
     label: String,
-    tags: Vec<RunTag>,
+    tags: Vec<WriteTag>,
 }
 
-fn normalize_iso_aliases(tags: &mut Vec<RunTag>) {
+fn normalize_iso_aliases(tags: &mut Vec<WriteTag>) {
     let Some(value) = tags
         .iter()
         .rev()
@@ -4619,7 +4589,7 @@ fn normalize_iso_aliases(tags: &mut Vec<RunTag>) {
 
     tags.retain(|tag| !is_iso_alias(&tag.name));
     for name in ["ISO", "ISOSpeed", "ISOSpeedRatings"] {
-        tags.push(RunTag {
+        tags.push(WriteTag {
             name: name.to_string(),
             value: value.clone(),
         });
@@ -4630,18 +4600,18 @@ fn is_iso_alias(name: &str) -> bool {
     matches!(name, "ISO" | "ISOSpeed" | "ISOSpeedRatings")
 }
 
-fn build_run_plan(
+fn build_write_plan(
     metadata_path: &Path,
     yaml: &YamlValue,
     targets: &[PathBuf],
-) -> Result<RunPlan, String> {
+) -> Result<WritePlan, String> {
     let root = yaml
         .as_mapping()
         .ok_or_else(|| "metadata YAML root must be a mapping".to_string())?;
-    let mut plan = RunPlan::default();
+    let mut plan = WritePlan::default();
 
     if let Some(exif) = yaml_mapping_get(root, "exif") {
-        plan.global = collect_run_tags_from_mapping(
+        plan.global = collect_write_tags_from_mapping(
             exif.as_mapping()
                 .ok_or_else(|| "metadata YAML `exif` key must be a mapping".to_string())?,
         )?;
@@ -4656,14 +4626,15 @@ fn build_run_plan(
         };
         let image_directory = path_parent_or_current(metadata_path);
         for (frame_key, frame_value) in frames {
-            let Some(image) = resolve_run_frame_target(frame_key, image_directory, targets) else {
+            let Some(image) = resolve_write_frame_target(frame_key, image_directory, targets)
+            else {
                 continue;
             };
             plan.frames.insert(
                 image.clone(),
-                RunFramePlan {
-                    label: run_frame_label(frame_key, &image),
-                    tags: collect_run_tags_from_frame_value(frame_value)?,
+                WriteFramePlan {
+                    label: write_frame_label(frame_key, &image),
+                    tags: collect_write_tags_from_frame_value(frame_value)?,
                 },
             );
         }
@@ -4672,15 +4643,15 @@ fn build_run_plan(
     Ok(plan)
 }
 
-fn run_frame_label(frame_key: &YamlValue, image: &Path) -> String {
+fn write_frame_label(frame_key: &YamlValue, image: &Path) -> String {
     if let Some(frame_number) = frame_number_from_key(frame_key) {
-        return format!("{} ← frame {frame_number}", run_file_heading(image));
+        return format!("{} ← frame {frame_number}", write_file_heading(image));
     }
 
-    run_file_heading(image)
+    write_file_heading(image)
 }
 
-fn resolve_run_frame_target(
+fn resolve_write_frame_target(
     frame_key: &YamlValue,
     image_directory: &Path,
     targets: &[PathBuf],
@@ -4694,9 +4665,9 @@ fn resolve_run_frame_target(
     targets.iter().find(|target| **target == absolute).cloned()
 }
 
-fn collect_run_tags_from_frame_value(value: &YamlValue) -> Result<Vec<RunTag>, String> {
+fn collect_write_tags_from_frame_value(value: &YamlValue) -> Result<Vec<WriteTag>, String> {
     match value {
-        YamlValue::Mapping(mapping) => collect_run_tags_from_mapping(mapping),
+        YamlValue::Mapping(mapping) => collect_write_tags_from_mapping(mapping),
         YamlValue::Sequence(items) => {
             let mut tags = Vec::new();
             for item in items {
@@ -4708,7 +4679,7 @@ fn collect_run_tags_from_frame_value(value: &YamlValue) -> Result<Vec<RunTag>, S
                         "metadata YAML frame sequence entries must contain one tag".to_string()
                     );
                 }
-                tags.extend(collect_run_tags_from_mapping(mapping)?);
+                tags.extend(collect_write_tags_from_mapping(mapping)?);
             }
             Ok(tags)
         }
@@ -4717,13 +4688,13 @@ fn collect_run_tags_from_frame_value(value: &YamlValue) -> Result<Vec<RunTag>, S
     }
 }
 
-fn collect_run_tags_from_mapping(mapping: &Mapping) -> Result<Vec<RunTag>, String> {
+fn collect_write_tags_from_mapping(mapping: &Mapping) -> Result<Vec<WriteTag>, String> {
     let mut tags = Vec::new();
     for (key, value) in mapping {
         let Some(name) = key.as_str() else {
             return Err("metadata YAML tag keys must be strings".to_string());
         };
-        tags.push(RunTag {
+        tags.push(WriteTag {
             name: name.to_string(),
             value: value.clone(),
         });
@@ -4732,7 +4703,7 @@ fn collect_run_tags_from_mapping(mapping: &Mapping) -> Result<Vec<RunTag>, Strin
 }
 
 #[derive(Debug, Clone, Default)]
-struct RunFileResult {
+struct WriteFileResult {
     written: usize,
     strip_attempted: bool,
     stripped: bool,
@@ -4743,7 +4714,7 @@ struct RunFileResult {
 }
 
 #[derive(Debug, Clone, Default)]
-struct RunSummary {
+struct WriteSummary {
     written_tags: usize,
     stripped_files: usize,
     removed_tags: usize,
@@ -4754,8 +4725,8 @@ struct RunSummary {
     elapsed_ms: u128,
 }
 
-impl RunSummary {
-    fn add(&mut self, result: &RunFileResult) {
+impl WriteSummary {
+    fn add(&mut self, result: &WriteFileResult) {
         self.written_tags += result.written;
         self.stripped_files += usize::from(result.stripped);
         self.removed_tags += result.removed_tags;
@@ -4766,20 +4737,20 @@ impl RunSummary {
 }
 
 #[derive(Debug, Clone)]
-struct RunOutput {
+struct WriteOutput {
     metadata_path: PathBuf,
     dry_run: bool,
     target_count: usize,
     file_warnings: Vec<String>,
-    files: Vec<RunFileOutput>,
+    files: Vec<WriteFileOutput>,
     skipped_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
-struct RunFileOutput {
+struct WriteFileOutput {
     label: String,
     image: PathBuf,
-    result: RunFileResult,
+    result: WriteFileResult,
     elapsed_ms: u128,
     dry_run: bool,
 }
@@ -4906,12 +4877,12 @@ fn flush_stdout() {
 
 fn apply_tags_to_image(
     image: &Path,
-    tags: &[RunTag],
+    tags: &[WriteTag],
     dry_run: bool,
-    args: &RunArgs,
+    args: &WriteArgs,
     strip_mode: Option<&StripMode>,
-) -> RunFileResult {
-    let mut result = RunFileResult::default();
+) -> WriteFileResult {
+    let mut result = WriteFileResult::default();
     let mut writable_tags = Vec::new();
     let mut custom_tags = Vec::new();
 
@@ -4923,8 +4894,8 @@ fn apply_tags_to_image(
         if tag.name == "$Location" {
             match expand_location_tag(&tag.value) {
                 Ok(expanded) => writable_tags.extend(expanded),
-                Err(RunTagError::Ignored) => {}
-                Err(RunTagError::Warning(message)) => result.warnings.push(message),
+                Err(WriteTagError::Ignored) => {}
+                Err(WriteTagError::Warning(message)) => result.warnings.push(message),
             }
         } else if let Some(tag) = writable_exif_tag(&tag.name, &tag.value) {
             writable_tags.push(tag);
@@ -5028,70 +4999,74 @@ fn writable_tag_identity(tag: &WritableExifTag) -> (u16, String) {
 }
 
 #[cfg(test)]
-fn format_run_output(output: &RunOutput, summary: &RunSummary) -> String {
+fn format_write_output(output: &WriteOutput, summary: &WriteSummary) -> String {
     let mut rendered = String::new();
-    rendered.push_str(&format_run_metadata_output(output));
-    rendered.push_str(&format_run_frames_heading());
+    rendered.push_str(&format_write_metadata_output(output));
+    rendered.push_str(&format_write_frames_heading());
     for file in &output.files {
-        rendered.push_str(&format_run_file_output(file));
+        rendered.push_str(&format_write_file_output(file));
     }
     for skipped in &output.skipped_files {
-        rendered.push_str(&format_run_skipped_file_output(skipped));
+        rendered.push_str(&format_write_skipped_file_output(skipped));
     }
-    rendered.push_str(&format_run_overview_output(summary));
+    rendered.push_str(&format_write_overview_output(summary));
 
     rendered
 }
 
-fn format_run_metadata_output(output: &RunOutput) -> String {
+fn format_write_metadata_output(output: &WriteOutput) -> String {
     let mut rendered = String::new();
     let mut first_group = true;
-    append_run_metadata_group(&mut rendered, &mut first_group, output);
+    append_write_metadata_group(&mut rendered, &mut first_group, output);
     rendered
 }
 
-fn format_run_frames_heading() -> String {
+fn format_write_frames_heading() -> String {
     let mut rendered = String::new();
     let mut first_group = false;
-    append_spaced_validate_heading(&mut rendered, &mut first_group, "frames");
+    append_spaced_check_heading(&mut rendered, &mut first_group, "frames");
     rendered
 }
 
 #[cfg(test)]
-fn format_run_file_output(file: &RunFileOutput) -> String {
+fn format_write_file_output(file: &WriteFileOutput) -> String {
     let mut rendered = String::new();
-    append_run_file_header(&mut rendered, file);
-    append_run_file_result(&mut rendered, file);
+    append_write_file_header(&mut rendered, file);
+    append_write_file_result(&mut rendered, file);
     rendered
 }
 
-fn format_run_file_header_output(file: &RunFileOutput) -> String {
+fn format_write_file_header_output(file: &WriteFileOutput) -> String {
     let mut rendered = String::new();
-    append_run_file_header(&mut rendered, file);
+    append_write_file_header(&mut rendered, file);
     rendered
 }
 
-fn format_run_file_result_output(file: &RunFileOutput) -> String {
+fn format_write_file_result_output(file: &WriteFileOutput) -> String {
     let mut rendered = String::new();
-    append_run_file_result(&mut rendered, file);
+    append_write_file_result(&mut rendered, file);
     rendered
 }
 
-fn format_run_skipped_file_output(image: &Path) -> String {
+fn format_write_skipped_file_output(image: &Path) -> String {
     let mut rendered = String::new();
-    append_run_skipped_file_group(&mut rendered, image);
+    append_write_skipped_file_group(&mut rendered, image);
     rendered
 }
 
-fn format_run_overview_output(summary: &RunSummary) -> String {
+fn format_write_overview_output(summary: &WriteSummary) -> String {
     let mut rendered = String::new();
     let mut first_group = false;
-    append_run_overview_group(&mut rendered, &mut first_group, summary);
+    append_write_overview_group(&mut rendered, &mut first_group, summary);
     rendered
 }
 
-fn append_run_metadata_group(rendered: &mut String, first_group: &mut bool, output: &RunOutput) {
-    append_spaced_validate_heading(rendered, first_group, "run");
+fn append_write_metadata_group(
+    rendered: &mut String,
+    first_group: &mut bool,
+    output: &WriteOutput,
+) {
+    append_spaced_check_heading(rendered, first_group, "write");
     rendered.push_str(&format!(
         "metadata file: {}\n",
         output.metadata_path.display()
@@ -5101,16 +5076,16 @@ fn append_run_metadata_group(rendered: &mut String, first_group: &mut bool, outp
         rendered.push_str(&format!("mode: {}\n", "dry-run".yellow()));
     }
     for warning in &output.file_warnings {
-        rendered.push_str(&format!("{}\n", format_validate_warning(warning)));
+        rendered.push_str(&format!("{}\n", format_check_warning(warning)));
     }
 }
 
-fn append_run_file_header(rendered: &mut String, file: &RunFileOutput) {
-    append_run_frame_subtitle(rendered, &file.label);
-    append_run_file_path(rendered, &file.image);
+fn append_write_file_header(rendered: &mut String, file: &WriteFileOutput) {
+    append_write_frame_subtitle(rendered, &file.label);
+    append_write_file_path(rendered, &file.image);
 }
 
-fn append_run_file_result(rendered: &mut String, file: &RunFileOutput) {
+fn append_write_file_result(rendered: &mut String, file: &WriteFileOutput) {
     if file.result.strip_attempted {
         let action = if file.dry_run {
             "would strip EXIF"
@@ -5121,36 +5096,39 @@ fn append_run_file_result(rendered: &mut String, file: &RunFileOutput) {
     }
     let action = if file.dry_run { "would write" } else { "wrote" };
     rendered.push_str(&format!("{action} {} tags\n", file.result.written));
-    rendered.push_str(&format!("took {}\n", format_run_duration(file.elapsed_ms)));
+    rendered.push_str(&format!(
+        "took {}\n",
+        format_write_duration(file.elapsed_ms)
+    ));
     for skipped in &file.result.skipped {
         rendered.push_str(&format!(
             "{}\n",
-            format_validate_warning(&format!("skipped {skipped}"))
+            format_check_warning(&format!("skipped {skipped}"))
         ));
     }
     for warning in &file.result.warnings {
-        rendered.push_str(&format!("{}\n", format_validate_warning(warning)));
+        rendered.push_str(&format!("{}\n", format_check_warning(warning)));
     }
     for error in &file.result.errors {
-        rendered.push_str(&format!("{}\n", format_validate_error(error)));
+        rendered.push_str(&format!("{}\n", format_check_error(error)));
     }
 }
 
-fn append_run_skipped_file_group(rendered: &mut String, image: &Path) {
-    append_run_frame_subtitle(rendered, &run_file_heading(image));
-    append_run_file_path(rendered, image);
+fn append_write_skipped_file_group(rendered: &mut String, image: &Path) {
+    append_write_frame_subtitle(rendered, &write_file_heading(image));
+    append_write_file_path(rendered, image);
     rendered.push_str("skipped: no metadata\n");
 }
 
-fn append_run_frame_subtitle(rendered: &mut String, label: &str) {
+fn append_write_frame_subtitle(rendered: &mut String, label: &str) {
     rendered.push_str(&format!("{}\n", label.bright_cyan()));
 }
 
-fn run_file_heading(image: &Path) -> String {
+fn write_file_heading(image: &Path) -> String {
     file_name(image)
 }
 
-fn append_run_file_path(rendered: &mut String, image: &Path) {
+fn append_write_file_path(rendered: &mut String, image: &Path) {
     if !is_current_directory_file(image) {
         rendered.push_str(&format!("file: {}\n", image.display()));
     }
@@ -5162,34 +5140,38 @@ fn is_current_directory_file(image: &Path) -> bool {
         .is_none_or(|parent| parent.as_os_str().is_empty() || parent == Path::new("."))
 }
 
-fn append_run_overview_group(rendered: &mut String, first_group: &mut bool, summary: &RunSummary) {
-    append_spaced_validate_heading(rendered, first_group, "overview");
-    append_run_overview_row(rendered, "errors", summary.errors);
-    append_run_overview_row(rendered, "warnings", summary.warnings);
-    append_run_overview_row(rendered, "written", summary.written_tags);
-    append_run_overview_row(rendered, "stripped", summary.stripped_files);
-    append_run_overview_row(rendered, "removed tags", summary.removed_tags);
-    append_run_overview_row(rendered, "skipped", summary.skipped_tags);
-    append_run_overview_row(rendered, "files skipped", summary.skipped_files);
-    append_run_overview_row(rendered, "took", format_run_duration(summary.elapsed_ms));
+fn append_write_overview_group(
+    rendered: &mut String,
+    first_group: &mut bool,
+    summary: &WriteSummary,
+) {
+    append_spaced_check_heading(rendered, first_group, "overview");
+    append_write_overview_row(rendered, "errors", summary.errors);
+    append_write_overview_row(rendered, "warnings", summary.warnings);
+    append_write_overview_row(rendered, "written", summary.written_tags);
+    append_write_overview_row(rendered, "stripped", summary.stripped_files);
+    append_write_overview_row(rendered, "removed tags", summary.removed_tags);
+    append_write_overview_row(rendered, "skipped", summary.skipped_tags);
+    append_write_overview_row(rendered, "files skipped", summary.skipped_files);
+    append_write_overview_row(rendered, "took", format_write_duration(summary.elapsed_ms));
     if summary.errors > 0 {
-        append_run_overview_row(rendered, "status", "fail".red());
+        append_write_overview_row(rendered, "status", "fail".red());
     } else if summary.warnings > 0 {
-        append_run_overview_row(
+        append_write_overview_row(
             rendered,
             "status",
             format!("{} {}", "success".green(), "(with warnings)"),
         );
     } else {
-        append_run_overview_row(rendered, "status", "success".green());
+        append_write_overview_row(rendered, "status", "success".green());
     }
 }
 
-fn append_run_overview_row(rendered: &mut String, label: &str, value: impl std::fmt::Display) {
+fn append_write_overview_row(rendered: &mut String, label: &str, value: impl std::fmt::Display) {
     rendered.push_str(&format!("{label:<14} {value}\n"));
 }
 
-fn format_run_duration(elapsed_ms: u128) -> String {
+fn format_write_duration(elapsed_ms: u128) -> String {
     if elapsed_ms > 1500 {
         format!("{:.1}s", elapsed_ms as f64 / 1000.0)
     } else {
@@ -5197,7 +5179,7 @@ fn format_run_duration(elapsed_ms: u128) -> String {
     }
 }
 
-enum RunTagError {
+enum WriteTagError {
     Ignored,
     Warning(String),
 }
@@ -5207,16 +5189,16 @@ fn is_blank_yaml_value(value: &YamlValue) -> bool {
         || matches!(value, YamlValue::String(value) if value.trim().is_empty())
 }
 
-fn expand_location_tag(value: &YamlValue) -> Result<Vec<WritableExifTag>, RunTagError> {
+fn expand_location_tag(value: &YamlValue) -> Result<Vec<WritableExifTag>, WriteTagError> {
     let Some(location_name) = location_name_from_yaml(value, &mut Vec::new()) else {
-        return Err(RunTagError::Ignored);
+        return Err(WriteTagError::Ignored);
     };
     let geonames = open_embedded_geonames_database()
-        .map_err(|error| RunTagError::Warning(format!("$Location lookup failed: {error}")))?;
+        .map_err(|error| WriteTagError::Warning(format!("$Location lookup failed: {error}")))?;
     let locations = locations_by_name(&geonames, location_name)
-        .map_err(|error| RunTagError::Warning(format!("$Location lookup failed: {error}")))?;
+        .map_err(|error| WriteTagError::Warning(format!("$Location lookup failed: {error}")))?;
     let Some(location) = locations.first() else {
-        return Err(RunTagError::Warning(format!(
+        return Err(WriteTagError::Warning(format!(
             "$Location: no match found in database [for <{location_name}>]"
         )));
     };
@@ -5536,28 +5518,28 @@ mod tests {
     }
 
     #[test]
-    fn interactive_inspect_preview_reports_missing_file_errors() {
+    fn interactive_read_preview_reports_missing_file_errors() {
         let missing = temporary_test_path("interactive-missing.jpg");
 
-        let preview = inspect_preview(&missing);
+        let preview = read_preview(&missing);
         let preview = preview
             .as_plain()
             .expect("missing image preview should be plain text");
 
-        assert!(preview.contains("Failed to inspect"));
+        assert!(preview.contains("Failed to read"));
         assert!(preview.contains("failed to open"));
     }
 
     #[test]
-    fn interactive_inspect_preview_preserves_inspect_colours() {
-        let directory = temporary_test_directory("interactive-inspect-colours");
+    fn interactive_read_preview_preserves_read_colours() {
+        let directory = temporary_test_directory("interactive-read-colours");
         let image = directory.join("image.jpg");
         std::fs::write(&image, [0xff, 0xd8, 0xff, 0xd9]).expect("jpg should be written");
 
-        let preview = inspect_preview(&image);
+        let preview = read_preview(&image);
         let lines = preview
             .as_lines()
-            .expect("inspect preview should render styled lines");
+            .expect("read preview should render styled lines");
 
         assert_eq!(line_text(&lines[0]), "<No EXIF metadata found>");
 
@@ -5565,7 +5547,7 @@ mod tests {
     }
 
     #[test]
-    fn ansi_preview_lines_preserve_inspect_styles() {
+    fn ansi_preview_lines_preserve_read_styles() {
         let lines = ansi_to_preview_lines(
             "\u{1b}[94mblue\u{1b}[0m plain\n\u{1b}[96mcyan\u{1b}[0m \u{1b}[33myellow\u{1b}[0m",
         );
@@ -5953,7 +5935,7 @@ mod tests {
             .iter()
             .position(|entry| entry.label == "image.jpg")
             .expect("image entry should exist");
-        assert_eq!(selected_preview_title(&app), "Inspect");
+        assert_eq!(selected_preview_title(&app), "Read");
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -6039,16 +6021,16 @@ mod tests {
     }
 
     #[test]
-    fn init_creates_metadata_file() {
-        let directory = temporary_test_directory("init-creates");
+    fn new_creates_metadata_file() {
+        let directory = temporary_test_directory("new-creates");
 
-        init_command(
+        new_command(
             false,
-            InitArgs {
+            NewArgs {
                 path: directory.clone(),
             },
         )
-        .expect("init should create metadata file");
+        .expect("new should create metadata file");
 
         let output = std::fs::read_to_string(directory.join(METADATA_FILE_NAME))
             .expect("metadata file should be readable");
@@ -6062,18 +6044,18 @@ mod tests {
     }
 
     #[test]
-    fn init_creates_metadata_file_in_target_directory() {
-        let parent = temporary_test_directory("init-target-parent");
+    fn new_creates_metadata_file_in_target_directory() {
+        let parent = temporary_test_directory("new-target-parent");
         let directory = parent.join("nested");
         std::fs::create_dir(&directory).expect("nested test directory should be created");
 
-        init_command(
+        new_command(
             false,
-            InitArgs {
+            NewArgs {
                 path: directory.clone(),
             },
         )
-        .expect("init should create metadata file in target directory");
+        .expect("new should create metadata file in target directory");
 
         assert!(directory.join(METADATA_FILE_NAME).exists());
         assert!(!parent.join(METADATA_FILE_NAME).exists());
@@ -6082,14 +6064,14 @@ mod tests {
     }
 
     #[test]
-    fn init_refuses_to_overwrite_existing_metadata_file() {
-        let directory = temporary_test_directory("init-existing");
+    fn new_refuses_to_overwrite_existing_metadata_file() {
+        let directory = temporary_test_directory("new-existing");
         let metadata = directory.join(METADATA_FILE_NAME);
         std::fs::write(&metadata, "existing").expect("metadata file should be written");
 
-        let result = init_command(
+        let result = new_command(
             false,
-            InitArgs {
+            NewArgs {
                 path: directory.clone(),
             },
         );
@@ -6106,8 +6088,8 @@ mod tests {
     }
 
     #[test]
-    fn init_counts_supported_images_non_recursively() {
-        let directory = temporary_test_directory("init-image-count");
+    fn new_counts_supported_images_non_recursively() {
+        let directory = temporary_test_directory("new-image-count");
         let nested = directory.join("nested");
         std::fs::create_dir(&nested).expect("nested test directory should be created");
         for file_name in [
@@ -6119,13 +6101,13 @@ mod tests {
         std::fs::write(directory.join("notes.txt"), []).expect("test text file should be written");
         std::fs::write(nested.join("nested.jpg"), []).expect("nested image should be written");
 
-        init_command(
+        new_command(
             false,
-            InitArgs {
+            NewArgs {
                 path: directory.clone(),
             },
         )
-        .expect("init should create metadata file");
+        .expect("new should create metadata file");
 
         let output = std::fs::read_to_string(directory.join(METADATA_FILE_NAME))
             .expect("metadata file should be readable");
@@ -6143,16 +6125,16 @@ mod tests {
     }
 
     #[test]
-    fn init_dry_run_does_not_create_metadata_file() {
-        let directory = temporary_test_directory("init-dry-run");
+    fn new_dry_run_does_not_create_metadata_file() {
+        let directory = temporary_test_directory("new-dry-run");
 
-        init_command(
+        new_command(
             true,
-            InitArgs {
+            NewArgs {
                 path: directory.clone(),
             },
         )
-        .expect("dry-run init should succeed");
+        .expect("dry-run new should succeed");
 
         assert!(!directory.join(METADATA_FILE_NAME).exists());
 
@@ -6161,7 +6143,7 @@ mod tests {
 
     #[test]
     fn resolve_metadata_path_prefers_yaml_over_yml() {
-        let directory = temporary_test_directory("validate-prefers-yaml");
+        let directory = temporary_test_directory("check-prefers-yaml");
         let yaml = directory.join(METADATA_FILE_NAME);
         let yml = directory.join(METADATA_YML_FILE_NAME);
         std::fs::write(&yaml, "exif: {}").expect("yaml metadata should be written");
@@ -6179,7 +6161,7 @@ mod tests {
 
     #[test]
     fn resolve_metadata_path_falls_back_to_yml() {
-        let directory = temporary_test_directory("validate-fallback-yml");
+        let directory = temporary_test_directory("check-fallback-yml");
         let yml = directory.join(METADATA_YML_FILE_NAME);
         std::fs::write(&yml, "exif: {}").expect("yml metadata should be written");
 
@@ -6194,7 +6176,7 @@ mod tests {
 
     #[test]
     fn resolve_metadata_path_errors_when_missing() {
-        let directory = temporary_test_directory("validate-missing");
+        let directory = temporary_test_directory("check-missing");
 
         let result = resolve_metadata_path(Some(&directory));
 
@@ -6204,8 +6186,8 @@ mod tests {
     }
 
     #[test]
-    fn run_request_treats_single_non_metadata_argument_as_targets() {
-        let args = RunArgs {
+    fn write_request_treats_single_non_metadata_argument_as_targets() {
+        let args = WriteArgs {
             metadata_or_targets: Some(PathBuf::from("*.jpg")),
             targets: None,
             strip: false,
@@ -6217,21 +6199,21 @@ mod tests {
             recursive: false,
         };
 
-        let request = RunRequest::from_args(&args);
+        let request = WriteRequest::from_args(&args);
 
         assert_eq!(request.metadata, None);
         assert_eq!(request.targets, Some("*.jpg".to_string()));
     }
 
     #[test]
-    fn run_targets_filter_default_images_by_extension() {
-        let directory = temporary_test_directory("run-target-extensions");
+    fn write_targets_filter_default_images_by_extension() {
+        let directory = temporary_test_directory("write-target-extensions");
         std::fs::write(directory.join("a.jpg"), [0xff, 0xd8, 0xff, 0xd9])
             .expect("jpg should be written");
         std::fs::write(directory.join("b.tif"), [0x49, 0x49, 0x2a, 0x00])
             .expect("tif should be written");
 
-        let targets = resolve_run_targets(&directory, None, false, &["jpg".to_string()])
+        let targets = resolve_write_targets(&directory, None, false, &["jpg".to_string()])
             .expect("targets should resolve");
 
         assert_eq!(targets, [directory.join("a.jpg")]);
@@ -6736,15 +6718,15 @@ mod tests {
     }
 
     #[test]
-    fn run_strip_clears_existing_tags_before_writing() {
-        let directory = temporary_test_directory("run-strip-all");
+    fn write_strip_clears_existing_tags_before_writing() {
+        let directory = temporary_test_directory("write-strip-all");
         let image = directory.join("image.jpg");
         write_test_exif_tags(&image, [("Make", "Nikon"), ("Model", "F3")]);
-        let args = RunArgs {
+        let args = WriteArgs {
             strip: true,
-            ..default_run_args()
+            ..default_write_args()
         };
-        let tags = vec![RunTag {
+        let tags = vec![WriteTag {
             name: "Artist".to_string(),
             value: YamlValue::String("Harry Merritt".to_string()),
         }];
@@ -6754,8 +6736,8 @@ mod tests {
             &tags,
             false,
             &args,
-            StripMode::from_run_args(&args)
-                .expect("run strip mode should parse")
+            StripMode::from_write_args(&args)
+                .expect("write strip mode should parse")
                 .as_ref(),
         );
 
@@ -6771,8 +6753,8 @@ mod tests {
     }
 
     #[test]
-    fn run_keep_preserves_named_tags_before_writing() {
-        let directory = temporary_test_directory("run-keep");
+    fn write_keep_preserves_named_tags_before_writing() {
+        let directory = temporary_test_directory("write-keep");
         let image = directory.join("image.jpg");
         write_test_exif_tags(
             &image,
@@ -6782,11 +6764,11 @@ mod tests {
                 ("Artist", "Harry Merritt"),
             ],
         );
-        let args = RunArgs {
+        let args = WriteArgs {
             keep: vec!["Make".to_string()],
-            ..default_run_args()
+            ..default_write_args()
         };
-        let tags = vec![RunTag {
+        let tags = vec![WriteTag {
             name: "FNumber".to_string(),
             value: YamlValue::String("5.6".to_string()),
         }];
@@ -6796,8 +6778,8 @@ mod tests {
             &tags,
             false,
             &args,
-            StripMode::from_run_args(&args)
-                .expect("run strip mode should parse")
+            StripMode::from_write_args(&args)
+                .expect("write strip mode should parse")
                 .as_ref(),
         );
 
@@ -6815,8 +6797,8 @@ mod tests {
     }
 
     #[test]
-    fn run_remove_removes_named_tags_before_writing() {
-        let directory = temporary_test_directory("run-remove");
+    fn write_remove_removes_named_tags_before_writing() {
+        let directory = temporary_test_directory("write-remove");
         let image = directory.join("image.jpg");
         write_test_exif_tags(
             &image,
@@ -6826,11 +6808,11 @@ mod tests {
                 ("Artist", "Harry Merritt"),
             ],
         );
-        let args = RunArgs {
+        let args = WriteArgs {
             remove: vec!["Model".to_string()],
-            ..default_run_args()
+            ..default_write_args()
         };
-        let tags = vec![RunTag {
+        let tags = vec![WriteTag {
             name: "FNumber".to_string(),
             value: YamlValue::String("5.6".to_string()),
         }];
@@ -6840,8 +6822,8 @@ mod tests {
             &tags,
             false,
             &args,
-            StripMode::from_run_args(&args)
-                .expect("run strip mode should parse")
+            StripMode::from_write_args(&args)
+                .expect("write strip mode should parse")
                 .as_ref(),
         );
 
@@ -6858,8 +6840,8 @@ mod tests {
     }
 
     #[test]
-    fn run_privacy_removes_sensitive_tags_before_writing() {
-        let directory = temporary_test_directory("run-privacy");
+    fn write_privacy_removes_sensitive_tags_before_writing() {
+        let directory = temporary_test_directory("write-privacy");
         let image = directory.join("image.jpg");
         write_test_exif_tags(
             &image,
@@ -6870,11 +6852,11 @@ mod tests {
                 ("FNumber", "5.6"),
             ],
         );
-        let args = RunArgs {
+        let args = WriteArgs {
             privacy: true,
-            ..default_run_args()
+            ..default_write_args()
         };
-        let tags = vec![RunTag {
+        let tags = vec![WriteTag {
             name: "Model".to_string(),
             value: YamlValue::String("F3".to_string()),
         }];
@@ -6884,8 +6866,8 @@ mod tests {
             &tags,
             false,
             &args,
-            StripMode::from_run_args(&args)
-                .expect("run strip mode should parse")
+            StripMode::from_write_args(&args)
+                .expect("write strip mode should parse")
                 .as_ref(),
         );
 
@@ -6903,14 +6885,14 @@ mod tests {
     }
 
     #[test]
-    fn run_privacy_preserves_unknown_tags_unless_explicitly_removed() {
-        let args = RunArgs {
+    fn write_privacy_preserves_unknown_tags_unless_explicitly_removed() {
+        let args = WriteArgs {
             privacy: true,
-            ..default_run_args()
+            ..default_write_args()
         };
-        let mode = StripMode::from_run_args(&args)
-            .expect("run privacy mode should parse")
-            .expect("run privacy should create a strip mode");
+        let mode = StripMode::from_write_args(&args)
+            .expect("write privacy mode should parse")
+            .expect("write privacy should create a strip mode");
         let exif = parse_raw_exif(&[
             tiff_ascii_entry(0x013b, b"A\0"),
             tiff_short_entry(0xfde8, 42),
@@ -6935,8 +6917,8 @@ mod tests {
     }
 
     #[test]
-    fn run_privacy_with_remove_removes_extra_tag_before_writing() {
-        let directory = temporary_test_directory("run-privacy-remove");
+    fn write_privacy_with_remove_removes_extra_tag_before_writing() {
+        let directory = temporary_test_directory("write-privacy-remove");
         let image = directory.join("image.jpg");
         write_test_exif_tags(
             &image,
@@ -6947,12 +6929,12 @@ mod tests {
                 ("FNumber", "5.6"),
             ],
         );
-        let args = RunArgs {
+        let args = WriteArgs {
             privacy: true,
             remove: vec!["FNumber".to_string()],
-            ..default_run_args()
+            ..default_write_args()
         };
-        let tags = vec![RunTag {
+        let tags = vec![WriteTag {
             name: "Model".to_string(),
             value: YamlValue::String("F3".to_string()),
         }];
@@ -6962,8 +6944,8 @@ mod tests {
             &tags,
             false,
             &args,
-            StripMode::from_run_args(&args)
-                .expect("run strip mode should parse")
+            StripMode::from_write_args(&args)
+                .expect("write strip mode should parse")
                 .as_ref(),
         );
 
@@ -6981,16 +6963,16 @@ mod tests {
     }
 
     #[test]
-    fn run_remove_allows_no_overwrite_to_write_removed_tag() {
-        let directory = temporary_test_directory("run-remove-no-overwrite");
+    fn write_remove_allows_no_overwrite_to_write_removed_tag() {
+        let directory = temporary_test_directory("write-remove-no-overwrite");
         let image = directory.join("image.jpg");
         write_test_exif_tags(&image, [("Model", "F3")]);
-        let args = RunArgs {
+        let args = WriteArgs {
             remove: vec!["Model".to_string()],
             no_overwrite: true,
-            ..default_run_args()
+            ..default_write_args()
         };
-        let tags = vec![RunTag {
+        let tags = vec![WriteTag {
             name: "Model".to_string(),
             value: YamlValue::String("FM2".to_string()),
         }];
@@ -7000,8 +6982,8 @@ mod tests {
             &tags,
             false,
             &args,
-            StripMode::from_run_args(&args)
-                .expect("run strip mode should parse")
+            StripMode::from_write_args(&args)
+                .expect("write strip mode should parse")
                 .as_ref(),
         );
 
@@ -7016,16 +6998,16 @@ mod tests {
     }
 
     #[test]
-    fn run_strip_dry_run_reports_without_modifying_file() {
-        let directory = temporary_test_directory("run-strip-dry-run");
+    fn write_strip_dry_run_reports_without_modifying_file() {
+        let directory = temporary_test_directory("write-strip-dry-run");
         let image = directory.join("image.jpg");
         write_test_exif_tags(&image, [("Make", "Nikon")]);
         let before = std::fs::read(&image).expect("image should be readable");
-        let args = RunArgs {
+        let args = WriteArgs {
             remove: vec!["Make".to_string()],
-            ..default_run_args()
+            ..default_write_args()
         };
-        let tags = vec![RunTag {
+        let tags = vec![WriteTag {
             name: "Model".to_string(),
             value: YamlValue::String("F3".to_string()),
         }];
@@ -7035,8 +7017,8 @@ mod tests {
             &tags,
             true,
             &args,
-            StripMode::from_run_args(&args)
-                .expect("run strip mode should parse")
+            StripMode::from_write_args(&args)
+                .expect("write strip mode should parse")
                 .as_ref(),
         );
 
@@ -7053,8 +7035,8 @@ mod tests {
     }
 
     #[test]
-    fn run_plan_merges_global_and_frame_tags() {
-        let directory = temporary_test_directory("run-plan-merge");
+    fn write_plan_merges_global_and_frame_tags() {
+        let directory = temporary_test_directory("write-plan-merge");
         let metadata = directory.join(METADATA_FILE_NAME);
         let image = directory.join("one.jpg");
         let yaml = serde_yaml::from_str::<YamlValue>(
@@ -7070,8 +7052,8 @@ frames:
         )
         .expect("test YAML should parse");
 
-        let plan = build_run_plan(&metadata, &yaml, std::slice::from_ref(&image))
-            .expect("run plan should build");
+        let plan = build_write_plan(&metadata, &yaml, std::slice::from_ref(&image))
+            .expect("write plan should build");
         let frame = plan
             .frame_for_image(&image)
             .expect("image should have merged tags");
@@ -7092,8 +7074,8 @@ frames:
     }
 
     #[test]
-    fn run_plan_expands_iso_aliases_after_frame_overrides() {
-        let directory = temporary_test_directory("run-plan-iso");
+    fn write_plan_expands_iso_aliases_after_frame_overrides() {
+        let directory = temporary_test_directory("write-plan-iso");
         let metadata = directory.join(METADATA_FILE_NAME);
         let image = directory.join("one.jpg");
         let yaml = serde_yaml::from_str::<YamlValue>(
@@ -7107,8 +7089,8 @@ frames:
         )
         .expect("test YAML should parse");
 
-        let plan = build_run_plan(&metadata, &yaml, std::slice::from_ref(&image))
-            .expect("run plan should build");
+        let plan = build_write_plan(&metadata, &yaml, std::slice::from_ref(&image))
+            .expect("write plan should build");
         let tags = plan
             .frame_for_image(&image)
             .expect("image should have merged tags")
@@ -7126,8 +7108,8 @@ frames:
     }
 
     #[test]
-    fn run_plan_labels_filename_frame_keys_with_file_name() {
-        let directory = temporary_test_directory("run-plan-filename-label");
+    fn write_plan_labels_filename_frame_keys_with_file_name() {
+        let directory = temporary_test_directory("write-plan-filename-label");
         let metadata = directory.join(METADATA_FILE_NAME);
         let image = directory.join("2.jpg");
         let yaml = serde_yaml::from_str::<YamlValue>(
@@ -7139,8 +7121,8 @@ frames:
         )
         .expect("test YAML should parse");
 
-        let plan = build_run_plan(&metadata, &yaml, std::slice::from_ref(&image))
-            .expect("run plan should build");
+        let plan = build_write_plan(&metadata, &yaml, std::slice::from_ref(&image))
+            .expect("write plan should build");
         let frame = plan
             .frame_for_image(&image)
             .expect("filename frame should match image");
@@ -7151,8 +7133,8 @@ frames:
     }
 
     #[test]
-    fn run_plan_accepts_null_frames_and_null_frame_values() {
-        let directory = temporary_test_directory("run-plan-null-frames");
+    fn write_plan_accepts_null_frames_and_null_frame_values() {
+        let directory = temporary_test_directory("write-plan-null-frames");
         let metadata = directory.join(METADATA_FILE_NAME);
         let image = directory.join("one.jpg");
         let yaml = serde_yaml::from_str::<YamlValue>(
@@ -7165,8 +7147,8 @@ frames:
         )
         .expect("test YAML should parse");
 
-        let plan = build_run_plan(&metadata, &yaml, std::slice::from_ref(&image))
-            .expect("run plan should build");
+        let plan = build_write_plan(&metadata, &yaml, std::slice::from_ref(&image))
+            .expect("write plan should build");
         let frame = plan
             .frame_for_image(&image)
             .expect("global tags should apply to the null frame");
@@ -7187,40 +7169,40 @@ frames:
 "#,
         )
         .expect("test YAML should parse");
-        let plan = build_run_plan(&metadata, &yaml, std::slice::from_ref(&image))
-            .expect("run plan should build");
+        let plan = build_write_plan(&metadata, &yaml, std::slice::from_ref(&image))
+            .expect("write plan should build");
         assert!(plan.frame_for_image(&image).is_some());
 
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn run_output_renders_file_groups_and_overview() {
+    fn write_output_renders_file_groups_and_overview() {
         colored::control::set_override(true);
         let image = PathBuf::from("image.jpg");
-        let output = RunOutput {
+        let output = WriteOutput {
             metadata_path: PathBuf::from("metadata.yaml"),
             dry_run: true,
             target_count: 3,
             file_warnings: Vec::new(),
             files: vec![
-                RunFileOutput {
+                WriteFileOutput {
                     label: "frame 1 (image.jpg)".to_string(),
                     image: image.clone(),
-                    result: RunFileResult {
+                    result: WriteFileResult {
                         written: 2,
                         warnings: vec!["skipping unsupported writer tag `FilmRoll`".to_string()],
-                        ..RunFileResult::default()
+                        ..WriteFileResult::default()
                     },
                     elapsed_ms: 42,
                     dry_run: false,
                 },
-                RunFileOutput {
+                WriteFileOutput {
                     label: "2.jpg".to_string(),
                     image: PathBuf::from("2.jpg"),
-                    result: RunFileResult {
+                    result: WriteFileResult {
                         written: 1,
-                        ..RunFileResult::default()
+                        ..WriteFileResult::default()
                     },
                     elapsed_ms: 1501,
                     dry_run: false,
@@ -7228,16 +7210,16 @@ frames:
             ],
             skipped_files: vec![PathBuf::from("missing.jpg")],
         };
-        let mut summary = RunSummary::default();
+        let mut summary = WriteSummary::default();
         summary.add(&output.files[0].result);
         summary.add(&output.files[1].result);
         summary.skipped_files = output.skipped_files.len();
         summary.elapsed_ms = 42;
 
-        let rendered = format_run_output(&output, &summary);
+        let rendered = format_write_output(&output, &summary);
         let plain = strip_ansi_codes(&rendered);
 
-        assert!(plain.starts_with("run "));
+        assert!(plain.starts_with("write "));
         assert!(plain.contains("mode: dry-run\n\nframes "));
         assert!(plain.contains("frames "));
         assert!(plain.contains("frame 1 (image.jpg)\nwrote 2 tags\ntook 42ms"));
@@ -7263,34 +7245,34 @@ frames:
         assert!(plain.contains("files skipped  1"));
         assert!(plain.contains("took           42ms"));
         assert!(plain.contains("status         success (with warnings)"));
-        assert!(!plain.contains("run:"));
+        assert!(!plain.contains("write:"));
         assert!(rendered.contains("status         \u{1b}[32msuccess\u{1b}[0m (with warnings)"));
     }
 
     #[test]
-    fn run_output_prints_path_for_non_current_directory_files() {
+    fn write_output_prints_path_for_non_current_directory_files() {
         colored::control::set_override(true);
-        let output = RunOutput {
+        let output = WriteOutput {
             metadata_path: PathBuf::from("metadata.yaml"),
             dry_run: true,
             target_count: 1,
             file_warnings: Vec::new(),
-            files: vec![RunFileOutput {
+            files: vec![WriteFileOutput {
                 label: "image.jpg".to_string(),
                 image: PathBuf::from("nested").join("image.jpg"),
-                result: RunFileResult {
+                result: WriteFileResult {
                     written: 1,
-                    ..RunFileResult::default()
+                    ..WriteFileResult::default()
                 },
                 elapsed_ms: 0,
                 dry_run: false,
             }],
             skipped_files: Vec::new(),
         };
-        let mut summary = RunSummary::default();
+        let mut summary = WriteSummary::default();
         summary.add(&output.files[0].result);
 
-        let rendered = format_run_output(&output, &summary);
+        let rendered = format_write_output(&output, &summary);
         let plain = strip_ansi_codes(&rendered);
 
         assert!(rendered.contains("\u{1b}[96mimage.jpg"));
@@ -7300,56 +7282,56 @@ frames:
     }
 
     #[test]
-    fn run_file_output_renders_strip_status_before_write_status() {
-        let file = RunFileOutput {
+    fn write_file_output_renders_strip_status_before_write_status() {
+        let file = WriteFileOutput {
             label: "image.jpg".to_string(),
             image: PathBuf::from("image.jpg"),
-            result: RunFileResult {
+            result: WriteFileResult {
                 written: 2,
                 strip_attempted: true,
                 stripped: true,
                 removed_tags: 3,
-                ..RunFileResult::default()
+                ..WriteFileResult::default()
             },
             elapsed_ms: 12,
             dry_run: false,
         };
 
-        let rendered = strip_ansi_codes(&format_run_file_output(&file));
+        let rendered = strip_ansi_codes(&format_write_file_output(&file));
 
         assert!(rendered.contains("image.jpg\nstripped EXIF: 3 tags\nwrote 2 tags\ntook 12ms"));
     }
 
     #[test]
-    fn run_file_output_renders_dry_run_strip_status() {
-        let file = RunFileOutput {
+    fn write_file_output_renders_dry_run_strip_status() {
+        let file = WriteFileOutput {
             label: "image.jpg".to_string(),
             image: PathBuf::from("image.jpg"),
-            result: RunFileResult {
+            result: WriteFileResult {
                 written: 1,
                 strip_attempted: true,
                 stripped: true,
                 removed_tags: 1,
-                ..RunFileResult::default()
+                ..WriteFileResult::default()
             },
             elapsed_ms: 12,
             dry_run: true,
         };
 
-        let rendered = strip_ansi_codes(&format_run_file_output(&file));
+        let rendered = strip_ansi_codes(&format_write_file_output(&file));
 
         assert!(rendered.contains("image.jpg\nwould strip EXIF: 1 tags\nwould write 1 tags"));
     }
 
     #[test]
-    fn run_overview_status_omits_warning_suffix_without_warnings() {
+    fn write_overview_status_omits_warning_suffix_without_warnings() {
         colored::control::set_override(true);
-        let summary = RunSummary {
+        let summary = WriteSummary {
             written_tags: 1,
-            ..RunSummary::default()
+            ..WriteSummary::default()
         };
 
-        let rendered = format_run_overview_output(&summary);
+        let rendered = format_write_overview_output(&summary);
         let plain = strip_ansi_codes(&rendered);
 
         assert!(plain.contains("warnings       0"));
@@ -7359,15 +7341,15 @@ frames:
     }
 
     #[test]
-    fn run_overview_status_fail_takes_precedence_over_warning_suffix() {
+    fn write_overview_status_fail_takes_precedence_over_warning_suffix() {
         colored::control::set_override(true);
-        let summary = RunSummary {
+        let summary = WriteSummary {
             warnings: 1,
             errors: 1,
-            ..RunSummary::default()
+            ..WriteSummary::default()
         };
 
-        let rendered = format_run_overview_output(&summary);
+        let rendered = format_write_overview_output(&summary);
         let plain = strip_ansi_codes(&rendered);
 
         assert!(plain.contains("status         fail\n"));
@@ -7376,23 +7358,23 @@ frames:
     }
 
     #[test]
-    fn run_file_output_can_render_header_before_result() {
+    fn write_file_output_can_render_header_before_result() {
         colored::control::set_override(true);
-        let file = RunFileOutput {
+        let file = WriteFileOutput {
             label: "frame 1 (image.jpg)".to_string(),
             image: PathBuf::from("image.jpg"),
-            result: RunFileResult {
+            result: WriteFileResult {
                 written: 2,
                 skipped: vec!["ISO already exists".to_string()],
-                ..RunFileResult::default()
+                ..WriteFileResult::default()
             },
             elapsed_ms: 1500,
             dry_run: false,
         };
 
-        let header = format_run_file_header_output(&file);
-        let result = format_run_file_result_output(&file);
-        let combined = format_run_file_output(&file);
+        let header = format_write_file_header_output(&file);
+        let result = format_write_file_result_output(&file);
+        let combined = format_write_file_output(&file);
 
         assert_eq!(combined, format!("{header}{result}"));
         assert_eq!(strip_ansi_codes(&header), "frame 1 (image.jpg)\n");
@@ -7404,49 +7386,49 @@ frames:
     }
 
     #[test]
-    fn run_file_output_always_prints_zero_written_completion_line() {
-        let file = RunFileOutput {
+    fn write_file_output_always_prints_zero_written_completion_line() {
+        let file = WriteFileOutput {
             label: "frame 1 (image.jpg)".to_string(),
             image: PathBuf::from("image.jpg"),
-            result: RunFileResult {
+            result: WriteFileResult {
                 skipped: vec!["ISO already exists".to_string()],
-                ..RunFileResult::default()
+                ..WriteFileResult::default()
             },
             elapsed_ms: 17,
             dry_run: false,
         };
 
         assert_eq!(
-            strip_ansi_codes(&format_run_file_result_output(&file)),
+            strip_ansi_codes(&format_write_file_result_output(&file)),
             "wrote 0 tags\ntook 17ms\nwarning: skipped ISO already exists\n"
         );
     }
 
     #[test]
-    fn run_file_output_labels_dry_run_completion_as_would_write() {
-        let file = RunFileOutput {
+    fn write_file_output_labels_dry_run_completion_as_would_write() {
+        let file = WriteFileOutput {
             label: "frame 1 (image.jpg)".to_string(),
             image: PathBuf::from("image.jpg"),
-            result: RunFileResult {
+            result: WriteFileResult {
                 written: 2,
-                ..RunFileResult::default()
+                ..WriteFileResult::default()
             },
             elapsed_ms: 9,
             dry_run: true,
         };
 
         assert_eq!(
-            strip_ansi_codes(&format_run_file_result_output(&file)),
+            strip_ansi_codes(&format_write_file_result_output(&file)),
             "would write 2 tags\ntook 9ms\n"
         );
     }
 
     #[test]
-    fn run_duration_formats_milliseconds_until_threshold_then_seconds() {
-        assert_eq!(format_run_duration(42), "42ms");
-        assert_eq!(format_run_duration(1500), "1500ms");
-        assert_eq!(format_run_duration(1501), "1.5s");
-        assert_eq!(format_run_duration(2345), "2.3s");
+    fn write_duration_formats_milliseconds_until_threshold_then_seconds() {
+        assert_eq!(format_write_duration(42), "42ms");
+        assert_eq!(format_write_duration(1500), "1500ms");
+        assert_eq!(format_write_duration(1501), "1.5s");
+        assert_eq!(format_write_duration(2345), "2.3s");
     }
 
     #[test]
@@ -7556,8 +7538,8 @@ frames:
     }
 
     #[test]
-    fn run_dry_run_counts_custom_tags_without_warning() {
-        let args = RunArgs {
+    fn write_dry_run_counts_custom_tags_without_warning() {
+        let args = WriteArgs {
             metadata_or_targets: None,
             targets: None,
             strip: false,
@@ -7569,11 +7551,11 @@ frames:
             recursive: false,
         };
         let tags = vec![
-            RunTag {
+            WriteTag {
                 name: "Make".to_string(),
                 value: YamlValue::String("Nikon".to_string()),
             },
-            RunTag {
+            WriteTag {
                 name: "FilmRoll".to_string(),
                 value: YamlValue::Number(35.into()),
             },
@@ -7587,7 +7569,7 @@ frames:
     }
 
     #[test]
-    fn inspect_decodes_custom_tags_from_user_comment() {
+    fn read_decodes_custom_tags_from_user_comment() {
         colored::control::set_override(true);
         let payload = encode_custom_tags(&[
             CustomTag {
@@ -7601,23 +7583,23 @@ frames:
         ])
         .expect("custom tags should encode");
         let entry = tiff_undefined_entry(0x9286, payload.len(), 200);
-        let metadata = InspectMetadata {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif_with_exif_entries(&[entry], &[(200, payload)]),
             warnings: Vec::new(),
-            file_info: InspectFileInfo {
-                rows: vec![InspectInfoRow::new("Image Width", "100 px")],
+            file_info: ReadFileInfo {
+                rows: vec![ReadInfoRow::new("Image Width", "100 px")],
             },
         };
 
-        let pretty = strip_ansi_codes(&format_inspect_output(
+        let pretty = strip_ansi_codes(&format_read_output(
             Path::new("image.jpg"),
             &metadata,
-            InspectFormat::Pretty,
+            ReadFormat::Pretty,
         ));
-        let raw = strip_ansi_codes(&format_inspect_output(
+        let raw = strip_ansi_codes(&format_read_output(
             Path::new("image.jpg"),
             &metadata,
-            InspectFormat::Raw,
+            ReadFormat::Raw,
         ));
 
         assert!(pretty.contains("custom "));
@@ -7636,7 +7618,7 @@ frames:
     }
 
     #[test]
-    fn run_tag_parser_supports_fraction_and_unit_values() {
+    fn write_tag_parser_supports_fraction_and_unit_values() {
         let exposure = writable_exif_tag("ExposureTime", &YamlValue::String("1/500".to_string()))
             .expect("exposure tag should parse");
         let focal_length = writable_exif_tag("FocalLength", &YamlValue::String("75mm".to_string()))
@@ -7656,17 +7638,17 @@ frames:
     }
 
     #[test]
-    fn validate_metadata_rejects_bad_structure() {
+    fn check_metadata_rejects_bad_structure() {
         let yaml = serde_yaml::from_str::<YamlValue>("- not\n- a mapping")
             .expect("test YAML should parse");
 
-        let result = validate_metadata_yaml(Path::new("metadata.yaml"), &yaml);
+        let result = check_metadata_yaml(Path::new("metadata.yaml"), &yaml);
 
         assert!(matches!(result, Err(message) if message.contains("root must be a mapping")));
     }
 
     #[test]
-    fn validate_metadata_counts_standard_and_unknown_exif_tags() {
+    fn check_metadata_counts_standard_and_unknown_exif_tags() {
         let yaml = serde_yaml::from_str::<YamlValue>(
             r#"
 exif:
@@ -7678,8 +7660,8 @@ exif:
         )
         .expect("test YAML should parse");
 
-        let report = validate_metadata_yaml(Path::new("metadata.yaml"), &yaml)
-            .expect("metadata should validate");
+        let report = check_metadata_yaml(Path::new("metadata.yaml"), &yaml)
+            .expect("metadata should pass checks");
 
         assert_eq!(report.exif_tags.standard, 3);
         assert_eq!(report.exif_tags.unknown, 1);
@@ -7693,8 +7675,8 @@ exif:
     }
 
     #[test]
-    fn validate_metadata_counts_frame_tags_and_location_special_key() {
-        let directory = temporary_test_directory("validate-frame-tags");
+    fn check_metadata_counts_frame_tags_and_location_special_key() {
+        let directory = temporary_test_directory("check-frame-tags");
         let metadata = directory.join(METADATA_FILE_NAME);
         let yaml = serde_yaml::from_str::<YamlValue>(
             r#"
@@ -7708,7 +7690,7 @@ frames:
         .expect("test YAML should parse");
         std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
 
-        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
 
         assert_eq!(report.frame_tags.standard, 2);
         assert_eq!(report.frame_tags.unknown, 1);
@@ -7730,8 +7712,8 @@ frames:
     }
 
     #[test]
-    fn validate_metadata_accepts_null_frames_and_null_frame_values() {
-        let directory = temporary_test_directory("validate-null-frames");
+    fn check_metadata_accepts_null_frames_and_null_frame_values() {
+        let directory = temporary_test_directory("check-null-frames");
         let metadata = directory.join(METADATA_FILE_NAME);
         std::fs::write(directory.join("one.jpg"), []).expect("test image should be written");
 
@@ -7742,7 +7724,7 @@ frames:
 "#,
         )
         .expect("test YAML should parse");
-        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
 
         assert_eq!(report.frame_tags, TagCounts::default());
         assert_eq!(report.frames.frames.len(), 1);
@@ -7755,7 +7737,7 @@ frames:
 "#,
         )
         .expect("test YAML should parse");
-        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
 
         assert_eq!(report.frames.file_count, 1);
         assert!(report.frames.frames.is_empty());
@@ -7764,8 +7746,8 @@ frames:
     }
 
     #[test]
-    fn validate_metadata_warns_when_location_is_not_found() {
-        let directory = temporary_test_directory("validate-missing-location");
+    fn check_metadata_warns_when_location_is_not_found() {
+        let directory = temporary_test_directory("check-missing-location");
         let metadata = directory.join(METADATA_FILE_NAME);
         let yaml = serde_yaml::from_str::<YamlValue>(
             r#"
@@ -7777,7 +7759,7 @@ frames:
         .expect("test YAML should parse");
         std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
 
-        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
 
         assert!(report.location_matches.is_empty());
         assert!(
@@ -7794,7 +7776,7 @@ frames:
     fn formats_missing_location_warning_in_red() {
         colored::control::set_override(true);
 
-        let output = format_validate_warning(
+        let output = format_check_warning(
             "$Location: no match found in database [for <DefinitelyNotARealPlace>]",
         );
 
@@ -7805,23 +7787,23 @@ frames:
     fn formats_missing_frame_file_error_with_error_label() {
         colored::control::set_override(true);
 
-        let output = format_validate_frame_error("file does not exist");
+        let output = format_check_frame_error("file does not exist");
 
         assert_eq!(output, "\u{1b}[31merror: file does not exist\u{1b}[0m");
     }
 
     #[test]
-    fn formats_other_validate_warnings_with_yellow_label() {
+    fn formats_other_check_warnings_with_yellow_label() {
         colored::control::set_override(true);
 
-        let output = format_validate_warning("ignored metadata.yml");
+        let output = format_check_warning("ignored metadata.yml");
 
         assert!(output.starts_with("\u{1b}[33mwarning\u{1b}[0m:"));
     }
 
     #[test]
-    fn validate_metadata_ignores_blank_and_null_locations() {
-        let directory = temporary_test_directory("validate-empty-locations");
+    fn check_metadata_ignores_blank_and_null_locations() {
+        let directory = temporary_test_directory("check-empty-locations");
         let metadata = directory.join(METADATA_FILE_NAME);
         let yaml = serde_yaml::from_str::<YamlValue>(
             r#"
@@ -7836,7 +7818,7 @@ frames:
         std::fs::write(directory.join("one.jpg"), []).expect("test image should be written");
         std::fs::write(directory.join("two.jpg"), []).expect("test image should be written");
 
-        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
 
         assert!(report.location_matches.is_empty());
         assert!(
@@ -7850,8 +7832,8 @@ frames:
     }
 
     #[test]
-    fn validate_metadata_warns_when_location_value_is_not_a_string() {
-        let directory = temporary_test_directory("validate-invalid-location");
+    fn check_metadata_warns_when_location_value_is_not_a_string() {
+        let directory = temporary_test_directory("check-invalid-location");
         let metadata = directory.join(METADATA_FILE_NAME);
         let yaml = serde_yaml::from_str::<YamlValue>(
             r#"
@@ -7863,7 +7845,7 @@ frames:
         .expect("test YAML should parse");
         std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
 
-        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
 
         assert!(report.location_matches.is_empty());
         assert!(
@@ -7877,8 +7859,8 @@ frames:
     }
 
     #[test]
-    fn validate_metadata_errors_for_missing_frame_references() {
-        let directory = temporary_test_directory("validate-missing-frames");
+    fn check_metadata_errors_for_missing_frame_references() {
+        let directory = temporary_test_directory("check-missing-frames");
         let metadata = directory.join(METADATA_FILE_NAME);
         let yaml = serde_yaml::from_str::<YamlValue>(
             r#"
@@ -7892,7 +7874,7 @@ frames:
         .expect("test YAML should parse");
         std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
 
-        let report = validate_metadata_yaml(&metadata, &yaml).expect("metadata should validate");
+        let report = check_metadata_yaml(&metadata, &yaml).expect("metadata should pass checks");
 
         assert!(
             !report
@@ -7923,8 +7905,8 @@ frames:
     }
 
     #[test]
-    fn validate_output_groups_are_rendered_in_order() {
-        let directory = temporary_test_directory("validate-group-order");
+    fn check_output_groups_are_rendered_in_order() {
+        let directory = temporary_test_directory("check-group-order");
         let metadata = directory.join(METADATA_FILE_NAME);
         std::fs::write(
             &metadata,
@@ -7939,8 +7921,8 @@ frames:
         .expect("metadata should be written");
         std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
 
-        let output = build_validate_output(Some(&metadata));
-        let rendered = strip_ansi_codes(&format_validate_output(&output));
+        let output = build_check_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
 
         let file = rendered.find("file ").expect("file group should render");
         let exif = rendered.find("exif ").expect("exif group should render");
@@ -7965,8 +7947,8 @@ frames:
     }
 
     #[test]
-    fn validate_overview_renders_success_without_warnings() {
-        let rendered = strip_ansi_codes(&format_validate_output(&ValidateOutput::default()));
+    fn check_overview_renders_success_without_warnings() {
+        let rendered = strip_ansi_codes(&format_check_output(&CheckOutput::default()));
 
         assert!(rendered.contains("errors      0"));
         assert!(rendered.contains("warnings    0"));
@@ -7975,12 +7957,12 @@ frames:
     }
 
     #[test]
-    fn validate_overview_renders_success_with_warnings() {
-        let output = ValidateOutput {
+    fn check_overview_renders_success_with_warnings() {
+        let output = CheckOutput {
             file_warnings: vec!["metadata.yml ignored because metadata.yaml exists".to_string()],
-            ..ValidateOutput::default()
+            ..CheckOutput::default()
         };
-        let rendered = strip_ansi_codes(&format_validate_output(&output));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
 
         assert!(rendered.contains("errors      0"));
         assert!(rendered.contains("warnings    1"));
@@ -7988,13 +7970,13 @@ frames:
     }
 
     #[test]
-    fn validate_overview_renders_error_when_errors_exist() {
-        let output = ValidateOutput {
+    fn check_overview_renders_error_when_errors_exist() {
+        let output = CheckOutput {
             file_errors: vec!["failed to parse metadata.yaml".to_string()],
             file_warnings: vec!["metadata.yml ignored because metadata.yaml exists".to_string()],
-            ..ValidateOutput::default()
+            ..CheckOutput::default()
         };
-        let rendered = strip_ansi_codes(&format_validate_output(&output));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
 
         assert!(rendered.contains("errors      1"));
         assert!(rendered.contains("warnings    1"));
@@ -8003,8 +7985,8 @@ frames:
     }
 
     #[test]
-    fn validate_overview_counts_missing_frame_file_as_error() {
-        let directory = temporary_test_directory("validate-missing-frame-file-error");
+    fn check_overview_counts_missing_frame_file_as_error() {
+        let directory = temporary_test_directory("check-missing-frame-file-error");
         let metadata = directory.join(METADATA_FILE_NAME);
         std::fs::write(
             &metadata,
@@ -8017,8 +7999,8 @@ frames:
         .expect("metadata should be written");
         std::fs::write(directory.join("image.jpg"), []).expect("image should be written");
 
-        let output = build_validate_output(Some(&metadata));
-        let rendered = strip_ansi_codes(&format_validate_output(&output));
+        let output = build_check_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
 
         assert!(rendered.contains("errors      1"));
         assert!(rendered.contains("warnings    0"));
@@ -8030,30 +8012,30 @@ frames:
     }
 
     #[test]
-    fn validate_overview_colours_success_with_warnings() {
+    fn check_overview_colours_success_with_warnings() {
         colored::control::set_override(true);
 
-        let output = ValidateOutput {
+        let output = CheckOutput {
             file_warnings: vec!["metadata.yml ignored because metadata.yaml exists".to_string()],
-            ..ValidateOutput::default()
+            ..CheckOutput::default()
         };
-        let rendered = format_validate_output(&output);
+        let rendered = format_check_output(&output);
 
         assert!(rendered.contains("validation: \u{1b}[32msuccess\u{1b}[0m"));
         assert!(rendered.contains("\u{1b}[32msuccess\u{1b}[0m (with warnings)"));
     }
 
     #[test]
-    fn validate_overview_colours_nonzero_counts_only() {
+    fn check_overview_colours_nonzero_counts_only() {
         colored::control::set_override(true);
 
-        let output = ValidateOutput {
+        let output = CheckOutput {
             file_errors: vec!["failed to parse metadata.yaml".to_string()],
             file_warnings: vec!["metadata.yml ignored because metadata.yaml exists".to_string()],
-            ..ValidateOutput::default()
+            ..CheckOutput::default()
         };
-        let rendered = format_validate_output(&output);
-        let clean = format_validate_output(&ValidateOutput::default());
+        let rendered = format_check_output(&output);
+        let clean = format_check_output(&CheckOutput::default());
 
         assert!(rendered.contains("errors      \u{1b}[31m1\u{1b}[0m"));
         assert!(rendered.contains("warnings    \u{1b}[33m1\u{1b}[0m"));
@@ -8064,8 +8046,8 @@ frames:
     }
 
     #[test]
-    fn validate_output_renders_frame_blocks_in_yaml_order() {
-        let directory = temporary_test_directory("validate-frame-order");
+    fn check_output_renders_frame_blocks_in_yaml_order() {
+        let directory = temporary_test_directory("check-frame-order");
         let metadata = directory.join(METADATA_FILE_NAME);
         std::fs::write(
             &metadata,
@@ -8081,8 +8063,8 @@ frames:
         std::fs::write(directory.join("one.jpg"), []).expect("test image should be written");
         std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
 
-        let output = build_validate_output(Some(&metadata));
-        let rendered = strip_ansi_codes(&format_validate_output(&output));
+        let output = build_check_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
         let frame_two = rendered.find("← 2").expect("frame 2 should render");
         let frame_image = rendered
             .find("\nimage.jpg\n")
@@ -8094,8 +8076,8 @@ frames:
     }
 
     #[test]
-    fn validate_output_prints_numeric_frame_summary_and_resolved_file() {
-        let directory = temporary_test_directory("validate-numeric-frame-file");
+    fn check_output_prints_numeric_frame_summary_and_resolved_file() {
+        let directory = temporary_test_directory("check-numeric-frame-file");
         let metadata = directory.join(METADATA_FILE_NAME);
         std::fs::write(
             &metadata,
@@ -8109,8 +8091,8 @@ frames:
         let first = directory.join("01.jpg");
         std::fs::write(&first, []).expect("first image should be written");
 
-        let output = build_validate_output(Some(&metadata));
-        let rendered = strip_ansi_codes(&format_validate_output(&output));
+        let output = build_check_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
 
         assert!(rendered.contains("frame numbers: 1"));
         assert!(rendered.contains("files: 1"));
@@ -8132,8 +8114,8 @@ frames:
     }
 
     #[test]
-    fn validate_output_warns_when_numeric_frames_exceed_files() {
-        let directory = temporary_test_directory("validate-more-frame-numbers");
+    fn check_output_warns_when_numeric_frames_exceed_files() {
+        let directory = temporary_test_directory("check-more-frame-numbers");
         let metadata = directory.join(METADATA_FILE_NAME);
         std::fs::write(
             &metadata,
@@ -8148,8 +8130,8 @@ frames:
         .expect("metadata should be written");
         std::fs::write(directory.join("01.jpg"), []).expect("image should be written");
 
-        let output = build_validate_output(Some(&metadata));
-        let rendered = strip_ansi_codes(&format_validate_output(&output));
+        let output = build_check_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
 
         assert!(rendered.contains("frame numbers: 2"));
         assert!(rendered.contains("files: 1"));
@@ -8164,8 +8146,8 @@ frames:
     }
 
     #[test]
-    fn validate_output_does_not_warn_when_files_exceed_numeric_frames() {
-        let directory = temporary_test_directory("validate-more-files");
+    fn check_output_does_not_warn_when_files_exceed_numeric_frames() {
+        let directory = temporary_test_directory("check-more-files");
         let metadata = directory.join(METADATA_FILE_NAME);
         std::fs::write(
             &metadata,
@@ -8179,8 +8161,8 @@ frames:
         std::fs::write(directory.join("01.jpg"), []).expect("first image should be written");
         std::fs::write(directory.join("02.jpg"), []).expect("second image should be written");
 
-        let output = build_validate_output(Some(&metadata));
-        let rendered = strip_ansi_codes(&format_validate_output(&output));
+        let output = build_check_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
 
         assert!(rendered.contains("frame numbers: 1"));
         assert!(rendered.contains("files: 2"));
@@ -8191,8 +8173,8 @@ frames:
     }
 
     #[test]
-    fn validate_output_omits_numeric_summary_for_filename_frames() {
-        let directory = temporary_test_directory("validate-filename-only");
+    fn check_output_omits_numeric_summary_for_filename_frames() {
+        let directory = temporary_test_directory("check-filename-only");
         let metadata = directory.join(METADATA_FILE_NAME);
         std::fs::write(
             &metadata,
@@ -8205,8 +8187,8 @@ frames:
         .expect("metadata should be written");
         std::fs::write(directory.join("image.jpg"), []).expect("image should be written");
 
-        let output = build_validate_output(Some(&metadata));
-        let rendered = strip_ansi_codes(&format_validate_output(&output));
+        let output = build_check_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
 
         assert!(!rendered.contains("frame numbers:"));
         assert!(!rendered.contains("files:"));
@@ -8216,13 +8198,13 @@ frames:
     }
 
     #[test]
-    fn validate_output_skips_later_groups_after_parse_error() {
-        let directory = temporary_test_directory("validate-parse-error");
+    fn check_output_skips_later_groups_after_parse_error() {
+        let directory = temporary_test_directory("check-parse-error");
         let metadata = directory.join(METADATA_FILE_NAME);
         std::fs::write(&metadata, "exif: [").expect("metadata should be written");
 
-        let output = build_validate_output(Some(&metadata));
-        let rendered = strip_ansi_codes(&format_validate_output(&output));
+        let output = build_check_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
 
         assert!(rendered.contains("YAML format: skipped"));
         assert!(rendered.contains("exif "));
@@ -8235,8 +8217,8 @@ frames:
     }
 
     #[test]
-    fn validate_output_uses_expected_colours() {
-        let directory = temporary_test_directory("validate-colours");
+    fn check_output_uses_expected_colours() {
+        let directory = temporary_test_directory("check-colours");
         let metadata = directory.join(METADATA_FILE_NAME);
         std::fs::write(
             &metadata,
@@ -8250,8 +8232,8 @@ frames:
         std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
         colored::control::set_override(true);
 
-        let output = build_validate_output(Some(&metadata));
-        let rendered = format_validate_output(&output);
+        let output = build_check_output(Some(&metadata));
+        let rendered = format_check_output(&output);
 
         assert!(rendered.contains("\u{1b}[94mfile "));
         assert!(rendered.contains("\u{1b}[32mfound "));
@@ -8262,7 +8244,7 @@ frames:
     }
 
     #[test]
-    fn validate_frame_titles_stay_light_blue_with_warnings_or_errors() {
+    fn check_frame_titles_stay_light_blue_with_warnings_or_errors() {
         colored::control::set_override(true);
 
         let warning_frame = FrameReport {
@@ -8279,54 +8261,52 @@ frames:
         };
 
         assert_eq!(
-            validate_frame_title(&warning_frame)
-                .bright_cyan()
-                .to_string(),
+            check_frame_title(&warning_frame).bright_cyan().to_string(),
             "\u{1b}[96mimage.jpg\u{1b}[0m"
         );
         assert_eq!(
-            validate_frame_title(&error_frame).bright_cyan().to_string(),
+            check_frame_title(&error_frame).bright_cyan().to_string(),
             "\u{1b}[96mframe 2\u{1b}[0m"
         );
     }
 
     #[test]
-    fn formats_empty_pretty_inspect_output() {
+    fn formats_empty_pretty_read_output() {
         colored::control::set_override(true);
 
         assert_eq!(
-            format_inspect_output(
+            format_read_output(
                 Path::new("image.tif"),
-                &InspectMetadata {
+                &ReadMetadata {
                     exif: parse_raw_exif(&[]),
                     warnings: Vec::new(),
-                    file_info: InspectFileInfo::empty(),
+                    file_info: ReadFileInfo::empty(),
                 },
-                InspectFormat::Pretty,
+                ReadFormat::Pretty,
             ),
             "\u{1b}[33m<No EXIF metadata found>\u{1b}[0m"
         );
     }
 
     #[test]
-    fn formats_empty_raw_inspect_output() {
+    fn formats_empty_raw_read_output() {
         assert_eq!(
-            format_inspect_output(
+            format_read_output(
                 Path::new("image.tif"),
-                &InspectMetadata {
+                &ReadMetadata {
                     exif: parse_raw_exif(&[]),
                     warnings: Vec::new(),
                     file_info: test_file_info(),
                 },
-                InspectFormat::Raw,
+                ReadFormat::Raw,
             ),
             "<No EXIF metadata found>"
         );
     }
 
     #[test]
-    fn formats_raw_inspect_output_with_unknown_rows_at_the_bottom() {
-        let metadata = InspectMetadata {
+    fn formats_raw_read_output_with_unknown_rows_at_the_bottom() {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif(&[
                 tiff_ascii_entry(0x010f, b"Z\0"),
                 tiff_short_entry(0xfde8, 42),
@@ -8336,7 +8316,7 @@ frames:
             file_info: test_file_info(),
         };
 
-        let output = format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Raw);
+        let output = format_read_output(Path::new("image.tif"), &metadata, ReadFormat::Raw);
 
         assert!(!output.contains("KNOWN"));
         assert!(!output.contains("UNKNOWN"));
@@ -8351,8 +8331,8 @@ frames:
     }
 
     #[test]
-    fn formats_pretty_inspect_output_without_raw_columns() {
-        let metadata = InspectMetadata {
+    fn formats_pretty_read_output_without_raw_columns() {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif(&[
                 tiff_ascii_entry(0x010f, b"Z\0"),
                 tiff_short_entry(0xfde8, 42),
@@ -8362,8 +8342,7 @@ frames:
             file_info: test_file_info(),
         };
 
-        let output =
-            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+        let output = format_read_output(Path::new("image.tif"), &metadata, ReadFormat::Pretty);
         let plain_output = strip_ansi_codes(&output);
 
         assert!(plain_output.contains("file "));
@@ -8385,26 +8364,25 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_output_omits_non_human_readable_tags_without_notice() {
+    fn pretty_read_output_omits_non_human_readable_tags_without_notice() {
         colored::control::set_override(true);
-        let metadata = InspectMetadata {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif(&[
                 tiff_ascii_entry(0x010f, b"Z\0"),
                 tiff_long_entry(0x0111, 12345),
                 tiff_long_entry(0x0117, 67890),
             ]),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         };
 
-        let pretty =
-            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+        let pretty = format_read_output(Path::new("image.tif"), &metadata, ReadFormat::Pretty);
         colored::control::set_override(false);
         let plain_pretty = strip_ansi_codes(&pretty);
-        let raw = strip_ansi_codes(&format_inspect_output(
+        let raw = strip_ansi_codes(&format_read_output(
             Path::new("image.tif"),
             &metadata,
-            InspectFormat::Raw,
+            ReadFormat::Raw,
         ));
 
         assert!(plain_pretty.contains("Make  Z"));
@@ -8425,25 +8403,24 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_output_omits_unknown_values() {
+    fn pretty_read_output_omits_unknown_values() {
         colored::control::set_override(true);
         let long_value = "x".repeat(160);
         let mut raw_value = long_value.clone().into_bytes();
         raw_value.push(0);
         let entry = tiff_ascii_offset_entry(0xfde8, raw_value.len(), 200);
-        let metadata = InspectMetadata {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif_with_offsets(&[entry], &[(200, raw_value)]),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         };
 
-        let pretty =
-            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+        let pretty = format_read_output(Path::new("image.tif"), &metadata, ReadFormat::Pretty);
         let plain_pretty = strip_ansi_codes(&pretty);
-        let raw = strip_ansi_codes(&format_inspect_output(
+        let raw = strip_ansi_codes(&format_read_output(
             Path::new("image.tif"),
             &metadata,
-            InspectFormat::Raw,
+            ReadFormat::Raw,
         ));
         let omitted_message = format!(
             "{}{}",
@@ -8461,9 +8438,9 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_output_keeps_unknown_values_at_display_limit() {
+    fn pretty_read_output_keeps_unknown_values_at_display_limit() {
         let value = "x".repeat(PRETTY_UNKNOWN_VALUE_DISPLAY_LIMIT);
-        let row = InspectRow {
+        let row = ReadRow {
             is_unknown: true,
             ifd: 0,
             context: "Tiff".to_string(),
@@ -8473,29 +8450,28 @@ frames:
             value: value.clone(),
         };
 
-        assert_eq!(pretty_inspect_value(&row), value);
+        assert_eq!(pretty_read_value(&row), value);
     }
 
     #[test]
-    fn pretty_inspect_output_masks_long_known_exif_values() {
+    fn pretty_read_output_masks_long_known_exif_values() {
         colored::control::set_override(true);
         let long_value = "x".repeat(PRETTY_KNOWN_VALUE_DISPLAY_LIMIT + 1);
         let mut raw_value = USER_COMMENT_ASCII_PREFIX.to_vec();
         raw_value.extend_from_slice(long_value.as_bytes());
         let entry = tiff_undefined_entry(0x9286, raw_value.len(), 200);
-        let metadata = InspectMetadata {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif_with_exif_entries(&[entry], &[(200, raw_value)]),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         };
 
-        let pretty =
-            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+        let pretty = format_read_output(Path::new("image.tif"), &metadata, ReadFormat::Pretty);
         let plain_pretty = strip_ansi_codes(&pretty);
-        let raw = strip_ansi_codes(&format_inspect_output(
+        let raw = strip_ansi_codes(&format_read_output(
             Path::new("image.tif"),
             &metadata,
-            InspectFormat::Raw,
+            ReadFormat::Raw,
         ));
         let omitted_message = format!(
             "{}{}",
@@ -8514,9 +8490,9 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_output_keeps_known_exif_values_at_display_limit() {
+    fn pretty_read_output_keeps_known_exif_values_at_display_limit() {
         let value = "x".repeat(PRETTY_KNOWN_VALUE_DISPLAY_LIMIT);
-        let row = InspectRow {
+        let row = ReadRow {
             is_unknown: false,
             ifd: 0,
             context: "Exif".to_string(),
@@ -8526,19 +8502,18 @@ frames:
             value: value.clone(),
         };
 
-        assert_eq!(pretty_inspect_value(&row), value);
+        assert_eq!(pretty_read_value(&row), value);
     }
 
     #[test]
-    fn pretty_inspect_output_omits_empty_groups() {
-        let metadata = InspectMetadata {
+    fn pretty_read_output_omits_empty_groups() {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif(&[tiff_ascii_entry(0x010f, b"Z\0")]),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         };
 
-        let output =
-            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+        let output = format_read_output(Path::new("image.tif"), &metadata, ReadFormat::Pretty);
         let plain_output = strip_ansi_codes(&output);
 
         assert!(plain_output.starts_with("camera "));
@@ -8551,16 +8526,15 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_group_heading_uses_validate_style_blue_rule() {
+    fn pretty_read_group_heading_uses_check_style_blue_rule() {
         colored::control::set_override(true);
-        let metadata = InspectMetadata {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif(&[tiff_ascii_entry(0x010f, b"Z\0")]),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         };
 
-        let output =
-            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+        let output = format_read_output(Path::new("image.tif"), &metadata, ReadFormat::Pretty);
         colored::control::set_override(false);
         let expected = format!("\u{1b}[94mcamera {}\u{1b}[0m", "─".repeat(43));
 
@@ -8580,9 +8554,9 @@ frames:
             "MIME Type",
             "MIMEType",
         ] {
-            let row = InspectInfoRow::new(name, "value");
+            let row = ReadInfoRow::new(name, "value");
 
-            assert!(matches!(classify_info_row(&row), PrettyInspectGroup::File));
+            assert!(matches!(classify_info_row(&row), PrettyReadGroup::File));
         }
     }
 
@@ -8627,8 +8601,8 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_output_deduplicates_identical_ifd_0_and_1_rows_only() {
-        let metadata = InspectMetadata {
+    fn pretty_read_output_deduplicates_identical_ifd_0_and_1_rows_only() {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif_with_ifd1(
                 &[tiff_ascii_entry(0x010f, b"A\0")],
                 &[
@@ -8637,11 +8611,10 @@ frames:
                 ],
             ),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         };
 
-        let output =
-            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+        let output = format_read_output(Path::new("image.tif"), &metadata, ReadFormat::Pretty);
 
         assert_eq!(output.matches("Make").count(), 1);
         assert_eq!(output.matches("A").count(), 1);
@@ -8649,18 +8622,17 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_output_keeps_ifd_0_and_1_rows_with_different_values() {
-        let metadata = InspectMetadata {
+    fn pretty_read_output_keeps_ifd_0_and_1_rows_with_different_values() {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif_with_ifd1(
                 &[tiff_ascii_entry(0x010f, b"A\0")],
                 &[tiff_ascii_entry(0x010f, b"B\0")],
             ),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         };
 
-        let output =
-            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+        let output = format_read_output(Path::new("image.tif"), &metadata, ReadFormat::Pretty);
 
         assert_eq!(output.matches("Make").count(), 2);
         assert!(output.contains("Make  A"));
@@ -8668,25 +8640,25 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_output_omits_photographic_sensitivity_duplicate_of_iso_speed() {
-        let metadata = InspectMetadata {
+    fn pretty_read_output_omits_photographic_sensitivity_duplicate_of_iso_speed() {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif_with_exif_entries(
                 &[tiff_short_entry(0x8827, 400), tiff_long_entry(0x8833, 400)],
                 &[],
             ),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         };
 
-        let pretty = strip_ansi_codes(&format_inspect_output(
+        let pretty = strip_ansi_codes(&format_read_output(
             Path::new("image.tif"),
             &metadata,
-            InspectFormat::Pretty,
+            ReadFormat::Pretty,
         ));
-        let raw = strip_ansi_codes(&format_inspect_output(
+        let raw = strip_ansi_codes(&format_read_output(
             Path::new("image.tif"),
             &metadata,
-            InspectFormat::Raw,
+            ReadFormat::Raw,
         ));
 
         assert!(pretty.contains("ISO Speed"));
@@ -8696,20 +8668,20 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_output_keeps_photographic_sensitivity_when_iso_speed_differs() {
-        let metadata = InspectMetadata {
+    fn pretty_read_output_keeps_photographic_sensitivity_when_iso_speed_differs() {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif_with_exif_entries(
                 &[tiff_short_entry(0x8827, 400), tiff_long_entry(0x8833, 800)],
                 &[],
             ),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         };
 
-        let pretty = strip_ansi_codes(&format_inspect_output(
+        let pretty = strip_ansi_codes(&format_read_output(
             Path::new("image.tif"),
             &metadata,
-            InspectFormat::Pretty,
+            ReadFormat::Pretty,
         ));
 
         assert!(pretty.contains("Photographic Sensitivity  400"));
@@ -8717,17 +8689,17 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_output_keeps_photographic_sensitivity_without_iso_speed() {
-        let metadata = InspectMetadata {
+    fn pretty_read_output_keeps_photographic_sensitivity_without_iso_speed() {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif_with_exif_entries(&[tiff_short_entry(0x8827, 400)], &[]),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         };
 
-        let pretty = strip_ansi_codes(&format_inspect_output(
+        let pretty = strip_ansi_codes(&format_read_output(
             Path::new("image.tif"),
             &metadata,
-            InspectFormat::Pretty,
+            ReadFormat::Pretty,
         ));
 
         assert!(pretty.contains("Photographic Sensitivity  400"));
@@ -8764,13 +8736,13 @@ frames:
     fn raw_output_omits_exposure_time_unit() {
         let (exposure_entry, exposure_data) =
             tiff_rational_entry_with_count(0x829a, &[(1, 1439)], 200);
-        let metadata = InspectMetadata {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif_with_exif_entries(&[exposure_entry], &[(200, exposure_data)]),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         };
 
-        let output = format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Raw);
+        let output = format_read_output(Path::new("image.tif"), &metadata, ReadFormat::Raw);
 
         assert!(output.contains("ExposureTime"));
         assert!(output.contains("1/1439"));
@@ -8781,14 +8753,13 @@ frames:
     fn pretty_output_rounds_exposure_time_reciprocal_denominator() {
         let (exposure_entry, exposure_data) =
             tiff_rational_entry_with_count(0x829a, &[(10_000, 14_392_134)], 200);
-        let metadata = InspectMetadata {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif_with_exif_entries(&[exposure_entry], &[(200, exposure_data)]),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         };
 
-        let output =
-            format_inspect_output(Path::new("image.tif"), &metadata, InspectFormat::Pretty);
+        let output = format_read_output(Path::new("image.tif"), &metadata, ReadFormat::Pretty);
 
         assert!(output.contains("Exposure Time"));
         assert!(output.contains("1/1439"));
@@ -8812,7 +8783,7 @@ frames:
         std::fs::write(&path, [0xff, 0xd8, 0xff]).expect("test image should be written");
         let exif = parse_raw_exif(&[]);
         let file_info =
-            InspectFileInfo::from_path(&path, &exif).expect("file info should be collected");
+            ReadFileInfo::from_path(&path, &exif).expect("file info should be collected");
         let rows = file_info.rows;
 
         assert!(info_row_value(&rows, "Exifmeta Version Number").is_none());
@@ -8836,8 +8807,7 @@ frames:
     fn appends_signed_decimal_gps_coordinates() {
         let metadata = test_gps_metadata();
 
-        let output =
-            format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Pretty);
+        let output = format_read_output(Path::new("image.jpg"), &metadata, ReadFormat::Pretty);
         let plain_output = strip_ansi_codes(&output);
 
         assert!(output.contains("GPS Latitude"));
@@ -8860,12 +8830,11 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_output_appends_nearest_locations() {
+    fn pretty_read_output_appends_nearest_locations() {
         colored::control::set_override(true);
         let metadata = test_gps_metadata();
 
-        let output =
-            format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Pretty);
+        let output = format_read_output(Path::new("image.jpg"), &metadata, ReadFormat::Pretty);
         colored::control::set_override(false);
         let plain_output = strip_ansi_codes(&output);
 
@@ -8890,11 +8859,10 @@ frames:
     }
 
     #[test]
-    fn pretty_inspect_output_omits_nearest_city_when_it_duplicates_nearest_location() {
+    fn pretty_read_output_omits_nearest_city_when_it_duplicates_nearest_location() {
         let metadata = test_coventry_gps_metadata();
 
-        let output =
-            format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Pretty);
+        let output = format_read_output(Path::new("image.jpg"), &metadata, ReadFormat::Pretty);
         let plain_output = strip_ansi_codes(&output);
 
         assert_eq!(plain_output.matches("GPS Nearest Location").count(), 5);
@@ -8904,10 +8872,10 @@ frames:
     }
 
     #[test]
-    fn raw_inspect_output_omits_nearest_locations() {
+    fn raw_read_output_omits_nearest_locations() {
         let metadata = test_gps_metadata();
 
-        let output = format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Raw);
+        let output = format_read_output(Path::new("image.jpg"), &metadata, ReadFormat::Raw);
 
         assert!(output.contains("GPSLatitude"));
         assert!(output.contains("GPSLatitudeRef"));
@@ -8923,14 +8891,13 @@ frames:
     fn appends_unsigned_decimal_gps_coordinate_when_ref_is_missing() {
         let (latitude_entry, latitude_data) =
             tiff_rational_entry(0x0002, [(10, 1), (30, 1), (0, 1)], 200);
-        let metadata = InspectMetadata {
+        let metadata = ReadMetadata {
             exif: parse_raw_exif_with_gps_entries(&[latitude_entry], &[(200, latitude_data)]),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         };
 
-        let output =
-            format_inspect_output(Path::new("image.jpg"), &metadata, InspectFormat::Pretty);
+        let output = format_read_output(Path::new("image.jpg"), &metadata, ReadFormat::Pretty);
 
         assert!(output.contains("GPS Latitude"));
         assert!(output.contains("[GPSLatitudeRef missing]"));
@@ -9028,15 +8995,15 @@ frames:
         let path = temporary_test_path("no-exif.jpg");
         std::fs::write(&path, [0xff, 0xd8, 0xff, 0xd9]).expect("test JPEG should be written");
 
-        let metadata = read_metadata(&path).expect("missing EXIF should not fail inspect");
+        let metadata = read_metadata(&path).expect("missing EXIF should not fail read");
 
-        let pretty = format_inspect_output(&path, &metadata, InspectFormat::Pretty);
+        let pretty = format_read_output(&path, &metadata, ReadFormat::Pretty);
         assert!(
             pretty == "\u{1b}[33m<No EXIF metadata found>\u{1b}[0m"
                 || pretty == "<No EXIF metadata found>"
         );
         assert_eq!(
-            format_inspect_output(&path, &metadata, InspectFormat::Raw),
+            format_read_output(&path, &metadata, ReadFormat::Raw),
             "<No EXIF metadata found>"
         );
 
@@ -9048,7 +9015,7 @@ frames:
         let missing = Path::new("definitely-missing-image.tif");
 
         assert_eq!(
-            validate_image_path(missing),
+            check_image_path(missing),
             Err("image does not exist: definitely-missing-image.tif".to_string())
         );
     }
@@ -9056,18 +9023,18 @@ frames:
     #[test]
     fn rejects_directory_image_path() {
         assert_eq!(
-            validate_image_path(Path::new(".")),
+            check_image_path(Path::new(".")),
             Err("image path is not a file: .".to_string())
         );
     }
 
-    fn test_gps_metadata() -> InspectMetadata {
+    fn test_gps_metadata() -> ReadMetadata {
         let (latitude_entry, latitude_data) =
             tiff_rational_entry(0x0002, [(52, 1), (21, 1), (101952, 10000)], 200);
         let (longitude_entry, longitude_data) =
             tiff_rational_entry(0x0004, [(1, 1), (18, 1), (1471968, 100000)], 224);
 
-        InspectMetadata {
+        ReadMetadata {
             exif: parse_raw_exif_with_gps_entries(
                 &[
                     tiff_ascii_entry(0x0001, b"N\0"),
@@ -9078,17 +9045,17 @@ frames:
                 &[(200, latitude_data), (224, longitude_data)],
             ),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         }
     }
 
-    fn test_coventry_gps_metadata() -> InspectMetadata {
+    fn test_coventry_gps_metadata() -> ReadMetadata {
         let (latitude_entry, latitude_data) =
             tiff_rational_entry(0x0002, [(52, 1), (24, 1), (23616, 1000)], 200);
         let (longitude_entry, longitude_data) =
             tiff_rational_entry(0x0004, [(1, 1), (30, 1), (43812, 1000)], 224);
 
-        InspectMetadata {
+        ReadMetadata {
             exif: parse_raw_exif_with_gps_entries(
                 &[
                     tiff_ascii_entry(0x0001, b"N\0"),
@@ -9099,17 +9066,17 @@ frames:
                 &[(200, latitude_data), (224, longitude_data)],
             ),
             warnings: Vec::new(),
-            file_info: InspectFileInfo::empty(),
+            file_info: ReadFileInfo::empty(),
         }
     }
 
-    fn test_file_info() -> InspectFileInfo {
-        InspectFileInfo {
-            rows: vec![InspectInfoRow::new("File Name", "image.tif")],
+    fn test_file_info() -> ReadFileInfo {
+        ReadFileInfo {
+            rows: vec![ReadInfoRow::new("File Name", "image.tif")],
         }
     }
 
-    fn info_row_value<'a>(rows: &'a [InspectInfoRow], name: &str) -> Option<&'a str> {
+    fn info_row_value<'a>(rows: &'a [ReadInfoRow], name: &str) -> Option<&'a str> {
         rows.iter()
             .find(|row| row.name == name)
             .map(|row| row.value.as_str())
@@ -9119,12 +9086,12 @@ frames:
         std::fs::write(image, [0xff, 0xd8, 0xff, 0xd9]).expect("test JPEG should be written");
         let tags = tags
             .into_iter()
-            .map(|(name, value)| RunTag {
+            .map(|(name, value)| WriteTag {
                 name: name.to_string(),
                 value: YamlValue::String(value.to_string()),
             })
             .collect::<Vec<_>>();
-        let args = RunArgs {
+        let args = WriteArgs {
             metadata_or_targets: None,
             targets: None,
             strip: false,
@@ -9139,8 +9106,8 @@ frames:
         assert!(result.errors.is_empty(), "{:?}", result.errors);
     }
 
-    fn default_run_args() -> RunArgs {
-        RunArgs {
+    fn default_write_args() -> WriteArgs {
+        WriteArgs {
             metadata_or_targets: None,
             targets: None,
             strip: false,

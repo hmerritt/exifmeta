@@ -17,18 +17,18 @@ pub struct Cli {
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
 pub enum Command {
     #[command(about = "Read metadata.yaml and write EXIF data to target image files")]
-    Run(RunArgs),
+    Write(WriteArgs),
 
     #[command(about = "Create a template metadata.yaml file")]
-    Init(InitArgs),
+    New(NewArgs),
 
     #[command(about = "Check metadata.yaml is valid")]
-    Validate(ValidateArgs),
+    Check(CheckArgs),
 
     #[command(about = "Read and pretty-print the current EXIF data of an image file")]
-    Inspect(InspectArgs),
+    Read(ReadArgs),
 
-    #[command(about = "Interactively browse folders and inspect image EXIF data")]
+    #[command(about = "Interactively browse folders and read image EXIF data")]
     Interactive(InteractiveArgs),
 
     #[command(about = "Remove all existing EXIF metadata from target image files")]
@@ -36,13 +36,13 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
-pub struct InitArgs {
+pub struct NewArgs {
     #[arg(value_name = "DIRECTORY", default_value = ".")]
     pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
-pub struct ValidateArgs {
+pub struct CheckArgs {
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
 }
@@ -54,7 +54,7 @@ pub struct InteractiveArgs {
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
-pub struct RunArgs {
+pub struct WriteArgs {
     #[arg(value_name = "METADATA_OR_TARGETS")]
     pub metadata_or_targets: Option<PathBuf>,
 
@@ -157,21 +157,21 @@ pub struct StripArgs {
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
-pub struct InspectArgs {
+pub struct ReadArgs {
     #[arg(value_name = "IMAGE")]
     pub image: PathBuf,
 
     #[arg(
         long,
         value_enum,
-        default_value_t = InspectFormat::Pretty,
-        help = "Choose the inspect output format"
+        default_value_t = ReadFormat::Pretty,
+        help = "Choose the read output format"
     )]
-    pub format: InspectFormat,
+    pub format: ReadFormat,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub enum InspectFormat {
+pub enum ReadFormat {
     Pretty,
     Raw,
 }
@@ -182,34 +182,34 @@ mod tests {
 
     #[test]
     fn parses_each_readme_command() {
-        for command in ["run", "init", "validate", "interactive", "strip"] {
+        for command in ["write", "new", "check", "interactive", "strip"] {
             assert!(
                 Cli::try_parse_from(["exifmeta", command]).is_ok(),
                 "expected {command} to parse"
             );
         }
 
-        assert!(Cli::try_parse_from(["exifmeta", "inspect", "image.jpg"]).is_ok());
+        assert!(Cli::try_parse_from(["exifmeta", "read", "image.jpg"]).is_ok());
     }
 
     #[test]
-    fn parses_init_default_path() {
-        let cli = Cli::try_parse_from(["exifmeta", "init"]).expect("init should parse");
+    fn parses_new_default_path() {
+        let cli = Cli::try_parse_from(["exifmeta", "new"]).expect("new should parse");
 
-        let Command::Init(args) = cli.command else {
-            panic!("expected init command");
+        let Command::New(args) = cli.command else {
+            panic!("expected new command");
         };
 
         assert_eq!(args.path, PathBuf::from("."));
     }
 
     #[test]
-    fn parses_init_path() {
-        let cli = Cli::try_parse_from(["exifmeta", "init", "some/other/directory"])
-            .expect("init path should parse");
+    fn parses_new_path() {
+        let cli = Cli::try_parse_from(["exifmeta", "new", "some/other/directory"])
+            .expect("new path should parse");
 
-        let Command::Init(args) = cli.command else {
-            panic!("expected init command");
+        let Command::New(args) = cli.command else {
+            panic!("expected new command");
         };
 
         assert_eq!(args.path, PathBuf::from("some/other/directory"));
@@ -240,60 +240,60 @@ mod tests {
     }
 
     #[test]
-    fn parses_inspect_default_format() {
-        let cli = Cli::try_parse_from(["exifmeta", "inspect", "image.jpg"])
-            .expect("inspect command should parse");
+    fn parses_read_default_format() {
+        let cli = Cli::try_parse_from(["exifmeta", "read", "image.jpg"])
+            .expect("read command should parse");
 
-        let Command::Inspect(args) = cli.command else {
-            panic!("expected inspect command");
+        let Command::Read(args) = cli.command else {
+            panic!("expected read command");
         };
 
         assert_eq!(args.image, PathBuf::from("image.jpg"));
-        assert_eq!(args.format, InspectFormat::Pretty);
+        assert_eq!(args.format, ReadFormat::Pretty);
     }
 
     #[test]
-    fn parses_inspect_raw_format() {
-        let cli = Cli::try_parse_from(["exifmeta", "inspect", "image.jpg", "--format", "raw"])
-            .expect("inspect raw format should parse");
+    fn parses_read_raw_format() {
+        let cli = Cli::try_parse_from(["exifmeta", "read", "image.jpg", "--format", "raw"])
+            .expect("read raw format should parse");
 
-        let Command::Inspect(args) = cli.command else {
-            panic!("expected inspect command");
+        let Command::Read(args) = cli.command else {
+            panic!("expected read command");
         };
 
-        assert_eq!(args.format, InspectFormat::Raw);
+        assert_eq!(args.format, ReadFormat::Raw);
     }
 
     #[test]
-    fn rejects_invalid_inspect_format() {
+    fn rejects_invalid_read_format() {
         assert!(
-            Cli::try_parse_from(["exifmeta", "inspect", "image.jpg", "--format", "json"]).is_err()
+            Cli::try_parse_from(["exifmeta", "read", "image.jpg", "--format", "json"]).is_err()
         );
     }
 
     #[test]
-    fn rejects_run_flags_on_inspect() {
-        assert!(Cli::try_parse_from(["exifmeta", "inspect", "image.jpg", "--recursive"]).is_err());
+    fn rejects_write_flags_on_read() {
+        assert!(Cli::try_parse_from(["exifmeta", "read", "image.jpg", "--recursive"]).is_err());
     }
 
     #[test]
-    fn parses_run_flags() {
+    fn parses_write_flags() {
         let cli = Cli::try_parse_from([
             "exifmeta",
             "--dry-run",
-            "run",
+            "write",
             "--strip",
             "--no-overwrite",
             "--extensions",
             "jpg,tiff",
             "--recursive",
         ])
-        .expect("run flags should parse");
+        .expect("write flags should parse");
 
         assert!(cli.dry_run);
 
-        let Command::Run(args) = cli.command else {
-            panic!("expected run command");
+        let Command::Write(args) = cli.command else {
+            panic!("expected write command");
         };
 
         assert!(args.strip);
@@ -306,12 +306,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_run_keep() {
-        let cli = Cli::try_parse_from(["exifmeta", "run", "--keep", "Make,Model"])
-            .expect("run keep should parse");
+    fn parses_write_keep() {
+        let cli = Cli::try_parse_from(["exifmeta", "write", "--keep", "Make,Model"])
+            .expect("write keep should parse");
 
-        let Command::Run(args) = cli.command else {
-            panic!("expected run command");
+        let Command::Write(args) = cli.command else {
+            panic!("expected write command");
         };
 
         assert!(!args.strip);
@@ -321,31 +321,31 @@ mod tests {
     }
 
     #[test]
-    fn parses_run_repeated_remove_values() {
+    fn parses_write_repeated_remove_values() {
         let cli = Cli::try_parse_from([
             "exifmeta",
-            "run",
+            "write",
             "--remove",
             "GPSLatitude,GPSLongitude",
             "--remove",
             "UserComment",
         ])
-        .expect("run repeated remove values should parse");
+        .expect("write repeated remove values should parse");
 
-        let Command::Run(args) = cli.command else {
-            panic!("expected run command");
+        let Command::Write(args) = cli.command else {
+            panic!("expected write command");
         };
 
         assert_eq!(args.remove, ["GPSLatitude", "GPSLongitude", "UserComment"]);
     }
 
     #[test]
-    fn parses_run_remove_with_privacy() {
-        let cli = Cli::try_parse_from(["exifmeta", "run", "--privacy", "--remove", "FNumber"])
-            .expect("run remove should compose with privacy");
+    fn parses_write_remove_with_privacy() {
+        let cli = Cli::try_parse_from(["exifmeta", "write", "--privacy", "--remove", "FNumber"])
+            .expect("write remove should compose with privacy");
 
-        let Command::Run(args) = cli.command else {
-            panic!("expected run command");
+        let Command::Write(args) = cli.command else {
+            panic!("expected write command");
         };
 
         assert!(args.privacy);
@@ -353,11 +353,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_conflicting_run_strip_modes() {
-        assert!(Cli::try_parse_from(["exifmeta", "run", "--privacy", "--keep", "Make"]).is_err());
-        assert!(Cli::try_parse_from(["exifmeta", "run", "--strip", "--keep", "Make"]).is_err());
-        assert!(Cli::try_parse_from(["exifmeta", "run", "--strip", "--remove", "Make"]).is_err());
-        assert!(Cli::try_parse_from(["exifmeta", "run", "--strip", "--privacy"]).is_err());
+    fn rejects_conflicting_write_strip_modes() {
+        assert!(Cli::try_parse_from(["exifmeta", "write", "--privacy", "--keep", "Make"]).is_err());
+        assert!(Cli::try_parse_from(["exifmeta", "write", "--strip", "--keep", "Make"]).is_err());
+        assert!(Cli::try_parse_from(["exifmeta", "write", "--strip", "--remove", "Make"]).is_err());
+        assert!(Cli::try_parse_from(["exifmeta", "write", "--strip", "--privacy"]).is_err());
     }
 
     #[test]
@@ -463,31 +463,31 @@ mod tests {
 
     #[test]
     fn parses_global_dry_run_after_subcommand() {
-        let cli = Cli::try_parse_from(["exifmeta", "validate", "--dry-run"])
+        let cli = Cli::try_parse_from(["exifmeta", "check", "--dry-run"])
             .expect("global dry-run should parse after subcommands");
 
         assert!(cli.dry_run);
-        assert_eq!(cli.command, Command::Validate(ValidateArgs { path: None }));
+        assert_eq!(cli.command, Command::Check(CheckArgs { path: None }));
     }
 
     #[test]
-    fn parses_validate_default_path() {
-        let cli = Cli::try_parse_from(["exifmeta", "validate"]).expect("validate should parse");
+    fn parses_check_default_path() {
+        let cli = Cli::try_parse_from(["exifmeta", "check"]).expect("check should parse");
 
-        let Command::Validate(args) = cli.command else {
-            panic!("expected validate command");
+        let Command::Check(args) = cli.command else {
+            panic!("expected check command");
         };
 
         assert_eq!(args.path, None);
     }
 
     #[test]
-    fn parses_validate_path() {
-        let cli = Cli::try_parse_from(["exifmeta", "validate", "some/metadata.yaml"])
-            .expect("validate path should parse");
+    fn parses_check_path() {
+        let cli = Cli::try_parse_from(["exifmeta", "check", "some/metadata.yaml"])
+            .expect("check path should parse");
 
-        let Command::Validate(args) = cli.command else {
-            panic!("expected validate command");
+        let Command::Check(args) = cli.command else {
+            panic!("expected check command");
         };
 
         assert_eq!(args.path, Some(PathBuf::from("some/metadata.yaml")));
@@ -496,5 +496,17 @@ mod tests {
     #[test]
     fn rejects_unknown_commands() {
         assert!(Cli::try_parse_from(["exifmeta", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn rejects_renamed_commands() {
+        for command in ["run", "init", "validate"] {
+            assert!(
+                Cli::try_parse_from(["exifmeta", command]).is_err(),
+                "expected old {command} command to be rejected"
+            );
+        }
+
+        assert!(Cli::try_parse_from(["exifmeta", "inspect", "image.jpg"]).is_err());
     }
 }

@@ -18,11 +18,11 @@ A simple program to read a standardised `metadata.yaml` file and write the data 
 
 | Command       | Function                                                                             |
 | :------------ | :----------------------------------------------------------------------------------- |
-| `run`         | Main function; reads `metadata.yaml` file and writes EXIF data to target image files |
-| `init`        | Create template `metadata.yaml` file                                                 |
-| `validate`    | Checks `metadata.yaml` is valid                                                      |
-| `inspect`     | Read and pretty-print the current EXIF data of a specific image file                 |
-| `interactive` | Interactively browse folders and inspect image EXIF data                             |
+| `write`       | Main function; reads `metadata.yaml` file and writes EXIF data to target image files |
+| `new`         | Create template `metadata.yaml` file                                                 |
+| `check`       | Checks `metadata.yaml` is valid                                                      |
+| `read`        | Read and pretty-print the current EXIF data of a specific image file                 |
+| `interactive` | Interactively browse folders and read image EXIF data                                |
 | `strip`       | Removes all existing EXIF metadata from target image files                           |
 
 ### Flags
@@ -30,14 +30,14 @@ A simple program to read a standardised `metadata.yaml` file and write the data 
 | Command          | Function                                                                                                                                   |
 | :--------------- | :----------------------------------------------------------------------------------------------------------------------------------------- |
 | `--dry-run`      | Runs the program in 'simulation' mode, without making any changes to any files                                                             |
-| `--strip`        | With `run`, remove all existing EXIF data from each file before adding new data                                                            |
+| `--strip`        | With `write`, remove all existing EXIF data from each file before adding new data                                                          |
 | `--no-overwrite` | Prevents overwriting exif data if there is already data there                                                                              |
 | `--extensions`   | Restricts processing to specified file typologies to prevent the script from attempting to modify unsupported binaries (e.g., -e jpg,tiff) |
 | `--recursive`    | Find image files across all subdirectories, applying the root configuration to nested image repositories                                   |
 | `--verify`       | Re-read images after `strip` and fail if EXIF metadata remains                                                                             |
-| `--keep`         | With `run` or `strip`, remove all EXIF tags except the comma-separated tag names                                                           |
-| `--remove`       | With `run` or `strip`, remove the comma-separated tag names; can combine with `--keep` or `--privacy` and takes precedence                 |
-| `--privacy`      | With `run` or `strip`, remove known privacy-sensitive EXIF tags while keeping harmless technical and unknown tags                          |
+| `--keep`         | With `write` or `strip`, remove all EXIF tags except the comma-separated tag names                                                         |
+| `--remove`       | With `write` or `strip`, remove the comma-separated tag names; can combine with `--keep` or `--privacy` and takes precedence               |
+| `--privacy`      | With `write` or `strip`, remove known privacy-sensitive EXIF tags while keeping harmless technical and unknown tags                        |
 | `--json`         | Emit machine-readable JSON output for `strip`                                                                                              |
 
 ### Supported Image File Formats
