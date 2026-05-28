@@ -18,12 +18,12 @@ A simple program to read a standardised `metadata.yaml` file and write the data 
 
 | Command       | Function                                                                             |
 | :------------ | :----------------------------------------------------------------------------------- |
-| `write`       | Main function; reads `metadata.yaml` file and writes EXIF data to target image files |
 | `new`         | Create template `metadata.yaml` file                                                 |
 | `check`       | Checks `metadata.yaml` is valid                                                      |
 | `read`        | Read and pretty-print the current EXIF data of a specific image file                 |
-| `interactive` | Interactively browse folders and read image EXIF data                                |
+| `write`       | Main function; reads `metadata.yaml` file and writes EXIF data to target image files |
 | `strip`       | Removes all existing EXIF metadata from target image files                           |
+| `interactive` | Interactively browse folders and read image EXIF data                                |
 
 ### Flags
 

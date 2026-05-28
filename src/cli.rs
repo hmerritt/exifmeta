@@ -16,9 +16,6 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
 pub enum Command {
-    #[command(about = "Read metadata.yaml and write EXIF data to target image files")]
-    Write(WriteArgs),
-
     #[command(about = "Create a template metadata.yaml file")]
     New(NewArgs),
 
@@ -28,11 +25,14 @@ pub enum Command {
     #[command(about = "Read and pretty-print the current EXIF data of an image file")]
     Read(ReadArgs),
 
-    #[command(about = "Interactively browse folders and read image EXIF data")]
-    Interactive(InteractiveArgs),
+    #[command(about = "Read metadata.yaml and write EXIF data to target image files")]
+    Write(WriteArgs),
 
     #[command(about = "Remove all existing EXIF metadata from target image files")]
     Strip(StripArgs),
+
+    #[command(about = "Interactively browse folders and read image EXIF data")]
+    Interactive(InteractiveArgs),
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -179,10 +179,40 @@ pub enum ReadFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn help_lists_commands_in_documented_order() {
+        let mut command = Cli::command();
+        let help = command.render_help().to_string();
+        let expected_order = ["new", "check", "read", "write", "strip", "interactive"];
+        let mut previous_position = 0;
+
+        for expected_command in expected_order {
+            let position = help
+                .find(&format!("  {expected_command}"))
+                .unwrap_or_else(|| panic!("expected help to list {expected_command} command"));
+
+            assert!(
+                position >= previous_position,
+                "expected {expected_command} to appear after previous command in help:\n{help}"
+            );
+
+            previous_position = position;
+        }
+
+        let help_position = help
+            .find("  help")
+            .expect("expected help to list generated help command");
+        assert!(
+            help_position >= previous_position,
+            "expected generated help command to appear after app commands:\n{help}"
+        );
+    }
 
     #[test]
     fn parses_each_readme_command() {
-        for command in ["write", "new", "check", "interactive", "strip"] {
+        for command in ["new", "check", "write", "strip", "interactive"] {
             assert!(
                 Cli::try_parse_from(["exifmeta", command]).is_ok(),
                 "expected {command} to parse"
