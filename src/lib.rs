@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, FileTimes, Metadata, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -35,6 +35,9 @@ use rusqlite::{Connection, DatabaseName, params, params_from_iter};
 use serde_json::json;
 use serde_yaml::{Mapping, Value as YamlValue};
 
+#[cfg(windows)]
+use std::os::windows::fs::FileTimesExt;
+
 pub mod cli;
 pub mod version;
 
@@ -55,6 +58,7 @@ const PRETTY_UNKNOWN_VALUE_DISPLAY_LIMIT: usize = 120;
 const PRETTY_KNOWN_VALUE_DISPLAY_LIMIT: usize = 2000;
 const PRETTY_UNKNOWN_VALUE_OMITTED_LABEL: &str = "<long value omitted>";
 const PRETTY_UNKNOWN_VALUE_OMITTED_HINT: &str = " (use `--format raw` to view)";
+const PRIVACY_FILE_TIMESTAMP_SECONDS: u64 = 946_684_800;
 const METADATA_TEMPLATE: &str = r#"# yaml-language-server: $schema=https://raw.githubusercontent.com/hmerritt/exif-medadata/master/schemas/metadata.schema.json
 
 # ───────────────────────────────────────────────
@@ -4334,10 +4338,11 @@ fn strip_command(dry_run: bool, args: StripArgs) -> Result<(), CliError> {
 
         let file_started = Instant::now();
         let result = if args.json {
-            strip_metadata_from_image(&file_output.image, dry_run, args.verify, &mode)
+            strip_image_for_strip_command(&file_output.image, dry_run, args.verify, &mode)
         } else {
             let progress = TerminalSpinner::start(spinner, "stripping metadata".to_string());
-            let result = strip_metadata_from_image(&file_output.image, dry_run, args.verify, &mode);
+            let result =
+                strip_image_for_strip_command(&file_output.image, dry_run, args.verify, &mode);
             progress.finish();
             result
         };
@@ -4378,6 +4383,7 @@ fn strip_command(dry_run: bool, args: StripArgs) -> Result<(), CliError> {
 struct StripFileResult {
     stripped: bool,
     verified: bool,
+    timestamps_reset: bool,
     removed_tags: usize,
     warnings: Vec<String>,
     errors: Vec<String>,
@@ -4565,6 +4571,10 @@ impl StripMode {
             StripRemovalDecision::Base => !(is_tiff && is_required_tiff_structural_field(field)),
             StripRemovalDecision::Keep => false,
         }
+    }
+
+    fn resets_file_timestamps(&self) -> bool {
+        matches!(self.base, StripBaseMode::Privacy)
     }
 }
 
@@ -4785,6 +4795,58 @@ fn strip_metadata_from_image(
     }
 
     result
+}
+
+fn strip_image_for_strip_command(
+    image: &Path,
+    dry_run: bool,
+    verify: bool,
+    mode: &StripMode,
+) -> StripFileResult {
+    let mut result = strip_metadata_from_image(image, dry_run, verify, mode);
+    if !mode.resets_file_timestamps() || !result.errors.is_empty() {
+        return result;
+    }
+
+    if dry_run {
+        result.timestamps_reset = true;
+        return result;
+    }
+
+    match reset_privacy_file_timestamps(image) {
+        Ok(()) => {
+            result.timestamps_reset = true;
+        }
+        Err(error) => result
+            .errors
+            .push(format!("failed to reset file timestamps: {error}")),
+    }
+
+    result
+}
+
+fn reset_privacy_file_timestamps(image: &Path) -> Result<(), String> {
+    set_file_timestamps(image, privacy_file_timestamp())
+}
+
+fn privacy_file_timestamp() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(PRIVACY_FILE_TIMESTAMP_SECONDS)
+}
+
+fn set_file_timestamps(image: &Path, timestamp: SystemTime) -> Result<(), String> {
+    let mut times = FileTimes::new()
+        .set_accessed(timestamp)
+        .set_modified(timestamp);
+    #[cfg(windows)]
+    {
+        times = times.set_created(timestamp);
+    }
+
+    File::options()
+        .write(true)
+        .open(image)
+        .and_then(|file| file.set_times(times))
+        .map_err(|error| error.to_string())
 }
 
 fn strip_tiff_full_metadata(image: &Path) -> Result<(), String> {
@@ -5058,6 +5120,14 @@ fn append_strip_file_result(rendered: &mut String, file: &StripFileOutput) {
     };
     rendered.push_str(&format!("{action}\n"));
     rendered.push_str(&format!("removed {} tags\n", file.result.removed_tags));
+    if file.result.timestamps_reset {
+        let action = if file.dry_run {
+            "would reset file timestamps"
+        } else {
+            "reset file timestamps"
+        };
+        rendered.push_str(&format!("{action}\n"));
+    }
     if file.result.verified {
         rendered.push_str("verified: no EXIF metadata\n");
     }
@@ -5117,6 +5187,8 @@ fn format_strip_json_output(output: &StripOutput, summary: &StripSummary) -> Str
                 "status": strip_file_status(file),
                 "stripped": file.result.stripped && !file.dry_run,
                 "would_strip": file.result.stripped && file.dry_run,
+                "timestamps_reset": file.result.timestamps_reset && !file.dry_run,
+                "would_reset_timestamps": file.result.timestamps_reset && file.dry_run,
                 "removed_tags": file.result.removed_tags,
                 "verified": file.result.verified,
                 "elapsed_ms": file.elapsed_ms,
@@ -5151,6 +5223,10 @@ fn strip_file_status(file: &StripFileOutput) -> &'static str {
         "error"
     } else if file.dry_run && file.result.stripped {
         "would_strip"
+    } else if file.dry_run && file.result.timestamps_reset {
+        "would_reset_timestamps"
+    } else if !file.result.stripped && file.result.timestamps_reset {
+        "timestamps_reset"
     } else if !file.result.stripped {
         "unchanged"
     } else if file.result.verified {
@@ -7597,6 +7673,7 @@ mod tests {
                 result: StripFileResult {
                     stripped: true,
                     verified: false,
+                    timestamps_reset: false,
                     removed_tags: 0,
                     warnings: Vec::new(),
                     errors: Vec::new(),
@@ -7620,6 +7697,28 @@ mod tests {
     }
 
     #[test]
+    fn strip_file_output_renders_timestamp_reset() {
+        let file = StripFileOutput {
+            label: "image.jpg".to_string(),
+            image: PathBuf::from("image.jpg"),
+            result: StripFileResult {
+                stripped: false,
+                verified: true,
+                timestamps_reset: true,
+                removed_tags: 0,
+                warnings: Vec::new(),
+                errors: Vec::new(),
+            },
+            elapsed_ms: 17,
+            dry_run: false,
+        };
+
+        let rendered = strip_ansi_codes(&format_strip_file_output(&file));
+
+        assert!(rendered.contains("stripped EXIF: no\nremoved 0 tags\nreset file timestamps\n"));
+    }
+
+    #[test]
     fn strip_json_output_is_machine_readable() {
         let output = StripOutput {
             dry_run: false,
@@ -7631,6 +7730,7 @@ mod tests {
                 result: StripFileResult {
                     stripped: true,
                     verified: true,
+                    timestamps_reset: true,
                     removed_tags: 3,
                     warnings: Vec::new(),
                     errors: Vec::new(),
@@ -7652,6 +7752,8 @@ mod tests {
         assert_eq!(value["dry_run"], false);
         assert_eq!(value["target_count"], 1);
         assert_eq!(value["files"][0]["status"], "verified");
+        assert_eq!(value["files"][0]["timestamps_reset"], true);
+        assert_eq!(value["files"][0]["would_reset_timestamps"], false);
         assert_eq!(value["files"][0]["removed_tags"], 3);
         assert_eq!(value["summary"]["files_stripped"], 1);
         assert_eq!(value["summary"]["tags_removed"], 3);
@@ -7781,6 +7883,75 @@ mod tests {
     }
 
     #[test]
+    fn strip_privacy_resets_file_timestamps_to_utc_epoch() {
+        let directory = temporary_test_directory("strip-privacy-timestamps");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(
+            &image,
+            [
+                ("Make", "Nikon"),
+                ("Artist", "Harry Merritt"),
+                ("DateTimeOriginal", "2026-05-22"),
+                ("FNumber", "5.6"),
+            ],
+        );
+
+        let result = strip_image_for_strip_command(&image, false, true, &StripMode::privacy());
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.stripped);
+        assert!(result.verified);
+        assert!(result.timestamps_reset);
+        assert_eq!(result.removed_tags, 2);
+        assert_privacy_file_timestamps(&image);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn strip_privacy_resets_file_timestamps_when_no_exif_tags_are_removed() {
+        let directory = temporary_test_directory("strip-privacy-timestamps-no-tags");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(&image, [("Make", "Nikon"), ("FNumber", "5.6")]);
+
+        let result = strip_image_for_strip_command(&image, false, true, &StripMode::privacy());
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(!result.stripped);
+        assert!(result.verified);
+        assert!(result.timestamps_reset);
+        assert_eq!(result.removed_tags, 0);
+        assert_privacy_file_timestamps(&image);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn strip_privacy_dry_run_reports_timestamp_reset_without_changing_file() {
+        let directory = temporary_test_directory("strip-privacy-timestamps-dry-run");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(&image, [("Artist", "Harry Merritt")]);
+        let initial_timestamp = privacy_file_timestamp() + Duration::from_secs(86_400);
+        set_file_timestamps(&image, initial_timestamp).expect("test timestamps should be set");
+
+        let result = strip_image_for_strip_command(&image, true, true, &StripMode::privacy());
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.stripped);
+        assert!(!result.verified);
+        assert!(result.timestamps_reset);
+        assert_file_timestamp_close(
+            std::fs::metadata(&image)
+                .expect("image metadata should be readable")
+                .modified()
+                .expect("modified time should be readable"),
+            initial_timestamp,
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn strip_privacy_with_remove_removes_extra_tag() {
         let directory = temporary_test_directory("strip-privacy-with-remove");
         let image = directory.join("image.jpg");
@@ -7798,17 +7969,19 @@ mod tests {
             TagSelectorSet::from_values(&["FNumber".to_string()])
                 .expect("remove selector should parse"),
         );
-        let result = strip_metadata_from_image(&image, false, true, &mode);
+        let result = strip_image_for_strip_command(&image, false, true, &mode);
 
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert!(result.stripped);
         assert!(result.verified);
+        assert!(result.timestamps_reset);
         assert_eq!(result.removed_tags, 3);
         let names = exif_tag_names(&image);
         assert!(names.contains("Make"));
         assert!(!names.contains("FNumber"));
         assert!(!names.contains("Artist"));
         assert!(!names.contains("DateTimeOriginal"));
+        assert_privacy_file_timestamps(&image);
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -8208,6 +8381,53 @@ mod tests {
         assert!(names.contains("Model"));
         assert!(!names.contains("Artist"));
         assert!(!names.contains("DateTimeOriginal"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn write_privacy_does_not_reset_file_timestamps() {
+        let directory = temporary_test_directory("write-privacy-timestamps");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(&image, [("Artist", "Harry Merritt")]);
+        let initial_timestamp = privacy_file_timestamp() + Duration::from_secs(86_400);
+        set_file_timestamps(&image, initial_timestamp).expect("test timestamps should be set");
+        let args = WriteArgs {
+            privacy: true,
+            ..default_write_args()
+        };
+        let tags = vec![WriteTag {
+            name: "Model".to_string(),
+            value: YamlValue::String("F3".to_string()),
+        }];
+
+        let result = apply_tags_to_image(
+            &image,
+            &tags,
+            false,
+            &args,
+            StripMode::from_write_args(&args)
+                .expect("write strip mode should parse")
+                .as_ref(),
+        );
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.stripped);
+        assert_ne!(
+            std::fs::metadata(&image)
+                .expect("image metadata should be readable")
+                .modified()
+                .expect("modified time should be readable"),
+            privacy_file_timestamp()
+        );
+        #[cfg(windows)]
+        assert_file_timestamp_close(
+            std::fs::metadata(&image)
+                .expect("image metadata should be readable")
+                .created()
+                .expect("creation time should be readable"),
+            initial_timestamp,
+        );
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -10558,6 +10778,39 @@ frames:
             .fields()
             .map(|field| field.tag.number())
             .collect()
+    }
+
+    fn assert_privacy_file_timestamps(image: &Path) {
+        let metadata = std::fs::metadata(image).expect("image metadata should be readable");
+        let expected = privacy_file_timestamp();
+        assert_file_timestamp_close(
+            metadata.accessed().expect("access time should be readable"),
+            expected,
+        );
+        assert_file_timestamp_close(
+            metadata
+                .modified()
+                .expect("modified time should be readable"),
+            expected,
+        );
+        #[cfg(windows)]
+        assert_file_timestamp_close(
+            metadata
+                .created()
+                .expect("creation time should be readable"),
+            expected,
+        );
+    }
+
+    fn assert_file_timestamp_close(actual: SystemTime, expected: SystemTime) {
+        let difference = actual
+            .duration_since(expected)
+            .or_else(|_| expected.duration_since(actual))
+            .expect("timestamp difference should be computable");
+        assert!(
+            difference <= Duration::from_secs(1),
+            "timestamp {actual:?} differed from {expected:?} by {difference:?}"
+        );
     }
 
     fn strip_ansi_codes(value: &str) -> String {
