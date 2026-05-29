@@ -1,13 +1,13 @@
 <img src="./assets/icon.png" draggable="false" width="100px" />
 
-# Exif Metadata
+# `exifmeta`
 
 [![Release](https://img.shields.io/github/v/release/hmerritt/exifmeta?link=https%3A%2F%2Fgithub.com%2Fhmerritt%2Fexifmeta%2Freleases%2Flatest)](https://github.com/hmerritt/exifmeta/releases/latest) [![Downloads](https://img.shields.io/github/downloads/hmerritt/exifmeta/total?link=https%3A%2F%2Fgithub.com%2Fhmerritt%2Fexifmeta%2Freleases%2Flatest)](https://github.com/hmerritt/exifmeta/releases/latest) [![Coverage](https://img.shields.io/coverallsCoverage/github/hmerritt/exifmeta)](https://coveralls.io/github/hmerritt/exifmeta?branch=master)
 
 EXIF read/write/remove tool — useful for film photographers.
 
-- [Download 💾](https://github.com/hmerritt/exifmeta/releases/latest)
 - [Features](#features-)
+- [Download](#download-)
 - [CLI Commands](#cli-commands)
 - [Usage](#usage)
 
@@ -19,6 +19,28 @@ EXIF read/write/remove tool — useful for film photographers.
 - Read/Write **custom** EXIF tags
 - Easily write to all images in the current directory (using a `metadata.yml` template file)
 - Includes an embeded database of locations that can search GPS data to find the nearest town/city; this happens **instantly**, completely offline, without any internet connection required!
+
+## Download 💾
+
+#### [➡️ Manually Download The Latest Release Here](https://github.com/hmerritt/exifmeta/releases/latest)
+
+Or via one of the supported package managers:
+
+#### ➡️ macOS / Linux via [Homebrew](https://brew.sh/)
+
+```sh
+brew install hmerritt/tap/exifmeta
+```
+
+#### ➡️ Windows via [Scoop](https://scoop.sh/)
+
+```sh
+scoop bucket add hmerritt https://github.com/hmerritt/scoop-bucket
+```
+
+```sh
+scoop install exifmeta
+```
 
 ## CLI Commands
 
