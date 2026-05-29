@@ -58,11 +58,11 @@ const PRETTY_UNKNOWN_VALUE_OMITTED_HINT: &str = " (use `--format raw` to view)";
 const METADATA_TEMPLATE: &str = r#"# yaml-language-server: $schema=https://raw.githubusercontent.com/hmerritt/exif-medadata/master/schemas/metadata.schema.json
 
 # ───────────────────────────────────────────────
-# Metadata file for images in this directory. Used by exifmeta, https://github.com/hmerritt/exifmeta
+# Metadata for photos (used by exifmeta https://github.com/hmerritt/exifmeta)
 # ───────────────────────────────────────────────
 
 # ───────────────────────────────────────────────
-# Custom Properties
+# 
 # These values will not be written as EXIF, and are meant for personal organisational
 # purposes — e.g. private metadata for your shoot
 # ───────────────────────────────────────────────
@@ -88,7 +88,7 @@ exif:
     MaxApertureValue:
 
     # Film / Capture
-    ISOSpeedRatings:
+    ISOSpeed:
     DateTimeOriginal:
     CreateDate:
     # 1 = Film Scanner
@@ -115,9 +115,9 @@ exif:
     Photographer:
 
 # ───────────────────────────────────────────────
-# Per Frame/File EXIF Properties
-# Use this to set EXIF tags for individual files, like ExposureTime, FNumber, or
-# GPS data. Values set here will override the above `exif` values.
+# Per File EXIF Properties
+# Set tags for individual photos, like ExposureTime, FNumber, GPS data,
+# or any custom value. Values set here will override any `exif` values above.
 # ───────────────────────────────────────────────
 frames:
 <frames>
