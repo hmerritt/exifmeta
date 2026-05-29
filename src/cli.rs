@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
 #[command(name = "exifmeta")]
-#[command(about = "Read metadata.yml and write EXIF metadata to image files")]
+#[command(about = "EXIF read/write/remove tool")]
 #[command(version, propagate_version = true)]
 pub struct Cli {
     #[arg(long, global = true, help = "Simulate actions without changing files")]
