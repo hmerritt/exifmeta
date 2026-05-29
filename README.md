@@ -174,7 +174,7 @@ You can also open a specific directory:
 exifmeta interactive "Photos/shoot-001"
 ```
 
-Press `w` to toggle write mode. In write mode, select an image and press `Enter`
+Press `w` or `Tab` to toggle write mode. In write mode, select an image and press `Enter`
 or `Right` to edit writable tags. Press `a` to add a tag, then choose a
 writable standard EXIF tag or enter a custom tag name. Each confirmed edit is
 written immediately; with `--dry-run`, edits are simulated without changing
