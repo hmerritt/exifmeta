@@ -1606,7 +1606,11 @@ fn write_editor_lines(app: &InteractiveApp) -> Vec<Line<'static>> {
     lines.push(Line::default());
 
     match &editor.state {
-        InteractiveWriteState::Browsing => append_write_browsing_lines(editor, &mut lines),
+        InteractiveWriteState::Browsing => append_write_browsing_lines(
+            editor,
+            app.focus == InteractiveFocus::WriteEditor,
+            &mut lines,
+        ),
         InteractiveWriteState::Editing { name, input, .. } => {
             lines.push(Line::from(format!("Edit {name}")));
             lines.push(Line::from(format!(
@@ -1664,7 +1668,11 @@ fn input_with_cursor(input: &str, cursor_visible: bool) -> String {
     format!("{}{}", input, if cursor_visible { "█" } else { " " })
 }
 
-fn append_write_browsing_lines(editor: &InteractiveWriteEditor, lines: &mut Vec<Line<'static>>) {
+fn append_write_browsing_lines(
+    editor: &InteractiveWriteEditor,
+    editor_focused: bool,
+    lines: &mut Vec<Line<'static>>,
+) {
     if editor.rows.is_empty() {
         lines.push(Line::from("<No editable EXIF or custom tags found>"));
         lines.push(Line::from(
@@ -1678,7 +1686,7 @@ fn append_write_browsing_lines(editor: &InteractiveWriteEditor, lines: &mut Vec<
             InteractiveTagKind::Standard => "EXIF",
             InteractiveTagKind::Custom => "Custom",
         };
-        let style = if index == editor.selected {
+        let style = if editor_focused && index == editor.selected {
             Style::default()
                 .bg(Color::Blue)
                 .fg(Color::White)
@@ -6760,6 +6768,68 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("Value: Nik "));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_rows_hide_selection_when_list_is_focused() {
+        let directory = temporary_test_directory("interactive-write-list-focus");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::List;
+        app.write_editor.rows = vec![InteractiveTagRow {
+            name: "Make".to_string(),
+            value: "Nikon".to_string(),
+            raw_value: YamlValue::String("Nikon".to_string()),
+            kind: InteractiveTagKind::Standard,
+        }];
+        app.write_editor.selected = 0;
+
+        let lines = write_editor_lines(&app);
+        let row = lines
+            .iter()
+            .find(|line| line_text(line).contains("Make"))
+            .expect("tag row should render");
+
+        assert_eq!(row.spans[0].style, Style::default());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_rows_show_selection_when_editor_is_focused() {
+        let directory = temporary_test_directory("interactive-write-editor-focus");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.rows = vec![InteractiveTagRow {
+            name: "Make".to_string(),
+            value: "Nikon".to_string(),
+            raw_value: YamlValue::String("Nikon".to_string()),
+            kind: InteractiveTagKind::Standard,
+        }];
+        app.write_editor.selected = 0;
+
+        let lines = write_editor_lines(&app);
+        let row = lines
+            .iter()
+            .find(|line| line_text(line).contains("Make"))
+            .expect("tag row should render");
+
+        assert_eq!(
+            row.spans[0].style,
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        );
 
         let _ = std::fs::remove_dir_all(directory);
     }
