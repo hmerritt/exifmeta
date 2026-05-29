@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
 use colored::Colorize;
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -25,7 +26,7 @@ use little_exif::metadata::Metadata as WritableMetadata;
 use little_exif::rational::uR64;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
@@ -207,6 +208,7 @@ fn interactive_command(args: InteractiveArgs, dry_run: bool) -> Result<(), Strin
 
 const INTERACTIVE_PREVIEW_TICK: Duration = Duration::from_millis(80);
 const INTERACTIVE_CURSOR_TICK: Duration = Duration::from_millis(500);
+const RIGHT_PANEL_CONTENT_TOP_PADDING: usize = 2;
 
 struct InteractiveTerminal {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
@@ -216,7 +218,7 @@ impl InteractiveTerminal {
     fn enter() -> Result<Self, String> {
         enable_raw_mode().map_err(|error| format!("failed to enable raw mode: {error}"))?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, SetCursorStyle::SteadyBar) {
             let _ = disable_raw_mode();
             return Err(format!("failed to enter alternate screen: {error}"));
         }
@@ -232,7 +234,11 @@ impl InteractiveTerminal {
 impl Drop for InteractiveTerminal {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            SetCursorStyle::DefaultUserShape,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -283,9 +289,13 @@ enum InteractiveMode {
 #[derive(Debug, Clone, PartialEq)]
 struct InteractiveTagRow {
     name: String,
+    label: String,
     value: String,
+    edit_value: String,
     raw_value: YamlValue,
     kind: InteractiveTagKind,
+    group: PrettyReadGroup,
+    editable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,21 +343,271 @@ enum InteractiveWriteState {
     Editing {
         name: String,
         kind: InteractiveTagKind,
-        input: String,
+        input: InteractiveTextInput,
     },
     AddKind,
     AddStandard {
-        query: String,
+        query: InteractiveTextInput,
         selected: usize,
     },
     AddCustomName {
-        input: String,
+        input: InteractiveTextInput,
     },
     AddValue {
         name: String,
         kind: InteractiveTagKind,
-        input: String,
+        input: InteractiveTextInput,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InteractiveTextInput {
+    text: String,
+    cursor: usize,
+}
+
+impl InteractiveTextInput {
+    fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let cursor = text.chars().count();
+        Self { text, cursor }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    fn insert(&mut self, char: char) {
+        let byte_index = self.cursor_byte_index();
+        self.text.insert(byte_index, char);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+
+        let end = self.cursor_byte_index();
+        self.cursor -= 1;
+        let start = self.cursor_byte_index();
+        self.text.replace_range(start..end, "");
+        true
+    }
+
+    fn delete(&mut self) -> bool {
+        if self.cursor >= self.text.chars().count() {
+            return false;
+        }
+
+        let start = self.cursor_byte_index();
+        self.cursor += 1;
+        let end = self.cursor_byte_index();
+        self.cursor -= 1;
+        self.text.replace_range(start..end, "");
+        true
+    }
+
+    fn move_left(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+        self.cursor -= 1;
+        true
+    }
+
+    fn move_right(&mut self) -> bool {
+        if self.cursor >= self.text.chars().count() {
+            return false;
+        }
+        self.cursor += 1;
+        true
+    }
+
+    fn move_home(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+        self.cursor = 0;
+        true
+    }
+
+    fn move_end(&mut self) -> bool {
+        let end = self.text.chars().count();
+        if self.cursor == end {
+            return false;
+        }
+        self.cursor = end;
+        true
+    }
+
+    fn move_previous_word(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+
+        let chars = self.text.chars().collect::<Vec<_>>();
+        let mut cursor = self.cursor.min(chars.len());
+        while cursor > 0 && chars[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        while cursor > 0 && !chars[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+
+        if self.cursor == cursor {
+            return false;
+        }
+        self.cursor = cursor;
+        true
+    }
+
+    fn move_next_word(&mut self) -> bool {
+        let chars = self.text.chars().collect::<Vec<_>>();
+        if self.cursor >= chars.len() {
+            return false;
+        }
+
+        let mut cursor = self.cursor;
+        if chars[cursor].is_ascii_whitespace() {
+            while cursor < chars.len() && chars[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+        } else {
+            while cursor < chars.len() && !chars[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            while cursor < chars.len() && chars[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+        }
+
+        if self.cursor == cursor {
+            return false;
+        }
+        self.cursor = cursor;
+        true
+    }
+
+    fn delete_next_word(&mut self) -> bool {
+        let chars = self.text.chars().collect::<Vec<_>>();
+        if self.cursor >= chars.len() {
+            return false;
+        }
+
+        let start = self.cursor_byte_index();
+        let mut end_cursor = self.cursor;
+        if chars[end_cursor].is_ascii_whitespace() {
+            while end_cursor < chars.len() && chars[end_cursor].is_ascii_whitespace() {
+                end_cursor += 1;
+            }
+            while end_cursor < chars.len() && !chars[end_cursor].is_ascii_whitespace() {
+                end_cursor += 1;
+            }
+        } else {
+            while end_cursor < chars.len() && !chars[end_cursor].is_ascii_whitespace() {
+                end_cursor += 1;
+            }
+            while end_cursor < chars.len() && chars[end_cursor].is_ascii_whitespace() {
+                end_cursor += 1;
+            }
+        }
+
+        let end = self
+            .text
+            .char_indices()
+            .nth(end_cursor)
+            .map_or(self.text.len(), |(index, _)| index);
+        self.text.replace_range(start..end, "");
+        true
+    }
+
+    fn cursor_byte_index(&self) -> usize {
+        self.text
+            .char_indices()
+            .nth(self.cursor)
+            .map_or(self.text.len(), |(index, _)| index)
+    }
+}
+
+impl Default for InteractiveTextInput {
+    fn default() -> Self {
+        Self::new("")
+    }
+}
+
+impl From<String> for InteractiveTextInput {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<&str> for InteractiveTextInput {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveInputKeyOutcome {
+    Ignored,
+    Moved,
+    Changed,
+}
+
+fn handle_interactive_text_input_key(
+    input: &mut InteractiveTextInput,
+    key: KeyEvent,
+) -> InteractiveInputKeyOutcome {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Left => input
+                .move_previous_word()
+                .then_some(InteractiveInputKeyOutcome::Moved)
+                .unwrap_or(InteractiveInputKeyOutcome::Ignored),
+            KeyCode::Right => input
+                .move_next_word()
+                .then_some(InteractiveInputKeyOutcome::Moved)
+                .unwrap_or(InteractiveInputKeyOutcome::Ignored),
+            KeyCode::Delete => input
+                .delete_next_word()
+                .then_some(InteractiveInputKeyOutcome::Changed)
+                .unwrap_or(InteractiveInputKeyOutcome::Ignored),
+            _ => InteractiveInputKeyOutcome::Ignored,
+        };
+    }
+
+    match key.code {
+        KeyCode::Backspace => input
+            .backspace()
+            .then_some(InteractiveInputKeyOutcome::Changed)
+            .unwrap_or(InteractiveInputKeyOutcome::Ignored),
+        KeyCode::Delete => input
+            .delete()
+            .then_some(InteractiveInputKeyOutcome::Changed)
+            .unwrap_or(InteractiveInputKeyOutcome::Ignored),
+        KeyCode::Left => input
+            .move_left()
+            .then_some(InteractiveInputKeyOutcome::Moved)
+            .unwrap_or(InteractiveInputKeyOutcome::Ignored),
+        KeyCode::Right => input
+            .move_right()
+            .then_some(InteractiveInputKeyOutcome::Moved)
+            .unwrap_or(InteractiveInputKeyOutcome::Ignored),
+        KeyCode::Home => input
+            .move_home()
+            .then_some(InteractiveInputKeyOutcome::Moved)
+            .unwrap_or(InteractiveInputKeyOutcome::Ignored),
+        KeyCode::End => input
+            .move_end()
+            .then_some(InteractiveInputKeyOutcome::Moved)
+            .unwrap_or(InteractiveInputKeyOutcome::Ignored),
+        KeyCode::Char(char) if !key.modifiers.contains(KeyModifiers::ALT) => {
+            input.insert(char);
+            InteractiveInputKeyOutcome::Changed
+        }
+        _ => InteractiveInputKeyOutcome::Ignored,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,6 +796,7 @@ impl InteractiveApp {
                 if self.mode == InteractiveMode::Write && self.selected_file().is_some() {
                     self.request_write_editor_for_selection();
                     self.focus = InteractiveFocus::WriteEditor;
+                    self.scroll_selected_write_row_into_view();
                 } else {
                     self.focus_preview_if_file_or_open_selected()?;
                 }
@@ -628,6 +889,7 @@ impl InteractiveApp {
                     modifiers: KeyModifiers::NONE,
                     ..
                 } => {
+                    self.scroll_preview_to_top();
                     self.write_editor.state = InteractiveWriteState::AddKind;
                     self.write_editor.status = None;
                     self.reset_input_cursor();
@@ -642,15 +904,12 @@ impl InteractiveApp {
             | InteractiveWriteState::AddCustomName { input }
             | InteractiveWriteState::AddValue { input, .. } => match key.code {
                 KeyCode::Enter => self.submit_write_input()?,
-                KeyCode::Backspace => {
-                    input.pop();
-                    self.reset_input_cursor();
-                }
-                KeyCode::Char(char) => {
-                    input.push(char);
-                    self.reset_input_cursor();
-                }
-                _ => {}
+                _ => match handle_interactive_text_input_key(input, key) {
+                    InteractiveInputKeyOutcome::Changed | InteractiveInputKeyOutcome::Moved => {
+                        self.reset_input_cursor();
+                    }
+                    InteractiveInputKeyOutcome::Ignored => {}
+                },
             },
             InteractiveWriteState::AddKind => match key {
                 KeyEvent {
@@ -658,8 +917,9 @@ impl InteractiveApp {
                     modifiers: KeyModifiers::NONE,
                     ..
                 } => {
+                    self.scroll_preview_to_top();
                     self.write_editor.state = InteractiveWriteState::AddStandard {
-                        query: String::new(),
+                        query: InteractiveTextInput::default(),
                         selected: 0,
                     };
                     self.write_editor.status = None;
@@ -670,8 +930,9 @@ impl InteractiveApp {
                     modifiers: KeyModifiers::NONE,
                     ..
                 } => {
+                    self.scroll_preview_to_top();
                     self.write_editor.state = InteractiveWriteState::AddCustomName {
-                        input: String::new(),
+                        input: InteractiveTextInput::default(),
                     };
                     self.write_editor.status = None;
                     self.reset_input_cursor();
@@ -680,11 +941,14 @@ impl InteractiveApp {
             },
             InteractiveWriteState::AddStandard { query, selected } => match key.code {
                 KeyCode::Enter => {
-                    if let Some(name) = filtered_writable_standard_tags(query).get(*selected) {
+                    if let Some(name) =
+                        filtered_writable_standard_tags(query.as_str()).get(*selected)
+                    {
+                        self.scroll_preview_to_top();
                         self.write_editor.state = InteractiveWriteState::AddValue {
                             name: (*name).to_string(),
                             kind: InteractiveTagKind::Standard,
-                            input: String::new(),
+                            input: InteractiveTextInput::default(),
                         };
                         self.reset_input_cursor();
                     }
@@ -693,22 +957,19 @@ impl InteractiveApp {
                     *selected = selected.saturating_sub(1);
                 }
                 KeyCode::Down => {
-                    let count = filtered_writable_standard_tags(query).len();
+                    let count = filtered_writable_standard_tags(query.as_str()).len();
                     if *selected + 1 < count {
                         *selected += 1;
                     }
                 }
-                KeyCode::Backspace => {
-                    query.pop();
-                    *selected = 0;
-                    self.reset_input_cursor();
-                }
-                KeyCode::Char(char) => {
-                    query.push(char);
-                    *selected = 0;
-                    self.reset_input_cursor();
-                }
-                _ => {}
+                _ => match handle_interactive_text_input_key(query, key) {
+                    InteractiveInputKeyOutcome::Changed => {
+                        *selected = 0;
+                        self.reset_input_cursor();
+                    }
+                    InteractiveInputKeyOutcome::Moved => self.reset_input_cursor(),
+                    InteractiveInputKeyOutcome::Ignored => {}
+                },
             },
         }
 
@@ -722,6 +983,7 @@ impl InteractiveApp {
     fn cancel_write_input(&mut self) -> bool {
         if self.mode == InteractiveMode::Write && self.write_input_active() {
             self.write_editor.state = InteractiveWriteState::Browsing;
+            self.scroll_selected_write_row_into_view();
             return true;
         }
         false
@@ -785,12 +1047,16 @@ impl InteractiveApp {
     }
 
     fn select_previous_write_row(&mut self) {
-        self.write_editor.selected = self.write_editor.selected.saturating_sub(1);
+        if let Some(selected) = self.previous_editable_write_row() {
+            self.write_editor.selected = selected;
+            self.scroll_selected_write_row_into_view();
+        }
     }
 
     fn select_next_write_row(&mut self) {
-        if self.write_editor.selected + 1 < self.write_editor.rows.len() {
-            self.write_editor.selected += 1;
+        if let Some(selected) = self.next_editable_write_row() {
+            self.write_editor.selected = selected;
+            self.scroll_selected_write_row_into_view();
         }
     }
 
@@ -798,13 +1064,49 @@ impl InteractiveApp {
         let Some(row) = self.write_editor.rows.get(self.write_editor.selected) else {
             return;
         };
+        if !row.editable {
+            return;
+        }
         self.write_editor.state = InteractiveWriteState::Editing {
             name: row.name.clone(),
             kind: row.kind,
-            input: yaml_value_to_input(&row.raw_value).unwrap_or_else(|| row.value.clone()),
+            input: InteractiveTextInput::new(row.edit_value.clone()),
         };
+        self.scroll_preview_to_top();
         self.write_editor.status = None;
         self.reset_input_cursor();
+    }
+
+    fn ensure_editable_write_selection(&mut self) {
+        if self
+            .write_editor
+            .rows
+            .get(self.write_editor.selected)
+            .is_some_and(|row| row.editable)
+        {
+            return;
+        }
+
+        self.write_editor.selected = self.first_editable_write_row().unwrap_or(0);
+    }
+
+    fn first_editable_write_row(&self) -> Option<usize> {
+        self.write_editor.rows.iter().position(|row| row.editable)
+    }
+
+    fn previous_editable_write_row(&self) -> Option<usize> {
+        (0..self.write_editor.selected)
+            .rev()
+            .find(|index| self.write_editor.rows[*index].editable)
+    }
+
+    fn next_editable_write_row(&self) -> Option<usize> {
+        self.write_editor
+            .rows
+            .iter()
+            .enumerate()
+            .skip(self.write_editor.selected.saturating_add(1))
+            .find_map(|(index, row)| row.editable.then_some(index))
     }
 
     fn submit_write_input(&mut self) -> Result<(), String> {
@@ -818,7 +1120,7 @@ impl InteractiveApp {
                 self.apply_interactive_tag(name, kind, input)?;
             }
             InteractiveWriteState::AddCustomName { input } => {
-                let name = input.trim();
+                let name = input.text.trim();
                 if name.is_empty() {
                     self.write_editor.status = Some(InteractiveStatus {
                         kind: InteractiveStatusKind::Error,
@@ -830,10 +1132,11 @@ impl InteractiveApp {
                         message: "use Standard for writable EXIF tags".to_string(),
                     });
                 } else {
+                    self.scroll_preview_to_top();
                     self.write_editor.state = InteractiveWriteState::AddValue {
                         name: name.to_string(),
                         kind: InteractiveTagKind::Custom,
-                        input: String::new(),
+                        input: InteractiveTextInput::default(),
                     };
                     self.reset_input_cursor();
                 }
@@ -850,9 +1153,10 @@ impl InteractiveApp {
         &mut self,
         name: String,
         kind: InteractiveTagKind,
-        input: String,
+        input: impl Into<InteractiveTextInput>,
     ) -> Result<(), String> {
-        if input.trim().is_empty() {
+        let input = input.into();
+        if input.text.trim().is_empty() {
             self.write_editor.status = Some(InteractiveStatus {
                 kind: InteractiveStatusKind::Error,
                 message: "tag value cannot be blank".to_string(),
@@ -868,7 +1172,7 @@ impl InteractiveApp {
         else {
             return Ok(());
         };
-        let value = yaml_value_from_input(&input);
+        let value = yaml_value_from_input(&input.text);
         if kind == InteractiveTagKind::Standard && writable_exif_tag(&name, &value).is_none() {
             self.write_editor.status = Some(InteractiveStatus {
                 kind: InteractiveStatusKind::Error,
@@ -1053,9 +1357,8 @@ impl InteractiveApp {
         match result.rows {
             Ok(rows) => {
                 self.write_editor.rows = rows;
-                if self.write_editor.selected >= self.write_editor.rows.len() {
-                    self.write_editor.selected = self.write_editor.rows.len().saturating_sub(1);
-                }
+                self.ensure_editable_write_selection();
+                self.scroll_selected_write_row_into_view();
             }
             Err(error) => {
                 self.write_editor.rows.clear();
@@ -1130,6 +1433,7 @@ impl InteractiveApp {
         self.preview_viewport_width = width;
         self.preview_viewport_height = height;
         self.clamp_preview_scroll();
+        self.scroll_selected_write_row_into_view();
     }
 
     fn scroll_preview_by(&mut self, lines: i16) {
@@ -1154,10 +1458,47 @@ impl InteractiveApp {
     }
 
     fn max_preview_scroll(&self) -> u16 {
-        self.preview
-            .rendered_line_count(self.preview_viewport_width)
+        self.right_panel_rendered_line_count()
             .saturating_sub(usize::from(self.preview_viewport_height))
             .min(usize::from(u16::MAX)) as u16
+    }
+
+    fn right_panel_rendered_line_count(&self) -> usize {
+        if self.mode == InteractiveMode::Write && self.selected_file().is_some() {
+            write_editor_lines(self).len().max(1)
+        } else {
+            self.preview
+                .rendered_line_count(self.preview_viewport_width)
+        }
+    }
+
+    fn scroll_selected_write_row_into_view(&mut self) {
+        if self.mode != InteractiveMode::Write
+            || self.selected_file().is_none()
+            || !matches!(self.write_editor.state, InteractiveWriteState::Browsing)
+        {
+            return;
+        }
+
+        let Some(line_index) = selected_write_row_line_index(self) else {
+            self.clamp_preview_scroll();
+            return;
+        };
+
+        let visible_top = usize::from(self.preview_scroll);
+        let visible_height = usize::from(self.preview_viewport_height.max(1));
+        let visible_bottom = visible_top + visible_height;
+
+        if line_index < visible_top {
+            self.preview_scroll = line_index.min(usize::from(u16::MAX)) as u16;
+        } else if line_index >= visible_bottom {
+            self.preview_scroll = line_index
+                .saturating_add(1)
+                .saturating_sub(visible_height)
+                .min(usize::from(u16::MAX)) as u16;
+        }
+
+        self.clamp_preview_scroll();
     }
 }
 
@@ -1238,7 +1579,9 @@ fn read_preview(image: &Path) -> InteractivePreviewContent {
                 &metadata,
                 ReadFormat::Pretty,
             ));
-            InteractivePreviewContent::Lines(ansi_to_preview_lines(&output))
+            let mut lines = ansi_to_preview_lines(&output);
+            prepend_right_panel_content_padding(&mut lines);
+            InteractivePreviewContent::Lines(lines)
         }
         Err(error) => InteractivePreviewContent::plain(format!(
             "Failed to read {}\n\n{error}",
@@ -1277,6 +1620,12 @@ fn ansi_to_preview_lines(value: &str) -> Vec<Line<'static>> {
     push_preview_span(&mut spans, &mut text, style);
     lines.push(Line::from(spans));
     lines
+}
+
+fn prepend_right_panel_content_padding(lines: &mut Vec<Line<'static>>) {
+    for _ in 0..RIGHT_PANEL_CONTENT_TOP_PADDING {
+        lines.insert(0, Line::default());
+    }
 }
 
 fn push_preview_span(spans: &mut Vec<Span<'static>>, text: &mut String, style: Style) {
@@ -1330,50 +1679,152 @@ fn render_directory_preview(directory: &Path) -> InteractivePreviewContent {
 
 fn interactive_tag_rows(image: &Path) -> Result<Vec<InteractiveTagRow>, String> {
     let metadata = read_metadata(image)?;
-    let mut rows = metadata
+    let read_rows = metadata
         .exif
         .fields()
         .filter(|field| !is_exifmeta_custom_payload_field(field))
-        .filter_map(|field| interactive_standard_tag_row(field, &metadata.exif))
+        .map(|field| ReadRow::from_field(field, &metadata.exif, ReadFormat::Pretty))
+        .collect::<Vec<_>>();
+    let custom_tags = custom_tags_from_exif(&metadata.exif);
+    let mut editable_rows = interactive_editable_rows(&metadata.exif, &read_rows, &custom_tags);
+    let mut pretty_rows = pretty_read_rows(&metadata.file_info.rows, &read_rows, &custom_tags);
+    append_nearest_location_rows(&mut pretty_rows, &metadata.exif, &mut Vec::new());
+    sort_pretty_read_rows(&mut pretty_rows);
+
+    Ok(pretty_rows
+        .into_iter()
+        .map(|row| {
+            let editable = editable_rows
+                .iter()
+                .position(|editable| {
+                    editable.group == row.group
+                        && editable.label == row.label
+                        && editable.value == row.value
+                })
+                .map(|index| editable_rows.remove(index));
+
+            editable.unwrap_or_else(|| InteractiveTagRow {
+                name: row.label.clone(),
+                label: row.label,
+                value: row.value.clone(),
+                edit_value: row.value.clone(),
+                raw_value: YamlValue::String(row.value),
+                kind: InteractiveTagKind::Standard,
+                group: row.group,
+                editable: false,
+            })
+        })
+        .collect())
+}
+
+fn interactive_editable_rows(
+    exif: &Exif,
+    read_rows: &[ReadRow],
+    custom_tags: &[CustomTag],
+) -> Vec<InteractiveTagRow> {
+    let mut rows = read_rows
+        .iter()
+        .filter(|row| WRITABLE_STANDARD_EXIF_TAG_NAMES.contains(&row.name.as_str()))
+        .map(|row| {
+            let value = pretty_read_value(row);
+            let edit_value = exif
+                .fields()
+                .find(|field| field_matches_read_row(field, row))
+                .and_then(|field| interactive_standard_edit_value(field, exif, &row.name))
+                .unwrap_or_else(|| row.value.clone());
+            InteractiveTagRow {
+                name: row.name.clone(),
+                label: row.pretty_name.clone(),
+                value: value.clone(),
+                edit_value,
+                raw_value: YamlValue::String(row.value.clone()),
+                kind: InteractiveTagKind::Standard,
+                group: classify_exif_row(row),
+                editable: true,
+            }
+        })
         .collect::<Vec<_>>();
 
-    for tag in custom_tags_from_exif(&metadata.exif) {
+    for tag in custom_tags {
         rows.push(InteractiveTagRow {
-            name: tag.name,
+            name: tag.name.clone(),
+            label: title_case_tag_name(&tag.name),
             value: custom_tag_value_label(&tag.value),
-            raw_value: tag.value,
+            edit_value: yaml_value_to_input(&tag.value)
+                .unwrap_or_else(|| custom_tag_value_label(&tag.value)),
+            raw_value: tag.value.clone(),
             kind: InteractiveTagKind::Custom,
+            group: PrettyReadGroup::Custom,
+            editable: true,
         });
     }
 
-    rows.sort_by(|left, right| {
-        interactive_tag_kind_sort_key(left.kind)
-            .cmp(&interactive_tag_kind_sort_key(right.kind))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    Ok(rows)
+    rows
 }
 
-fn interactive_standard_tag_row(field: &Field, exif: &Exif) -> Option<InteractiveTagRow> {
-    let name = field.tag.to_string();
-    if !WRITABLE_STANDARD_EXIF_TAG_NAMES.contains(&name.as_str()) {
+fn field_matches_read_row(field: &Field, row: &ReadRow) -> bool {
+    usize::from(field.ifd_num.index()) == row.ifd
+        && format!("{:?}", field.tag.context()) == row.context
+        && field.tag.number() == row.tag_id
+        && field.tag.to_string() == row.name
+}
+
+fn interactive_standard_edit_value(field: &Field, exif: &Exif, name: &str) -> Option<String> {
+    match name {
+        "GPSLatitude" | "GPSLongitude" => {
+            decimal_gps_coordinate(field, exif).map(format_decimal_coordinate)
+        }
+        "GPSAltitude" => first_rational_decimal(&field.value),
+        "ExposureTime" | "FNumber" | "FocalLength" | "MaxApertureValue" => {
+            first_rational_edit_value(&field.value)
+        }
+        "ExposureProgram" | "FileSource" | "Flash" | "GPSAltitudeRef" | "ISO"
+        | "ISOSpeedRatings" | "ISOSpeed" | "LightSource" | "MeteringMode" | "Orientation"
+        | "WhiteBalance" => first_unsigned_edit_value(&field.value),
+        "Artist" | "Copyright" | "CreateDate" | "DateTimeOriginal" | "GPSLatitudeRef"
+        | "GPSLongitudeRef" | "GPSMapDatum" | "ImageDescription" | "LensMake" | "LensModel"
+        | "Make" | "Model" | "ModifyDate" | "Software" => first_ascii_edit_value(&field.value),
+        _ => None,
+    }
+}
+
+fn first_ascii_edit_value(value: &Value) -> Option<String> {
+    let Value::Ascii(values) = value else {
         return None;
-    }
+    };
 
-    let row = ReadRow::from_field(field, exif, ReadFormat::Pretty);
-    Some(InteractiveTagRow {
-        name,
-        value: row.value.clone(),
-        raw_value: YamlValue::String(row.value),
-        kind: InteractiveTagKind::Standard,
-    })
+    let value = values.first()?;
+    std::str::from_utf8(value)
+        .ok()
+        .map(|value| value.trim_end_matches('\0').to_string())
 }
 
-fn interactive_tag_kind_sort_key(kind: InteractiveTagKind) -> u8 {
-    match kind {
-        InteractiveTagKind::Standard => 0,
-        InteractiveTagKind::Custom => 1,
+fn first_unsigned_edit_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Byte(values) => values.first().map(ToString::to_string),
+        Value::Short(values) => values.first().map(ToString::to_string),
+        Value::Long(values) => values.first().map(ToString::to_string),
+        Value::Undefined(values, _) => values.first().map(ToString::to_string),
+        _ => None,
     }
+}
+
+fn first_rational_edit_value(value: &Value) -> Option<String> {
+    let Value::Rational(values) = value else {
+        return None;
+    };
+    let value = values.first()?;
+
+    Some(format!("{}/{}", value.num, value.denom))
+}
+
+fn first_rational_decimal(value: &Value) -> Option<String> {
+    let Value::Rational(values) = value else {
+        return None;
+    };
+    let value = values.first()?;
+
+    Some(format_decimal_scalar(value.to_f64()))
 }
 
 fn yaml_value_from_input(input: &str) -> YamlValue {
@@ -1470,7 +1921,12 @@ fn loading_preview(entry: &InteractiveEntry, spinner: SpinnerPreset) -> Interact
             ))
         }
         InteractiveEntryKind::File => {
-            InteractivePreviewContent::plain(format!("{} Reading EXIF preview", spinner.frame()))
+            let mut lines = vec![Line::from(format!(
+                "{} Reading EXIF preview",
+                spinner.frame()
+            ))];
+            prepend_right_panel_content_padding(&mut lines);
+            InteractivePreviewContent::Lines(lines)
         }
     }
 }
@@ -1578,6 +2034,12 @@ fn render_interactive(frame: &mut ratatui::Frame<'_>, app: &mut InteractiveApp) 
         .scroll((app.preview_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(preview, chunks[1]);
+
+    if app.input_cursor_visible {
+        if let Some(position) = write_input_cursor_position(app, chunks[1]) {
+            frame.set_cursor_position(position);
+        }
+    }
 }
 
 fn write_editor_lines(app: &InteractiveApp) -> Vec<Line<'static>> {
@@ -1601,26 +2063,25 @@ fn write_editor_lines(app: &InteractiveApp) -> Vec<Line<'static>> {
         };
         lines.push(Line::from(Span::styled(status.message.clone(), style)));
     }
-    if app.write_loading_visible {
-        lines.push(Line::from(Span::styled(
-            format!("{} Reading editable tags", app.preview_spinner.frame()),
-            Style::default().fg(Color::Yellow),
-        )));
-    }
     lines.push(Line::default());
 
     match &editor.state {
-        InteractiveWriteState::Browsing => append_write_browsing_lines(
-            editor,
-            app.focus == InteractiveFocus::WriteEditor,
-            &mut lines,
-        ),
+        InteractiveWriteState::Browsing => {
+            if app.write_loading_visible {
+                lines.push(Line::from(Span::styled(
+                    format!("{} Reading editable tags", app.preview_spinner.frame()),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            append_write_browsing_lines(
+                editor,
+                app.focus == InteractiveFocus::WriteEditor,
+                &mut lines,
+            );
+        }
         InteractiveWriteState::Editing { name, input, .. } => {
             lines.push(Line::from(format!("Edit {name}")));
-            lines.push(Line::from(format!(
-                "Value: {}",
-                input_with_cursor(input, app.input_cursor_visible)
-            )));
+            lines.push(Line::from(format!("Value: {}", input_text(input))));
         }
         InteractiveWriteState::AddKind => {
             lines.push(Line::from("Add tag"));
@@ -1630,9 +2091,9 @@ fn write_editor_lines(app: &InteractiveApp) -> Vec<Line<'static>> {
         InteractiveWriteState::AddStandard { query, selected } => {
             lines.push(Line::from(format!(
                 "Standard tag search: {}",
-                input_with_cursor(query, app.input_cursor_visible)
+                input_text(query)
             )));
-            let matches = filtered_writable_standard_tags(query);
+            let matches = filtered_writable_standard_tags(query.as_str());
             if matches.is_empty() {
                 lines.push(Line::from("<No writable standard tags match>"));
             } else {
@@ -1651,25 +2112,127 @@ fn write_editor_lines(app: &InteractiveApp) -> Vec<Line<'static>> {
         }
         InteractiveWriteState::AddCustomName { input } => {
             lines.push(Line::from("Custom tag name"));
-            lines.push(Line::from(format!(
-                "Name: {}",
-                input_with_cursor(input, app.input_cursor_visible)
-            )));
+            lines.push(Line::from(format!("Name: {}", input_text(input))));
         }
         InteractiveWriteState::AddValue { name, input, .. } => {
             lines.push(Line::from(format!("Add {name}")));
-            lines.push(Line::from(format!(
-                "Value: {}",
-                input_with_cursor(input, app.input_cursor_visible)
-            )));
+            lines.push(Line::from(format!("Value: {}", input_text(input))));
         }
     }
 
     lines
 }
 
-fn input_with_cursor(input: &str, cursor_visible: bool) -> String {
-    format!("{}{}", input, if cursor_visible { "█" } else { " " })
+fn input_text(input: &InteractiveTextInput) -> String {
+    input.text.clone()
+}
+
+fn write_input_cursor_position(app: &InteractiveApp, preview_area: Rect) -> Option<Position> {
+    if app.mode != InteractiveMode::Write || !app.write_input_active() {
+        return None;
+    }
+
+    let (line_index, prefix_width, input) = write_input_cursor_target(app)?;
+    let scroll = usize::from(app.preview_scroll);
+    let inner_height = usize::from(preview_area.height.saturating_sub(2));
+    if line_index < scroll || line_index >= scroll + inner_height {
+        return None;
+    }
+
+    let x = usize::from(preview_area.x)
+        .saturating_add(1)
+        .saturating_add(prefix_width)
+        .saturating_add(input.cursor);
+    let y = usize::from(preview_area.y)
+        .saturating_add(1)
+        .saturating_add(line_index.saturating_sub(scroll));
+    let max_x = usize::from(
+        preview_area
+            .x
+            .saturating_add(preview_area.width.saturating_sub(1)),
+    );
+    let max_y = usize::from(
+        preview_area
+            .y
+            .saturating_add(preview_area.height.saturating_sub(1)),
+    );
+
+    (x < max_x && y < max_y).then(|| Position {
+        x: x.min(usize::from(u16::MAX)) as u16,
+        y: y.min(usize::from(u16::MAX)) as u16,
+    })
+}
+
+fn write_input_cursor_target(
+    app: &InteractiveApp,
+) -> Option<(usize, usize, &InteractiveTextInput)> {
+    let start = write_header_line_count(app);
+    match &app.write_editor.state {
+        InteractiveWriteState::Editing { input, .. } => Some((start + 1, "Value: ".len(), input)),
+        InteractiveWriteState::AddStandard { query, .. } => {
+            Some((start, "Standard tag search: ".len(), query))
+        }
+        InteractiveWriteState::AddCustomName { input } => Some((start + 1, "Name: ".len(), input)),
+        InteractiveWriteState::AddValue { input, .. } => Some((start + 1, "Value: ".len(), input)),
+        InteractiveWriteState::Browsing | InteractiveWriteState::AddKind => None,
+    }
+}
+
+fn selected_write_row_line_index(app: &InteractiveApp) -> Option<usize> {
+    let editor = &app.write_editor;
+    if editor.rows.is_empty() {
+        return None;
+    }
+
+    let mut line_index = write_browsing_start_line_index(app);
+    let mut first_group = true;
+
+    for group in PrettyReadGroup::OUTPUT_ORDER {
+        let group_rows = editor
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.group == group)
+            .collect::<Vec<_>>();
+        if group_rows.is_empty() {
+            continue;
+        }
+
+        if !first_group {
+            line_index += 1;
+        }
+        first_group = false;
+
+        line_index += 1;
+
+        for (index, _) in group_rows {
+            if index == editor.selected {
+                return Some(line_index);
+            }
+            line_index += 1;
+        }
+    }
+
+    None
+}
+
+fn write_browsing_start_line_index(app: &InteractiveApp) -> usize {
+    let mut line_index = write_header_line_count(app);
+    if app.write_loading_visible {
+        line_index += 1;
+    }
+    line_index
+}
+
+fn write_header_line_count(app: &InteractiveApp) -> usize {
+    let mut line_count = 1;
+    if app.dry_run {
+        line_count += 1;
+    }
+    if app.write_editor.status.is_some() {
+        line_count += 1;
+    }
+    line_count + 1
 }
 
 fn append_write_browsing_lines(
@@ -1685,25 +2248,64 @@ fn append_write_browsing_lines(
         return;
     }
 
-    for (index, row) in editor.rows.iter().enumerate() {
-        let kind = match row.kind {
-            InteractiveTagKind::Standard => "EXIF",
-            InteractiveTagKind::Custom => "Custom",
-        };
-        let style = if editor_focused && index == editor.selected {
-            Style::default()
-                .bg(Color::Blue)
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else if row.kind == InteractiveTagKind::Custom {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default()
-        };
+    let mut first_group = true;
+    for group in PrettyReadGroup::OUTPUT_ORDER {
+        let group_rows = editor
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.group == group)
+            .collect::<Vec<_>>();
+        if group_rows.is_empty() {
+            continue;
+        }
+
+        if !first_group {
+            lines.push(Line::default());
+        }
+        first_group = false;
+
         lines.push(Line::from(Span::styled(
-            format!("{kind:<7} {:<24} {}", row.name, row.value),
-            style,
+            check_heading_text(group.label()),
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
         )));
+
+        let name_width = group_rows
+            .iter()
+            .map(|(_, row)| row.label.len())
+            .max()
+            .unwrap_or(0);
+
+        for (index, row) in group_rows {
+            let style =
+                interactive_write_row_style(row, editor_focused && index == editor.selected);
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{}{}  {}",
+                    row.label,
+                    " ".repeat(name_width - row.label.len()),
+                    row.value
+                ),
+                style,
+            )));
+        }
+    }
+}
+
+fn interactive_write_row_style(row: &InteractiveTagRow, selected: bool) -> Style {
+    if selected && row.editable {
+        Style::default()
+            .bg(Color::Blue)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else if !row.editable {
+        Style::default().fg(Color::DarkGray)
+    } else if row.kind == InteractiveTagKind::Custom {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default()
     }
 }
 
@@ -1967,14 +2569,7 @@ fn append_pretty_file_info_rows(output: &mut String, info_rows: &[ReadInfoRow]) 
 }
 
 fn append_pretty_read_groups(output: &mut String, pretty_rows: &mut [PrettyReadRow]) {
-    pretty_rows.sort_by(|left, right| {
-        left.group
-            .output_order()
-            .cmp(&right.group.output_order())
-            .then(pretty_read_row_sort_order(left).cmp(&pretty_read_row_sort_order(right)))
-            .then_with(|| pretty_read_row_sort_label(left).cmp(&pretty_read_row_sort_label(right)))
-            .then(left.value.cmp(&right.value))
-    });
+    sort_pretty_read_rows(pretty_rows);
 
     let mut first_group = true;
     for group in PrettyReadGroup::OUTPUT_ORDER {
@@ -2005,6 +2600,17 @@ fn append_pretty_read_groups(output: &mut String, pretty_rows: &mut [PrettyReadR
             output.push_str(&format!("  {}\n", row.value));
         }
     }
+}
+
+fn sort_pretty_read_rows(pretty_rows: &mut [PrettyReadRow]) {
+    pretty_rows.sort_by(|left, right| {
+        left.group
+            .output_order()
+            .cmp(&right.group.output_order())
+            .then(pretty_read_row_sort_order(left).cmp(&pretty_read_row_sort_order(right)))
+            .then_with(|| pretty_read_row_sort_label(left).cmp(&pretty_read_row_sort_label(right)))
+            .then(left.value.cmp(&right.value))
+    });
 }
 
 fn pretty_read_row_sort_order(row: &PrettyReadRow) -> usize {
@@ -2240,7 +2846,7 @@ impl PrettyReadRow {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrettyReadGroup {
     File,
     Camera,
@@ -2849,12 +3455,21 @@ fn gps_reference(field: &Field) -> Option<&str> {
 }
 
 fn format_decimal_coordinate(value: f64) -> String {
+    format_decimal_scalar(value)
+}
+
+fn format_decimal_scalar(value: f64) -> String {
     let formatted = format!("{value:.6}");
 
-    formatted
+    let trimmed = formatted
         .trim_end_matches('0')
         .trim_end_matches('.')
-        .to_string()
+        .to_string();
+    if trimmed == "-0" {
+        "0".to_string()
+    } else {
+        trimmed
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3528,13 +4143,15 @@ fn append_check_overview_group(output: &mut String, first_group: &mut bool, repo
     }
 }
 
+const CHECK_HEADING_WIDTH: usize = 50;
+
+fn check_heading_text(label: &str) -> String {
+    let dash_count = CHECK_HEADING_WIDTH.saturating_sub(label.len() + 1);
+    format!("{label} {}", "─".repeat(dash_count))
+}
+
 fn append_check_heading(output: &mut String, label: &str) {
-    const WIDTH: usize = 50;
-    let dash_count = WIDTH.saturating_sub(label.len() + 1);
-    output.push_str(&format!(
-        "{}\n",
-        format!("{label} {}", "─".repeat(dash_count)).bright_blue()
-    ));
+    output.push_str(&format!("{}\n", check_heading_text(label).bright_blue()));
 }
 
 fn append_spaced_check_heading(output: &mut String, first_group: &mut bool, label: &str) {
@@ -6530,7 +7147,7 @@ mod tests {
         let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
         app.mode = InteractiveMode::Write;
         app.write_editor.state = InteractiveWriteState::AddCustomName {
-            input: String::new(),
+            input: InteractiveTextInput::default(),
         };
 
         app.handle_event(key_event(KeyCode::Tab, KeyEventKind::Press))
@@ -6592,9 +7209,13 @@ mod tests {
             &app,
             Ok(vec![InteractiveTagRow {
                 name: "Make".to_string(),
+                label: "Make".to_string(),
                 value: "Nikon".to_string(),
+                edit_value: "Nikon".to_string(),
                 raw_value: YamlValue::String("Nikon".to_string()),
                 kind: InteractiveTagKind::Standard,
+                group: PrettyReadGroup::Camera,
+                editable: true,
             }]),
         ));
 
@@ -6626,9 +7247,13 @@ mod tests {
             &app,
             Ok(vec![InteractiveTagRow {
                 name: "Model".to_string(),
+                label: "Model".to_string(),
                 value: "F3".to_string(),
+                edit_value: "F3".to_string(),
                 raw_value: YamlValue::String("F3".to_string()),
                 kind: InteractiveTagKind::Standard,
+                group: PrettyReadGroup::Camera,
+                editable: true,
             }]),
         ));
 
@@ -6690,9 +7315,13 @@ mod tests {
         app.write_editor.image = Some(directory.join("previous.jpg"));
         app.write_editor.rows.push(InteractiveTagRow {
             name: "Make".to_string(),
+            label: "Make".to_string(),
             value: "Nikon".to_string(),
+            edit_value: "Nikon".to_string(),
             raw_value: YamlValue::String("Nikon".to_string()),
             kind: InteractiveTagKind::Standard,
+            group: PrettyReadGroup::Camera,
+            editable: true,
         });
 
         app.request_write_editor_for_selection();
@@ -6813,7 +7442,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_input_cursor_renders_and_blinks() {
+    fn interactive_input_text_renders_without_fake_cursor() {
         let directory = temporary_test_directory("interactive-cursor");
         std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
             .expect("jpg should be written");
@@ -6823,7 +7452,7 @@ mod tests {
         app.write_editor.state = InteractiveWriteState::Editing {
             name: "Make".to_string(),
             kind: InteractiveTagKind::Standard,
-            input: "Nik".to_string(),
+            input: InteractiveTextInput::new("Nik"),
         };
         app.input_cursor_visible = true;
 
@@ -6832,7 +7461,8 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Value: Nik█"));
+        assert!(rendered.contains("Value: Nik"));
+        assert!(!rendered.contains('█'));
 
         app.input_cursor_deadline = Instant::now() - Duration::from_millis(1);
         app.tick_input_cursor();
@@ -6843,7 +7473,8 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Value: Nik "));
+        assert!(rendered.contains("Value: Nik"));
+        assert!(!rendered.contains("Value: Nik "));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -6859,9 +7490,13 @@ mod tests {
         app.focus = InteractiveFocus::List;
         app.write_editor.rows = vec![InteractiveTagRow {
             name: "Make".to_string(),
+            label: "Make".to_string(),
             value: "Nikon".to_string(),
+            edit_value: "Nikon".to_string(),
             raw_value: YamlValue::String("Nikon".to_string()),
             kind: InteractiveTagKind::Standard,
+            group: PrettyReadGroup::Camera,
+            editable: true,
         }];
         app.write_editor.selected = 0;
 
@@ -6887,9 +7522,13 @@ mod tests {
         app.focus = InteractiveFocus::WriteEditor;
         app.write_editor.rows = vec![InteractiveTagRow {
             name: "Make".to_string(),
+            label: "Make".to_string(),
             value: "Nikon".to_string(),
+            edit_value: "Nikon".to_string(),
             raw_value: YamlValue::String("Nikon".to_string()),
             kind: InteractiveTagKind::Standard,
+            group: PrettyReadGroup::Camera,
+            editable: true,
         }];
         app.write_editor.selected = 0;
 
@@ -6911,6 +7550,638 @@ mod tests {
     }
 
     #[test]
+    fn interactive_write_rows_render_read_style_group_order() {
+        let directory = temporary_test_directory("interactive-write-group-order");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(&image, [("Make", "Nikon"), ("FNumber", "5.6")]);
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.rows = interactive_tag_rows(&image).expect("write rows should build");
+
+        let rendered = write_editor_lines(&app)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let file = rendered.find("file").expect("file group should render");
+        let camera = rendered.find("camera").expect("camera group should render");
+        let exposure = rendered
+            .find("exposure")
+            .expect("exposure group should render");
+
+        assert!(file < camera);
+        assert!(camera < exposure);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_group_headings_include_read_style_rule() {
+        let directory = temporary_test_directory("interactive-write-heading-rule");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(&image, [("Make", "Nikon")]);
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.rows = interactive_tag_rows(&image).expect("write rows should build");
+
+        let lines = write_editor_lines(&app);
+        let file_heading = lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.starts_with("file "))
+            .expect("file heading should render");
+
+        assert!(file_heading.contains('─'));
+        assert_eq!(file_heading, check_heading_text("file"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_rows_dim_disabled_rows() {
+        let directory = temporary_test_directory("interactive-write-disabled-row");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(&image, [("Make", "Nikon")]);
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.rows = interactive_tag_rows(&image).expect("write rows should build");
+
+        let lines = write_editor_lines(&app);
+        let file_name = lines
+            .iter()
+            .find(|line| line_text(line).contains("Name"))
+            .expect("file info row should render");
+
+        assert_eq!(
+            file_name.spans[0].style,
+            Style::default().fg(Color::DarkGray)
+        );
+        assert!(
+            app.write_editor
+                .rows
+                .iter()
+                .any(|row| row.label == "Name" && !row.editable)
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_navigation_skips_disabled_rows() {
+        let directory = temporary_test_directory("interactive-write-navigation-disabled");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.rows = vec![
+            interactive_test_row("File Name", PrettyReadGroup::File, false),
+            interactive_test_row("Make", PrettyReadGroup::Camera, true),
+            interactive_test_row("Model", PrettyReadGroup::Camera, false),
+            interactive_test_row("F Number", PrettyReadGroup::Exposure, true),
+        ];
+        app.write_editor.selected = 1;
+
+        app.select_next_write_row();
+        assert_eq!(app.write_editor.selected, 3);
+
+        app.select_previous_write_row();
+        assert_eq!(app.write_editor.selected, 1);
+
+        app.write_editor.selected = 0;
+        app.ensure_editable_write_selection();
+        assert_eq!(app.write_editor.selected, 1);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_loading_appears_at_browsing_data_start() {
+        let directory = temporary_test_directory("interactive-write-loading-row");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.rows = vec![interactive_test_row("Make", PrettyReadGroup::Camera, true)];
+        let expected_line = write_browsing_start_line_index(&app);
+        app.write_loading_visible = true;
+
+        let loading_line = write_editor_lines(&app)
+            .iter()
+            .position(|line| line_text(line).contains("Reading editable tags"))
+            .expect("loading line should render");
+
+        assert_eq!(loading_line, expected_line);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_navigation_scrolls_selected_row_into_view() {
+        let directory = temporary_test_directory("interactive-write-navigation-scroll");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "image.jpg")
+            .expect("image should exist");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.rows = (0..10)
+            .map(|index| {
+                interactive_test_row(&format!("Tag {index}"), PrettyReadGroup::Camera, true)
+            })
+            .collect();
+        app.set_preview_viewport(80, 5);
+
+        for _ in 0..9 {
+            app.select_next_write_row();
+        }
+
+        assert_eq!(app.write_editor.selected, 9);
+        assert_write_selection_visible(&app);
+        assert!(app.preview_scroll > 0);
+
+        for _ in 0..9 {
+            app.select_previous_write_row();
+        }
+
+        assert_eq!(app.write_editor.selected, 0);
+        assert_write_selection_visible(&app);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_refresh_scrolls_selected_row_into_view() {
+        let directory = temporary_test_directory("interactive-write-refresh-scroll");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "image.jpg")
+            .expect("image should exist");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.set_preview_viewport(80, 5);
+        app.request_write_editor_for_selection();
+        app.write_editor.selected = 8;
+
+        app.apply_write_result(write_result_for_selected(
+            &app,
+            Ok((0..10)
+                .map(|index| {
+                    interactive_test_row(&format!("Tag {index}"), PrettyReadGroup::Camera, true)
+                })
+                .collect()),
+        ));
+
+        assert_eq!(app.write_editor.selected, 8);
+        assert_write_selection_visible(&app);
+        assert!(app.preview_scroll > 0);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_focus_scrolls_to_preserved_selected_row() {
+        let directory = temporary_test_directory("interactive-write-focus-scroll");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "image.jpg")
+            .expect("image should exist");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::List;
+        app.write_editor.rows = (0..10)
+            .map(|index| {
+                interactive_test_row(&format!("Tag {index}"), PrettyReadGroup::Camera, true)
+            })
+            .collect();
+        app.write_editor.selected = 8;
+        app.set_preview_viewport(80, 5);
+        app.preview_scroll = 0;
+
+        app.handle_event(key_event(KeyCode::Right, KeyEventKind::Press))
+            .expect("right should focus write editor");
+
+        assert_eq!(app.focus, InteractiveFocus::WriteEditor);
+        assert_eq!(app.write_editor.selected, 8);
+        assert_write_selection_visible(&app);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_viewport_resize_keeps_selected_row_visible() {
+        let directory = temporary_test_directory("interactive-write-resize-scroll");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "image.jpg")
+            .expect("image should exist");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.rows = (0..10)
+            .map(|index| {
+                interactive_test_row(&format!("Tag {index}"), PrettyReadGroup::Camera, true)
+            })
+            .collect();
+        app.write_editor.selected = 8;
+        app.set_preview_viewport(80, 12);
+        app.preview_scroll = 0;
+
+        app.set_preview_viewport(80, 5);
+
+        assert_write_selection_visible(&app);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_editing_uses_canonical_value_while_browsing_uses_pretty_value() {
+        let (exposure_entry, exposure_data) =
+            tiff_rational_entry_with_count(0x829a, &[(10_000, 14_392_134)], 200);
+        let exif = parse_raw_exif_with_exif_entries(&[exposure_entry], &[(200, exposure_data)]);
+        let rows = interactive_editable_rows_for_exif(&exif);
+        let row = rows
+            .iter()
+            .find(|row| row.name == "ExposureTime")
+            .expect("exposure row should be editable");
+
+        assert_eq!(row.value, "1/1439");
+        assert_eq!(row.edit_value, "10000/14392134");
+
+        let directory = temporary_test_directory("interactive-write-raw-edit");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.write_editor.rows = rows;
+        app.write_editor.selected = app
+            .write_editor
+            .rows
+            .iter()
+            .position(|row| row.name == "ExposureTime")
+            .expect("exposure row should exist");
+
+        app.start_edit_selected_write_row();
+
+        let InteractiveWriteState::Editing { input, .. } = &app.write_editor.state else {
+            panic!("editing state should start");
+        };
+        assert_eq!(input.text, "10000/14392134");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_gps_edit_values_use_decimal_coordinates() {
+        let metadata = test_gps_metadata();
+        let rows = interactive_editable_rows_for_exif(&metadata.exif);
+        let latitude = interactive_editable_row(&rows, "GPSLatitude");
+        let longitude = interactive_editable_row(&rows, "GPSLongitude");
+
+        assert!(latitude.value.contains("(52.352832)"));
+        assert!(latitude.value.contains("52 deg 21 min 10.1952 sec N"));
+        assert_eq!(latitude.edit_value, "52.352832");
+        assert!(longitude.value.contains("1 deg 18 min 14.71968 sec W"));
+        assert_eq!(longitude.edit_value, "-1.304089");
+    }
+
+    #[test]
+    fn interactive_write_rational_edit_values_use_exact_fractions() {
+        let (exposure_entry, exposure_data) =
+            tiff_rational_entry_with_count(0x829a, &[(1, 500)], 200);
+        let (f_number_entry, f_number_data) =
+            tiff_rational_entry_with_count(0x829d, &[(56, 10)], 208);
+        let (focal_length_entry, focal_length_data) =
+            tiff_rational_entry_with_count(0x920a, &[(75, 1)], 216);
+        let exif = parse_raw_exif_with_exif_entries(
+            &[exposure_entry, f_number_entry, focal_length_entry],
+            &[
+                (200, exposure_data),
+                (208, f_number_data),
+                (216, focal_length_data),
+            ],
+        );
+        let rows = interactive_editable_rows_for_exif(&exif);
+
+        assert_eq!(
+            interactive_editable_row(&rows, "ExposureTime").edit_value,
+            "1/500"
+        );
+        assert_eq!(
+            interactive_editable_row(&rows, "FNumber").edit_value,
+            "56/10"
+        );
+        assert_eq!(
+            interactive_editable_row(&rows, "FocalLength").edit_value,
+            "75/1"
+        );
+    }
+
+    #[test]
+    fn interactive_write_numeric_and_text_edit_values_use_underlying_values() {
+        let ifd0_exif = parse_raw_exif(&[
+            tiff_ascii_entry(0x010f, b"N\0"),
+            tiff_short_entry(0x0112, 6),
+        ]);
+        let ifd0_rows = interactive_editable_rows_for_exif(&ifd0_exif);
+        assert_eq!(interactive_editable_row(&ifd0_rows, "Make").edit_value, "N");
+        assert_eq!(
+            interactive_editable_row(&ifd0_rows, "Orientation").edit_value,
+            "6"
+        );
+
+        let exif = parse_raw_exif_with_exif_entries(
+            &[tiff_short_entry(0x9208, 1), tiff_short_entry(0x9209, 16)],
+            &[],
+        );
+        let rows = interactive_editable_rows_for_exif(&exif);
+        assert_eq!(
+            interactive_editable_row(&rows, "LightSource").edit_value,
+            "1"
+        );
+        assert_eq!(interactive_editable_row(&rows, "Flash").edit_value, "16");
+    }
+
+    #[test]
+    fn interactive_write_standard_edit_values_round_trip_through_writer_conversion() {
+        let directory = temporary_test_directory("interactive-write-edit-round-trip");
+        let image = directory.join("image.jpg");
+        write_test_exif_tags(
+            &image,
+            [
+                ("Make", "Nikon"),
+                ("Model", "F3"),
+                ("ExposureTime", "1/500"),
+                ("FNumber", "f/5.6"),
+                ("FocalLength", "75mm"),
+                ("GPSLatitude", "31.66833"),
+                ("GPSLatitudeRef", "N"),
+                ("GPSLongitude", "1.304089"),
+                ("GPSLongitudeRef", "W"),
+                ("Flash", "16"),
+                ("Orientation", "6"),
+            ],
+        );
+
+        let rows = interactive_tag_rows(&image).expect("interactive rows should build");
+        for row in rows
+            .iter()
+            .filter(|row| row.editable && row.kind == InteractiveTagKind::Standard)
+        {
+            let value = yaml_value_from_input(&row.edit_value);
+            assert!(
+                writable_exif_tag(&row.name, &value).is_some(),
+                "{} edit value should round-trip through writer conversion: {:?}",
+                row.name,
+                row.edit_value
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_text_input_edits_and_renders_cursor_in_middle() {
+        let mut input = InteractiveTextInput::new("Nikon");
+
+        assert!(input.move_left());
+        assert!(input.move_left());
+        input.insert('X');
+        assert_eq!(input.text, "NikXon");
+        assert_eq!(input.cursor, 4);
+
+        assert!(input.backspace());
+        assert_eq!(input.text, "Nikon");
+        assert_eq!(input.cursor, 3);
+
+        assert!(input.delete());
+        assert_eq!(input.text, "Nikn");
+
+        assert!(input.move_home());
+        input.insert('Ω');
+        assert_eq!(input.text, "ΩNikn");
+        assert_eq!(input.cursor, 1);
+
+        assert!(input.move_end());
+        assert_eq!(input.cursor, 5);
+        assert!(input.move_left());
+        assert_eq!(input_text(&input), "ΩNikn");
+    }
+
+    #[test]
+    fn interactive_text_input_ctrl_word_navigation_and_delete() {
+        let mut input = InteractiveTextInput::new("alpha  βeta gamma");
+
+        assert!(input.move_previous_word());
+        assert_eq!(input.cursor, 12);
+
+        assert!(input.move_previous_word());
+        assert_eq!(input.cursor, 7);
+
+        assert!(input.move_next_word());
+        assert_eq!(input.cursor, 12);
+
+        assert!(input.move_home());
+        assert!(input.delete_next_word());
+        assert_eq!(input.text, "βeta gamma");
+        assert_eq!(input.cursor, 0);
+
+        assert!(input.move_next_word());
+        assert_eq!(input.cursor, 5);
+        assert!(input.delete_next_word());
+        assert_eq!(input.text, "βeta ");
+        assert_eq!(input.cursor, 5);
+    }
+
+    #[test]
+    fn interactive_text_input_ctrl_keys_drive_word_editing() {
+        let mut input = InteractiveTextInput::new("alpha  beta gamma");
+
+        let outcome = handle_interactive_text_input_key(
+            &mut input,
+            KeyEvent::new_with_kind(KeyCode::Left, KeyModifiers::CONTROL, KeyEventKind::Press),
+        );
+        assert_eq!(outcome, InteractiveInputKeyOutcome::Moved);
+        assert_eq!(input.cursor, 12);
+
+        let outcome = handle_interactive_text_input_key(
+            &mut input,
+            KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::CONTROL, KeyEventKind::Press),
+        );
+        assert_eq!(outcome, InteractiveInputKeyOutcome::Moved);
+        assert_eq!(input.cursor, input.text.chars().count());
+
+        input.cursor = 0;
+        let outcome = handle_interactive_text_input_key(
+            &mut input,
+            KeyEvent::new_with_kind(KeyCode::Delete, KeyModifiers::CONTROL, KeyEventKind::Press),
+        );
+        assert_eq!(outcome, InteractiveInputKeyOutcome::Changed);
+        assert_eq!(input.text, "beta gamma");
+        assert_eq!(input.cursor, 0);
+    }
+
+    #[test]
+    fn interactive_write_input_cursor_position_tracks_input_states() {
+        let directory = temporary_test_directory("interactive-cursor-position");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+        let area = Rect {
+            x: 10,
+            y: 5,
+            width: 80,
+            height: 20,
+        };
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.state = InteractiveWriteState::Editing {
+            name: "Make".to_string(),
+            kind: InteractiveTagKind::Standard,
+            input: InteractiveTextInput {
+                text: "Nikon".to_string(),
+                cursor: 2,
+            },
+        };
+        assert_eq!(
+            write_input_cursor_position(&app, area),
+            Some(Position { x: 20, y: 9 })
+        );
+
+        app.write_editor.state = InteractiveWriteState::AddStandard {
+            query: InteractiveTextInput {
+                text: "ake".to_string(),
+                cursor: 1,
+            },
+            selected: 0,
+        };
+        assert_eq!(
+            write_input_cursor_position(&app, area),
+            Some(Position { x: 33, y: 8 })
+        );
+
+        app.write_editor.state = InteractiveWriteState::AddCustomName {
+            input: InteractiveTextInput {
+                text: "Film".to_string(),
+                cursor: 4,
+            },
+        };
+        assert_eq!(
+            write_input_cursor_position(&app, area),
+            Some(Position { x: 21, y: 9 })
+        );
+
+        app.write_editor.state = InteractiveWriteState::AddValue {
+            name: "Film".to_string(),
+            kind: InteractiveTagKind::Custom,
+            input: InteractiveTextInput {
+                text: "Kodak".to_string(),
+                cursor: 5,
+            },
+        };
+        assert_eq!(
+            write_input_cursor_position(&app, area),
+            Some(Position { x: 23, y: 9 })
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_input_cursor_position_hides_when_scrolled_out() {
+        let directory = temporary_test_directory("interactive-cursor-scrolled");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.write_editor.state = InteractiveWriteState::Editing {
+            name: "Make".to_string(),
+            kind: InteractiveTagKind::Standard,
+            input: InteractiveTextInput::new("Nikon"),
+        };
+        app.preview_scroll = 4;
+
+        assert_eq!(
+            write_input_cursor_position(
+                &app,
+                Rect {
+                    x: 10,
+                    y: 5,
+                    width: 80,
+                    height: 20,
+                }
+            ),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_add_standard_search_uses_cursor_and_resets_selection() {
+        let directory = temporary_test_directory("interactive-standard-search-cursor");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.state = InteractiveWriteState::AddStandard {
+            query: InteractiveTextInput {
+                text: "ake".to_string(),
+                cursor: 0,
+            },
+            selected: 3,
+        };
+
+        app.handle_write_key(KeyEvent::new_with_kind(
+            KeyCode::Char('M'),
+            KeyModifiers::empty(),
+            KeyEventKind::Press,
+        ))
+        .expect("search edit should be handled");
+
+        let InteractiveWriteState::AddStandard { query, selected } = &app.write_editor.state else {
+            panic!("add-standard state should remain active");
+        };
+        assert_eq!(query.text, "Make");
+        assert_eq!(query.cursor, 1);
+        assert_eq!(*selected, 0);
+        assert!(filtered_writable_standard_tags(query.as_str()).contains(&"Make"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn interactive_read_preview_preserves_read_colours() {
         let directory = temporary_test_directory("interactive-read-colours");
         let image = directory.join("image.jpg");
@@ -6923,7 +8194,9 @@ mod tests {
             .as_lines()
             .expect("read preview should render styled lines");
 
-        assert!(line_text(&lines[0]).starts_with("file "));
+        assert!(line_text(&lines[0]).is_empty());
+        assert!(line_text(&lines[1]).is_empty());
+        assert!(line_text(&lines[2]).starts_with("file "));
         let no_exif_line = lines
             .iter()
             .find(|line| line_text(line) == "<No EXIF metadata found>")
@@ -7350,15 +8623,17 @@ mod tests {
         app.tick_preview_spinner();
 
         assert!(app.preview_loading_visible);
-        let preview = app
+        let lines = app
             .preview
-            .as_plain()
-            .expect("loading preview should be plain text");
-        assert!(preview.contains("Reading EXIF preview"));
-        assert!(preview.starts_with(app.preview_spinner.frame()));
+            .as_lines()
+            .expect("loading preview should be styled lines");
+        assert!(line_text(&lines[0]).is_empty());
+        assert!(line_text(&lines[1]).is_empty());
+        assert!(line_text(&lines[2]).contains("Reading EXIF preview"));
+        assert!(line_text(&lines[2]).starts_with(app.preview_spinner.frame()));
+        let preview = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(!preview.contains("image.jpg"));
         assert!(!preview.contains(&display_path(&directory)));
-        assert!(!preview.contains("\n\n"));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -7399,6 +8674,52 @@ mod tests {
             path: entry.path.clone(),
             rows,
         }
+    }
+
+    fn interactive_test_row(
+        label: &str,
+        group: PrettyReadGroup,
+        editable: bool,
+    ) -> InteractiveTagRow {
+        InteractiveTagRow {
+            name: label.replace(' ', ""),
+            label: label.to_string(),
+            value: "value".to_string(),
+            edit_value: "value".to_string(),
+            raw_value: YamlValue::String("value".to_string()),
+            kind: InteractiveTagKind::Standard,
+            group,
+            editable,
+        }
+    }
+
+    fn interactive_editable_rows_for_exif(exif: &Exif) -> Vec<InteractiveTagRow> {
+        let read_rows = exif
+            .fields()
+            .map(|field| ReadRow::from_field(field, exif, ReadFormat::Pretty))
+            .collect::<Vec<_>>();
+
+        interactive_editable_rows(exif, &read_rows, &[])
+    }
+
+    fn interactive_editable_row<'a>(
+        rows: &'a [InteractiveTagRow],
+        name: &str,
+    ) -> &'a InteractiveTagRow {
+        rows.iter()
+            .find(|row| row.name == name)
+            .expect("editable row should exist")
+    }
+
+    fn assert_write_selection_visible(app: &InteractiveApp) {
+        let line_index = selected_write_row_line_index(app).expect("selected row should render");
+        let visible_top = usize::from(app.preview_scroll);
+        let visible_bottom = visible_top + usize::from(app.preview_viewport_height.max(1));
+
+        assert!(
+            (visible_top..visible_bottom).contains(&line_index),
+            "line {line_index} should be visible in {visible_top}..{visible_bottom}"
+        );
     }
 
     fn line_text(line: &Line<'static>) -> String {
