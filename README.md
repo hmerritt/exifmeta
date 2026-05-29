@@ -162,7 +162,7 @@ exifmeta strip --privacy
 
 ### `interactive`
 
-Open an interactive browser for folders and images.
+Open an interactive browser for folders and images. It starts in read mode by default.
 
 ```sh
 exifmeta interactive
@@ -173,6 +173,13 @@ You can also open a specific directory:
 ```sh
 exifmeta interactive "Photos/shoot-001"
 ```
+
+Press `w` to toggle write mode. In write mode, select an image and press `Enter`
+or `Right` to edit writable tags. Press `a` to add a tag, then choose a
+writable standard EXIF tag or enter a custom tag name. Each confirmed edit is
+written immediately; with `--dry-run`, edits are simulated without changing
+files. The standard picker only lists EXIF tags currently supported by
+exifmeta's writer.
 
 ### `metadata.yml` file
 
