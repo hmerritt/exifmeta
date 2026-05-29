@@ -1629,40 +1629,36 @@ impl ReadFileInfo {
         let file_kind = detect_file_kind(image);
         let mut rows = Vec::new();
 
-        rows.push(ReadInfoRow::new("File Name", file_name(image)));
         rows.push(ReadInfoRow::new("Directory", directory_name(image)));
-        rows.push(ReadInfoRow::new(
-            "File Size",
-            format_file_size(metadata.len()),
-        ));
-
-        if let Ok(modified) = metadata.modified() {
-            rows.push(ReadInfoRow::new(
-                "File Modification Date/Time",
-                format_system_time(modified),
-            ));
-        }
+        rows.push(ReadInfoRow::new("Name", file_name(image)));
+        rows.push(ReadInfoRow::new("Size", format_file_size(metadata.len())));
 
         if let Ok(accessed) = metadata.accessed() {
             rows.push(ReadInfoRow::new(
-                "File Access Date/Time",
+                "Access Date",
                 format_system_time(accessed),
             ));
         }
 
         if let Ok(created) = metadata.created() {
             rows.push(ReadInfoRow::new(
-                "File Creation Date/Time",
+                "Creation Date",
                 format_system_time(created),
             ));
         }
 
+        if let Ok(modified) = metadata.modified() {
+            rows.push(ReadInfoRow::new(
+                "Modification Date",
+                format_system_time(modified),
+            ));
+        }
+
         rows.push(ReadInfoRow::new(
-            "File Permissions",
+            "Permissions",
             format_permissions(&metadata),
         ));
-        rows.push(ReadInfoRow::new("File Type", file_kind.file_type));
-        rows.push(ReadInfoRow::new("File Type Extension", file_kind.extension));
+        rows.push(ReadInfoRow::new("Type Extension", file_kind.extension));
         rows.push(ReadInfoRow::new("MIME Type", file_kind.mime_type));
         rows.push(ReadInfoRow::new(
             "Exif Byte Order",
@@ -1718,7 +1714,14 @@ fn format_read_output(_image: &Path, metadata: &ReadMetadata, format: ReadFormat
         .collect::<Vec<_>>();
 
     if rows.is_empty() && custom_tags.is_empty() {
-        output.push_str(&format_empty_exif_message(format));
+        match format {
+            ReadFormat::Pretty => append_empty_pretty_read_output(
+                &mut output,
+                &metadata.file_info.rows,
+                format_empty_exif_message(format),
+            ),
+            ReadFormat::Raw => output.push_str(&format_empty_exif_message(format)),
+        }
     } else {
         sort_read_rows(&mut rows);
 
@@ -1746,6 +1749,18 @@ fn format_read_output(_image: &Path, metadata: &ReadMetadata, format: ReadFormat
     }
 
     output
+}
+
+fn append_empty_pretty_read_output(
+    output: &mut String,
+    info_rows: &[ReadInfoRow],
+    message: String,
+) {
+    append_pretty_file_info_rows(output, info_rows);
+    if !output.is_empty() {
+        output.push_str("\n\n");
+    }
+    output.push_str(&message);
 }
 
 fn format_empty_exif_message(format: ReadFormat) -> String {
@@ -1788,10 +1803,24 @@ fn append_pretty_read_rows(
 ) {
     let mut pretty_rows = pretty_read_rows(info_rows, rows, custom_tags);
     append_nearest_location_rows(&mut pretty_rows, exif, warnings);
+    append_pretty_read_groups(output, &mut pretty_rows);
+}
+
+fn append_pretty_file_info_rows(output: &mut String, info_rows: &[ReadInfoRow]) {
+    let mut pretty_rows = pretty_read_rows(info_rows, &[], &[])
+        .into_iter()
+        .filter(|row| row.group == PrettyReadGroup::File)
+        .collect::<Vec<_>>();
+    append_pretty_read_groups(output, &mut pretty_rows);
+    *output = output.trim_end().to_string();
+}
+
+fn append_pretty_read_groups(output: &mut String, pretty_rows: &mut [PrettyReadRow]) {
     pretty_rows.sort_by(|left, right| {
         left.group
             .output_order()
             .cmp(&right.group.output_order())
+            .then(pretty_read_row_sort_order(left).cmp(&pretty_read_row_sort_order(right)))
             .then_with(|| pretty_read_row_sort_label(left).cmp(&pretty_read_row_sort_label(right)))
             .then(left.value.cmp(&right.value))
     });
@@ -1824,6 +1853,25 @@ fn append_pretty_read_rows(
             output.push_str(&" ".repeat(name_width - row.label.len()));
             output.push_str(&format!("  {}\n", row.value));
         }
+    }
+}
+
+fn pretty_read_row_sort_order(row: &PrettyReadRow) -> usize {
+    if row.group != PrettyReadGroup::File {
+        return usize::MAX;
+    }
+
+    match normalized_label(&row.label).as_str() {
+        "name" | "filename" => 0,
+        "size" | "filesize" => 1,
+        "typeextension" | "filetypeextension" => 2,
+        "mimetype" => 3,
+        "permissions" | "filepermissions" => 4,
+        "accessdate" | "fileaccessdate/time" => 5,
+        "creationdate" | "filecreationdate/time" => 6,
+        "modificationdate" | "filemodificationdate/time" => 7,
+        "directory" => 8,
+        _ => usize::MAX,
     }
 }
 
@@ -2093,14 +2141,21 @@ fn classify_info_row(row: &ReadInfoRow) -> PrettyReadGroup {
         &row.name,
         &[
             "filename",
+            "name",
             "directory",
             "filesize",
+            "size",
             "filemodificationdate/time",
+            "modificationdate",
             "fileaccessdate/time",
+            "accessdate",
             "filecreationdate/time",
+            "creationdate",
             "filepermissions",
+            "permissions",
             "filetype",
             "filetypeextension",
+            "typeextension",
             "mimetype",
         ],
     ) {
@@ -6344,13 +6399,20 @@ mod tests {
         let directory = temporary_test_directory("interactive-read-colours");
         let image = directory.join("image.jpg");
         std::fs::write(&image, [0xff, 0xd8, 0xff, 0xd9]).expect("jpg should be written");
+        colored::control::set_override(true);
 
         let preview = read_preview(&image);
+        colored::control::set_override(false);
         let lines = preview
             .as_lines()
             .expect("read preview should render styled lines");
 
-        assert_eq!(line_text(&lines[0]), "<No EXIF metadata found>");
+        assert!(line_text(&lines[0]).starts_with("file "));
+        let no_exif_line = lines
+            .iter()
+            .find(|line| line_text(line) == "<No EXIF metadata found>")
+            .expect("no-EXIF message should be rendered below file info");
+        assert_eq!(no_exif_line.spans[0].style.fg, Some(Color::Yellow));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -9098,6 +9160,45 @@ frames:
     }
 
     #[test]
+    fn formats_empty_pretty_read_output_with_file_group_when_file_info_exists() {
+        colored::control::set_override(true);
+
+        let output = format_read_output(
+            Path::new("image.tif"),
+            &ReadMetadata {
+                exif: parse_raw_exif(&[]),
+                warnings: Vec::new(),
+                file_info: test_file_info(),
+            },
+            ReadFormat::Pretty,
+        );
+        colored::control::set_override(false);
+        let plain_output = strip_ansi_codes(&output);
+
+        assert!(plain_output.starts_with("file "));
+        assert_eq!(
+            pretty_file_labels(&output),
+            [
+                "Name",
+                "Size",
+                "Type Extension",
+                "MIME Type",
+                "Permissions",
+                "Access Date",
+                "Creation Date",
+                "Modification Date",
+                "Directory",
+            ]
+        );
+        assert!(plain_output.contains("\n\n<No EXIF metadata found>"));
+        assert!(!plain_output.contains("misc "));
+        assert!(
+            plain_output.find("file ").unwrap()
+                < plain_output.find("<No EXIF metadata found>").unwrap()
+        );
+    }
+
+    #[test]
     fn formats_empty_raw_read_output() {
         assert_eq!(
             format_read_output(
@@ -9155,7 +9256,9 @@ frames:
         let plain_output = strip_ansi_codes(&output);
 
         assert!(plain_output.contains("file "));
-        assert!(plain_output.contains("File Name  image.tif"));
+        assert!(plain_output.contains("Name"));
+        assert!(plain_output.contains("image.tif"));
+        assert!(!plain_output.contains("File Type"));
         assert!(plain_output.contains("camera "));
         assert!(plain_output.contains("Make   Z\nModel  E"));
         assert!(!plain_output.contains("unknown "));
@@ -9354,12 +9457,18 @@ frames:
     fn classifies_extra_file_info_rows_as_file() {
         for name in [
             "File Access Date/Time",
+            "Access Date",
             "fileaccessdate/time",
             "File Creation Date/Time",
+            "Creation Date",
             "File Permissions",
+            "Permissions",
             "File Type",
             "File Type Extension",
+            "Type Extension",
             "file type extension",
+            "Name",
+            "Size",
             "MIME Type",
             "MIMEType",
         ] {
@@ -9597,12 +9706,12 @@ frames:
 
         assert!(info_row_value(&rows, "Exifmeta Version Number").is_none());
         let expected_file_name = path.file_name().and_then(|name| name.to_str());
-        assert_eq!(info_row_value(&rows, "File Name"), expected_file_name);
+        assert_eq!(info_row_value(&rows, "Name"), expected_file_name);
         assert!(info_row_value(&rows, "Directory").is_some());
-        assert_eq!(info_row_value(&rows, "File Size"), Some("3 bytes"));
-        assert!(info_row_value(&rows, "File Permissions").is_some());
-        assert_eq!(info_row_value(&rows, "File Type"), Some("JPEG"));
-        assert_eq!(info_row_value(&rows, "File Type Extension"), Some("jpg"));
+        assert_eq!(info_row_value(&rows, "Size"), Some("3 bytes"));
+        assert!(info_row_value(&rows, "Permissions").is_some());
+        assert!(info_row_value(&rows, "File Type").is_none());
+        assert_eq!(info_row_value(&rows, "Type Extension"), Some("jpg"));
         assert_eq!(info_row_value(&rows, "MIME Type"), Some("image/jpeg"));
         assert_eq!(
             info_row_value(&rows, "Exif Byte Order"),
@@ -9807,9 +9916,20 @@ frames:
         let metadata = read_metadata(&path).expect("missing EXIF should not fail read");
 
         let pretty = format_read_output(&path, &metadata, ReadFormat::Pretty);
+        let plain_pretty = strip_ansi_codes(&pretty);
+        assert!(plain_pretty.starts_with("file "));
+        assert!(plain_pretty.contains("Name"));
+        assert!(plain_pretty.contains("no-exif.jpg"));
+        assert!(plain_pretty.contains("Size"));
+        assert!(plain_pretty.contains("4 bytes"));
+        assert!(plain_pretty.contains("Type Extension"));
+        assert!(plain_pretty.contains("jpg"));
+        assert!(plain_pretty.contains("MIME Type"));
+        assert!(plain_pretty.contains("image/jpeg"));
+        assert!(plain_pretty.contains("\n\n<No EXIF metadata found>"));
         assert!(
-            pretty == "\u{1b}[33m<No EXIF metadata found>\u{1b}[0m"
-                || pretty == "<No EXIF metadata found>"
+            plain_pretty.find("file ").unwrap()
+                < plain_pretty.find("<No EXIF metadata found>").unwrap()
         );
         assert_eq!(
             format_read_output(&path, &metadata, ReadFormat::Raw),
@@ -9881,8 +10001,44 @@ frames:
 
     fn test_file_info() -> ReadFileInfo {
         ReadFileInfo {
-            rows: vec![ReadInfoRow::new("File Name", "image.tif")],
+            rows: vec![
+                ReadInfoRow::new("Modification Date", "2026:05:27 22:19:36+08:00"),
+                ReadInfoRow::new("Permissions", "read-write"),
+                ReadInfoRow::new("Type Extension", "tif"),
+                ReadInfoRow::new("Directory", "C:\\photos"),
+                ReadInfoRow::new("MIME Type", "image/tiff"),
+                ReadInfoRow::new("Creation Date", "2026:05:21 19:17:45+08:00"),
+                ReadInfoRow::new("Size", "24 MB"),
+                ReadInfoRow::new("Name", "image.tif"),
+                ReadInfoRow::new("Access Date", "2026:05:27 22:19:36+08:00"),
+                ReadInfoRow::new("Exif Byte Order", "Big-endian (Motorola, MM)"),
+            ],
         }
+    }
+
+    fn pretty_file_labels(output: &str) -> Vec<String> {
+        let plain_output = strip_ansi_codes(output);
+        let mut labels = Vec::new();
+        let mut in_file_group = false;
+
+        for line in plain_output.lines() {
+            if line.starts_with("file ") {
+                in_file_group = true;
+                continue;
+            }
+
+            if in_file_group && line.is_empty() {
+                break;
+            }
+
+            if in_file_group {
+                if let Some((label, _)) = line.split_once("  ") {
+                    labels.push(label.trim_end().to_string());
+                }
+            }
+        }
+
+        labels
     }
 
     fn info_row_value<'a>(rows: &'a [ReadInfoRow], name: &str) -> Option<&'a str> {
