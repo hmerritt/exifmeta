@@ -208,7 +208,8 @@ fn interactive_command(args: InteractiveArgs, dry_run: bool) -> Result<(), Strin
 
 const INTERACTIVE_PREVIEW_TICK: Duration = Duration::from_millis(80);
 const INTERACTIVE_CURSOR_TICK: Duration = Duration::from_millis(500);
-const RIGHT_PANEL_CONTENT_TOP_PADDING: usize = 2;
+const READ_MODE_HELP_TEXT: &str = "Tab — write mode";
+const WRITE_MODE_HELP_TEXT: &str = "Tab — read mode     A — add new tag     Esc — back";
 
 struct InteractiveTerminal {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
@@ -327,7 +328,7 @@ impl Default for InteractiveWriteEditor {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InteractiveStatusKind {
-    Info,
+    Warning,
     Error,
 }
 
@@ -885,10 +886,10 @@ impl InteractiveApp {
                     ..
                 } => self.start_edit_selected_write_row(),
                 KeyEvent {
-                    code: KeyCode::Char('a'),
-                    modifiers: KeyModifiers::NONE,
+                    code: KeyCode::Char('a' | 'A'),
+                    modifiers,
                     ..
-                } => {
+                } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
                     self.scroll_preview_to_top();
                     self.write_editor.state = InteractiveWriteState::AddKind;
                     self.write_editor.status = None;
@@ -990,14 +991,23 @@ impl InteractiveApp {
     }
 
     fn toggle_mode(&mut self) {
-        self.mode = match self.mode {
-            InteractiveMode::Read => InteractiveMode::Write,
-            InteractiveMode::Write => InteractiveMode::Read,
+        let entering_write = self.mode == InteractiveMode::Read;
+        self.mode = if entering_write {
+            InteractiveMode::Write
+        } else {
+            InteractiveMode::Read
         };
-        self.focus = InteractiveFocus::List;
+        self.focus = if entering_write && self.selected_file().is_some() {
+            InteractiveFocus::WriteEditor
+        } else {
+            InteractiveFocus::List
+        };
         self.write_editor.state = InteractiveWriteState::Browsing;
         if self.mode == InteractiveMode::Write {
             self.request_write_editor_for_selection();
+            if self.focus == InteractiveFocus::WriteEditor {
+                self.scroll_selected_write_row_into_view();
+            }
         } else {
             self.write_loading = false;
             self.write_loading_visible = false;
@@ -1184,12 +1194,13 @@ impl InteractiveApp {
 
         let result = apply_interactive_tag_to_image(&image, &name, value, kind, self.dry_run)?;
         if result.errors.is_empty() {
-            let action = if self.dry_run { "would write" } else { "wrote" };
             self.request_write_editor_for_selection();
-            self.write_editor.status = Some(InteractiveStatus {
-                kind: InteractiveStatusKind::Info,
-                message: format!("{action} {name}"),
-            });
+            if let Some(message) = interactive_write_warning_message(&result) {
+                self.write_editor.status = Some(InteractiveStatus {
+                    kind: InteractiveStatusKind::Warning,
+                    message,
+                });
+            }
         } else {
             self.write_editor.status = Some(InteractiveStatus {
                 kind: InteractiveStatusKind::Error,
@@ -1580,7 +1591,7 @@ fn read_preview(image: &Path) -> InteractivePreviewContent {
                 ReadFormat::Pretty,
             ));
             let mut lines = ansi_to_preview_lines(&output);
-            prepend_right_panel_content_padding(&mut lines);
+            prepend_read_panel_header(&mut lines);
             InteractivePreviewContent::Lines(lines)
         }
         Err(error) => InteractivePreviewContent::plain(format!(
@@ -1622,10 +1633,16 @@ fn ansi_to_preview_lines(value: &str) -> Vec<Line<'static>> {
     lines
 }
 
-fn prepend_right_panel_content_padding(lines: &mut Vec<Line<'static>>) {
-    for _ in 0..RIGHT_PANEL_CONTENT_TOP_PADDING {
-        lines.insert(0, Line::default());
-    }
+fn prepend_read_panel_header(lines: &mut Vec<Line<'static>>) {
+    lines.insert(0, Line::default());
+    lines.insert(0, read_mode_help_line());
+}
+
+fn read_mode_help_line() -> Line<'static> {
+    Line::from(Span::styled(
+        READ_MODE_HELP_TEXT,
+        Style::default().fg(Color::DarkGray),
+    ))
 }
 
 fn push_preview_span(spans: &mut Vec<Span<'static>>, text: &mut String, style: Style) {
@@ -1659,7 +1676,7 @@ fn render_directory_preview(directory: &Path) -> InteractivePreviewContent {
                 .collect::<Vec<_>>();
             let mut lines = vec![Line::default()];
             if entries.is_empty() {
-                lines.push(Line::from("<No directories or photos in this directory>"));
+                lines.push(Line::from("<No directories or photos here>"));
             } else {
                 for entry in entries {
                     lines.push(Line::from(Span::styled(
@@ -1897,6 +1914,12 @@ fn apply_interactive_tag_to_image(
     ))
 }
 
+fn interactive_write_warning_message(result: &WriteFileResult) -> Option<String> {
+    let mut messages = result.warnings.clone();
+    messages.extend(result.skipped.iter().cloned());
+    (!messages.is_empty()).then(|| messages.join("; "))
+}
+
 fn interactive_write_args() -> WriteArgs {
     WriteArgs {
         metadata_or_targets: None,
@@ -1925,7 +1948,7 @@ fn loading_preview(entry: &InteractiveEntry, spinner: SpinnerPreset) -> Interact
                 "{} Reading EXIF preview",
                 spinner.frame()
             ))];
-            prepend_right_panel_content_padding(&mut lines);
+            prepend_read_panel_header(&mut lines);
             InteractivePreviewContent::Lines(lines)
         }
     }
@@ -2047,7 +2070,7 @@ fn write_editor_lines(app: &InteractiveApp) -> Vec<Line<'static>> {
     let editor = &app.write_editor;
 
     lines.push(Line::from(Span::styled(
-        "w/Tab toggle mode  Enter edit  a add  Esc back",
+        WRITE_MODE_HELP_TEXT,
         Style::default().fg(Color::DarkGray),
     )));
     if app.dry_run {
@@ -2058,7 +2081,7 @@ fn write_editor_lines(app: &InteractiveApp) -> Vec<Line<'static>> {
     }
     if let Some(status) = &editor.status {
         let style = match status.kind {
-            InteractiveStatusKind::Info => Style::default().fg(Color::Green),
+            InteractiveStatusKind::Warning => Style::default().fg(Color::Yellow),
             InteractiveStatusKind::Error => Style::default().fg(Color::Yellow),
         };
         lines.push(Line::from(Span::styled(status.message.clone(), style)));
@@ -3179,7 +3202,9 @@ fn file_name(image: &Path) -> String {
 }
 
 fn directory_name(image: &Path) -> String {
-    let directory = image.parent().map(|parent| parent.display().to_string());
+    let directory = image
+        .parent()
+        .map(|parent| strip_windows_verbatim_prefixes(&parent.display().to_string()));
 
     match directory.as_deref() {
         Some("") | None => ".".to_string(),
@@ -7110,8 +7135,30 @@ mod tests {
             .expect("write toggle should be handled");
 
         assert_eq!(app.mode, InteractiveMode::Write);
-        assert_eq!(app.focus, InteractiveFocus::List);
+        assert_eq!(app.focus, InteractiveFocus::WriteEditor);
         assert!(app.write_loading);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_toggle_on_directory_keeps_list_focus() {
+        let directory = temporary_test_directory("interactive-mode-toggle-directory");
+        std::fs::create_dir(directory.join("nested")).expect("nested directory should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "nested/")
+            .expect("directory should exist");
+
+        app.handle_event(key_event(KeyCode::Tab, KeyEventKind::Press))
+            .expect("write toggle should be handled");
+
+        assert_eq!(app.mode, InteractiveMode::Write);
+        assert_eq!(app.focus, InteractiveFocus::List);
+        assert!(!app.write_loading);
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -7133,6 +7180,7 @@ mod tests {
             .expect("tab toggle should be handled");
 
         assert_eq!(app.mode, InteractiveMode::Write);
+        assert_eq!(app.focus, InteractiveFocus::WriteEditor);
         assert!(app.write_loading);
 
         let _ = std::fs::remove_dir_all(directory);
@@ -7431,14 +7479,23 @@ mod tests {
 
         assert!(app.write_loading);
         assert!(app.write_request_id > request_id);
-        assert!(
-            app.write_editor
-                .status
-                .as_ref()
-                .is_some_and(|status| status.message == "would write Make")
-        );
+        assert_eq!(app.write_editor.status, None);
 
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_warning_message_includes_warnings_and_skipped_tags() {
+        let result = WriteFileResult {
+            warnings: vec!["replacing existing non-exifmeta UserComment".to_string()],
+            skipped: vec!["Make already exists".to_string()],
+            ..WriteFileResult::default()
+        };
+
+        assert_eq!(
+            interactive_write_warning_message(&result),
+            Some("replacing existing non-exifmeta UserComment; Make already exists".to_string())
+        );
     }
 
     #[test]
@@ -7475,6 +7532,24 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("Value: Nik"));
         assert!(!rendered.contains("Value: Nik "));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_help_text_uses_requested_controls() {
+        let directory = temporary_test_directory("interactive-write-help");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+
+        let lines = write_editor_lines(&app);
+
+        assert_eq!(line_text(&lines[0]), WRITE_MODE_HELP_TEXT);
+        assert!(line_text(&lines[0]).contains("mode          A"));
+        assert!(line_text(&lines[0]).contains("tag          Esc"));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -8194,7 +8269,7 @@ mod tests {
             .as_lines()
             .expect("read preview should render styled lines");
 
-        assert!(line_text(&lines[0]).is_empty());
+        assert_eq!(line_text(&lines[0]), READ_MODE_HELP_TEXT);
         assert!(line_text(&lines[1]).is_empty());
         assert!(line_text(&lines[2]).starts_with("file "));
         let no_exif_line = lines
@@ -8454,6 +8529,13 @@ mod tests {
     }
 
     #[test]
+    fn interactive_directory_name_removes_windows_verbatim_prefixes() {
+        let image = PathBuf::from(r"\\?\C:\Users\photos").join("image.jpg");
+
+        assert_eq!(directory_name(&image), r"C:\Users\photos");
+    }
+
+    #[test]
     fn interactive_matching_preview_result_updates_panel() {
         let directory = temporary_test_directory("interactive-preview-result");
         std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
@@ -8561,7 +8643,7 @@ mod tests {
         assert!(line_text(&lines[0]).is_empty());
         assert_eq!(
             line_text(&lines[1]),
-            "<No directories or photos in this directory>"
+            "<No directories or photos here>"
         );
 
         let _ = std::fs::remove_dir_all(directory);
@@ -8627,7 +8709,7 @@ mod tests {
             .preview
             .as_lines()
             .expect("loading preview should be styled lines");
-        assert!(line_text(&lines[0]).is_empty());
+        assert_eq!(line_text(&lines[0]), READ_MODE_HELP_TEXT);
         assert!(line_text(&lines[1]).is_empty());
         assert!(line_text(&lines[2]).contains("Reading EXIF preview"));
         assert!(line_text(&lines[2]).starts_with(app.preview_spinner.frame()));
