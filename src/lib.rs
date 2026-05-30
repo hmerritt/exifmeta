@@ -9297,12 +9297,12 @@ mod tests {
         assert!(result.verified);
         assert!(result.timestamps_reset);
         assert_eq!(result.removed_tags, 3);
+        assert_privacy_file_timestamps(&image);
         let names = exif_tag_names(&image);
         assert!(names.contains("Make"));
         assert!(!names.contains("FNumber"));
         assert!(!names.contains("Artist"));
         assert!(!names.contains("DateTimeOriginal"));
-        assert_privacy_file_timestamps(&image);
 
         let _ = std::fs::remove_dir_all(directory);
     }
