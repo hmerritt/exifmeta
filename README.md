@@ -100,7 +100,7 @@ Common reasons for the check to fail:
 
 - The `metadata.yml` file does not exist
 - The YAML fails to parse (the file is invalid)
-- There are formatting errors or invalid tags
+- There are formatting errors, invalid YAML structure, or broken frame references
 
 ```sh
 exifmeta check
