@@ -208,6 +208,7 @@ fn interactive_command(args: InteractiveArgs, dry_run: bool) -> Result<(), Strin
 
 const INTERACTIVE_PREVIEW_TICK: Duration = Duration::from_millis(80);
 const INTERACTIVE_CURSOR_TICK: Duration = Duration::from_millis(500);
+const WRITE_LOADING_DELAY: Duration = Duration::from_millis(100);
 const READ_MODE_HELP_TEXT: &str = "Tab — write mode";
 const WRITE_MODE_HELP_TEXT: &str = "Tab — read mode     A — add new tag     Esc — back";
 
@@ -1041,7 +1042,7 @@ impl InteractiveApp {
         self.write_editor.status = None;
         self.write_loading = true;
         self.write_loading_visible = false;
-        self.write_loading_deadline = Some(Instant::now() + INTERACTIVE_PREVIEW_TICK);
+        self.write_loading_deadline = Some(Instant::now() + WRITE_LOADING_DELAY);
         let request_id = self.write_request_id;
         let sender = self.write_sender.clone();
 
@@ -7547,9 +7548,10 @@ mod tests {
 
         let lines = write_editor_lines(&app);
 
-        assert_eq!(line_text(&lines[0]), WRITE_MODE_HELP_TEXT);
-        assert!(line_text(&lines[0]).contains("mode          A"));
-        assert!(line_text(&lines[0]).contains("tag          Esc"));
+        let help = line_text(&lines[0]);
+        assert_eq!(help, WRITE_MODE_HELP_TEXT);
+        assert!(help.contains("mode     A"));
+        assert!(help.contains("tag     Esc"));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -7756,6 +7758,89 @@ mod tests {
             .expect("loading line should render");
 
         assert_eq!(loading_line, expected_line);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_loading_waits_for_delay_before_rendering() {
+        let directory = temporary_test_directory("interactive-write-loading-delay");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "image.jpg")
+            .expect("image should exist");
+        app.mode = InteractiveMode::Write;
+        app.request_write_editor_for_selection();
+
+        assert!(app.write_loading);
+        assert!(!app.write_loading_visible);
+        assert!(
+            !write_editor_lines(&app)
+                .iter()
+                .any(|line| line_text(line).contains("Reading editable tags"))
+        );
+
+        app.write_loading_deadline = Some(Instant::now() + Duration::from_secs(1));
+        app.tick_write_loading();
+
+        assert!(!app.write_loading_visible);
+        assert!(
+            !write_editor_lines(&app)
+                .iter()
+                .any(|line| line_text(line).contains("Reading editable tags"))
+        );
+
+        app.write_loading_deadline = Some(Instant::now());
+        app.tick_write_loading();
+
+        assert!(app.write_loading_visible);
+        assert!(
+            write_editor_lines(&app)
+                .iter()
+                .any(|line| line_text(line).contains("Reading editable tags"))
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_write_loading_stays_hidden_when_result_arrives_before_delay() {
+        let directory = temporary_test_directory("interactive-write-loading-fast-result");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "image.jpg")
+            .expect("image should exist");
+        app.mode = InteractiveMode::Write;
+        app.request_write_editor_for_selection();
+
+        app.apply_write_result(write_result_for_selected(
+            &app,
+            Ok(vec![interactive_test_row(
+                "Make",
+                PrettyReadGroup::Camera,
+                true,
+            )]),
+        ));
+        app.write_loading_deadline = Some(Instant::now());
+        app.tick_write_loading();
+
+        assert!(!app.write_loading);
+        assert!(!app.write_loading_visible);
+        assert!(
+            !write_editor_lines(&app)
+                .iter()
+                .any(|line| line_text(line).contains("Reading editable tags"))
+        );
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -8641,10 +8726,7 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert!(line_text(&lines[0]).is_empty());
-        assert_eq!(
-            line_text(&lines[1]),
-            "<No directories or photos here>"
-        );
+        assert_eq!(line_text(&lines[1]), "<No directories or photos here>");
 
         let _ = std::fs::remove_dir_all(directory);
     }
