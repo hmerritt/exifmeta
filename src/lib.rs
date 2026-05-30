@@ -1066,12 +1066,15 @@ impl InteractiveApp {
         if !row.editable {
             return;
         }
+        let name = row.name.clone();
+        let kind = row.kind;
+        let edit_value = row.edit_value.clone();
+        self.scroll_selected_write_row_into_view();
         self.write_editor.state = InteractiveWriteState::Editing {
-            name: row.name.clone(),
-            kind: row.kind,
-            input: InteractiveTextInput::new(row.edit_value.clone()),
+            name,
+            kind,
+            input: InteractiveTextInput::new(edit_value),
         };
-        self.scroll_preview_to_top();
         self.write_editor.status = None;
         self.reset_input_cursor();
     }
@@ -2058,7 +2061,7 @@ fn write_editor_lines(app: &InteractiveApp) -> Vec<Line<'static>> {
     lines.push(Line::default());
 
     match &editor.state {
-        InteractiveWriteState::Browsing => {
+        InteractiveWriteState::Browsing | InteractiveWriteState::Editing { .. } => {
             if app.write_loading_visible {
                 lines.push(Line::from(Span::styled(
                     format!("{} Reading editable tags", app.preview_spinner.frame()),
@@ -2068,12 +2071,9 @@ fn write_editor_lines(app: &InteractiveApp) -> Vec<Line<'static>> {
             append_write_browsing_lines(
                 editor,
                 app.focus == InteractiveFocus::WriteEditor,
+                inline_editing_input(editor),
                 &mut lines,
             );
-        }
-        InteractiveWriteState::Editing { name, input, .. } => {
-            lines.push(Line::from(format!("Edit {name}")));
-            lines.push(Line::from(format!("Value: {}", input_text(input))));
         }
         InteractiveWriteState::AddTag { query, selected } => {
             lines.push(Line::from(format!("Tag: {}", input_text(query))));
@@ -2175,11 +2175,27 @@ fn write_input_cursor_target(
 ) -> Option<(usize, usize, &InteractiveTextInput)> {
     let start = write_header_line_count(app);
     match &app.write_editor.state {
-        InteractiveWriteState::Editing { input, .. } => Some((start + 1, "Value: ".len(), input)),
+        InteractiveWriteState::Editing { input, .. } => {
+            let line_index = selected_write_row_line_index(app)?;
+            let prefix_width = selected_write_row_value_prefix_width(&app.write_editor)?;
+            Some((line_index, prefix_width, input))
+        }
         InteractiveWriteState::AddTag { query, .. } => Some((start, "Tag: ".len(), query)),
         InteractiveWriteState::AddValue { input, .. } => Some((start + 1, "Value: ".len(), input)),
         InteractiveWriteState::Browsing => None,
     }
+}
+
+fn selected_write_row_value_prefix_width(editor: &InteractiveWriteEditor) -> Option<usize> {
+    let selected_row = editor.rows.get(editor.selected)?;
+    let name_width = editor
+        .rows
+        .iter()
+        .filter(|row| row.group == selected_row.group)
+        .map(|row| row.label.len())
+        .max()?;
+
+    Some(name_width + 2)
 }
 
 fn selected_write_row_line_index(app: &InteractiveApp) -> Option<usize> {
@@ -2242,6 +2258,7 @@ fn write_header_line_count(app: &InteractiveApp) -> usize {
 fn append_write_browsing_lines(
     editor: &InteractiveWriteEditor,
     editor_focused: bool,
+    inline_edit: Option<&InteractiveTextInput>,
     lines: &mut Vec<Line<'static>>,
 ) {
     if editor.rows.is_empty() {
@@ -2285,16 +2302,30 @@ fn append_write_browsing_lines(
         for (index, row) in group_rows {
             let style =
                 interactive_write_row_style(row, editor_focused && index == editor.selected);
+            let value = if index == editor.selected {
+                inline_edit
+                    .map(input_text)
+                    .unwrap_or_else(|| row.value.clone())
+            } else {
+                row.value.clone()
+            };
             lines.push(Line::from(Span::styled(
                 format!(
                     "{}{}  {}",
                     row.label,
                     " ".repeat(name_width - row.label.len()),
-                    row.value
+                    value
                 ),
                 style,
             )));
         }
+    }
+}
+
+fn inline_editing_input(editor: &InteractiveWriteEditor) -> Option<&InteractiveTextInput> {
+    match &editor.state {
+        InteractiveWriteState::Editing { input, .. } => Some(input),
+        _ => None,
     }
 }
 
@@ -7511,6 +7542,9 @@ mod tests {
 
         let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
         app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.rows = vec![interactive_test_row("Make", PrettyReadGroup::Camera, true)];
+        app.write_editor.selected = 0;
         app.write_editor.state = InteractiveWriteState::Editing {
             name: "Make".to_string(),
             kind: InteractiveTagKind::Standard,
@@ -7523,7 +7557,7 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Value: Nik"));
+        assert!(rendered.contains("Make  Nik"));
         assert!(!rendered.contains('█'));
 
         app.input_cursor_deadline = Instant::now() - Duration::from_millis(1);
@@ -7535,8 +7569,8 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Value: Nik"));
-        assert!(!rendered.contains("Value: Nik "));
+        assert!(rendered.contains("Make  Nik"));
+        assert!(!rendered.contains("Make  Nik "));
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -8023,6 +8057,62 @@ mod tests {
     }
 
     #[test]
+    fn interactive_write_editing_renders_selected_row_inline() {
+        let directory = temporary_test_directory("interactive-write-inline-edit");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.rows = vec![
+            interactive_test_row("Make", PrettyReadGroup::Camera, true),
+            interactive_test_row("Model", PrettyReadGroup::Camera, true),
+            interactive_test_row("F Number", PrettyReadGroup::Exposure, true),
+        ];
+        app.write_editor.rows[0].value = "Nikon pretty".to_string();
+        app.write_editor.rows[0].edit_value = "Nikon raw".to_string();
+        app.write_editor.rows[1].value = "F3".to_string();
+        app.write_editor.selected = 0;
+
+        app.start_edit_selected_write_row();
+        let InteractiveWriteState::Editing { input, .. } = &mut app.write_editor.state else {
+            panic!("editing state should start");
+        };
+        input.text = "Canon raw".to_string();
+        input.cursor = input.text.chars().count();
+
+        let rendered = write_editor_lines(&app)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains(&check_heading_text("camera")));
+        assert!(rendered.contains(&check_heading_text("exposure")));
+        assert!(rendered.contains("Make   Canon raw"));
+        assert!(rendered.contains("Model  F3"));
+        assert!(rendered.contains("F Number  value"));
+        assert!(!rendered.contains("Nikon pretty"));
+        assert!(!rendered.contains("Edit Make"));
+        assert!(!rendered.contains("Value: Canon raw"));
+
+        let make_line = write_editor_lines(&app)
+            .into_iter()
+            .find(|line| line_text(line).contains("Make"))
+            .expect("edited row should render");
+        assert_eq!(
+            make_line.spans[0].style,
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn interactive_write_gps_edit_values_use_decimal_coordinates() {
         let metadata = test_gps_metadata();
         let rows = interactive_editable_rows_for_exif(&metadata.exif);
@@ -8227,6 +8317,8 @@ mod tests {
         let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
         app.mode = InteractiveMode::Write;
         app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.rows = vec![interactive_test_row("Make", PrettyReadGroup::Camera, true)];
+        app.write_editor.selected = 0;
         app.write_editor.state = InteractiveWriteState::Editing {
             name: "Make".to_string(),
             kind: InteractiveTagKind::Standard,
@@ -8237,7 +8329,7 @@ mod tests {
         };
         assert_eq!(
             write_input_cursor_position(&app, area),
-            Some(Position { x: 20, y: 9 })
+            Some(Position { x: 19, y: 9 })
         );
 
         app.write_editor.state = InteractiveWriteState::AddTag {
@@ -8277,6 +8369,8 @@ mod tests {
 
         let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
         app.mode = InteractiveMode::Write;
+        app.write_editor.rows = vec![interactive_test_row("Make", PrettyReadGroup::Camera, true)];
+        app.write_editor.selected = 0;
         app.write_editor.state = InteractiveWriteState::Editing {
             name: "Make".to_string(),
             kind: InteractiveTagKind::Standard,
