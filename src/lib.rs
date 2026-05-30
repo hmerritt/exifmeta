@@ -347,18 +347,15 @@ enum InteractiveWriteState {
         kind: InteractiveTagKind,
         input: InteractiveTextInput,
     },
-    AddKind,
-    AddStandard {
+    AddTag {
         query: InteractiveTextInput,
         selected: usize,
-    },
-    AddCustomName {
-        input: InteractiveTextInput,
     },
     AddValue {
         name: String,
         kind: InteractiveTagKind,
         input: InteractiveTextInput,
+        existing: bool,
     },
 }
 
@@ -735,11 +732,6 @@ impl InteractiveApp {
                 ..
             } if !self.write_input_active() => Ok(true),
             KeyEvent {
-                code: KeyCode::Char('w'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            }
-            | KeyEvent {
                 code: KeyCode::Tab, ..
             } if !self.write_input_active() => {
                 self.toggle_mode();
@@ -892,7 +884,10 @@ impl InteractiveApp {
                     ..
                 } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
                     self.scroll_preview_to_top();
-                    self.write_editor.state = InteractiveWriteState::AddKind;
+                    self.write_editor.state = InteractiveWriteState::AddTag {
+                        query: InteractiveTextInput::default(),
+                        selected: 0,
+                    };
                     self.write_editor.status = None;
                     self.reset_input_cursor();
                 }
@@ -903,7 +898,6 @@ impl InteractiveApp {
                 _ => {}
             },
             InteractiveWriteState::Editing { input, .. }
-            | InteractiveWriteState::AddCustomName { input }
             | InteractiveWriteState::AddValue { input, .. } => match key.code {
                 KeyCode::Enter => self.submit_write_input()?,
                 _ => match handle_interactive_text_input_key(input, key) {
@@ -913,44 +907,33 @@ impl InteractiveApp {
                     InteractiveInputKeyOutcome::Ignored => {}
                 },
             },
-            InteractiveWriteState::AddKind => match key {
-                KeyEvent {
-                    code: KeyCode::Char('s'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    self.scroll_preview_to_top();
-                    self.write_editor.state = InteractiveWriteState::AddStandard {
-                        query: InteractiveTextInput::default(),
-                        selected: 0,
-                    };
-                    self.write_editor.status = None;
-                    self.reset_input_cursor();
-                }
-                KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    self.scroll_preview_to_top();
-                    self.write_editor.state = InteractiveWriteState::AddCustomName {
-                        input: InteractiveTextInput::default(),
-                    };
-                    self.write_editor.status = None;
-                    self.reset_input_cursor();
-                }
-                _ => {}
-            },
-            InteractiveWriteState::AddStandard { query, selected } => match key.code {
+            InteractiveWriteState::AddTag { query, selected } => match key.code {
                 KeyCode::Enter => {
-                    if let Some(name) =
-                        filtered_writable_standard_tags(query.as_str()).get(*selected)
-                    {
+                    let name = query.text.trim();
+                    if name.is_empty() {
+                        self.write_editor.status = Some(InteractiveStatus {
+                            kind: InteractiveStatusKind::Error,
+                            message: "tag name cannot be blank".to_string(),
+                        });
+                    } else {
+                        let matches = filtered_writable_standard_tags(name);
+                        let (name, kind) = matches.get(*selected).map_or_else(
+                            || (name.to_string(), InteractiveTagKind::Custom),
+                            |name| ((*name).to_string(), InteractiveTagKind::Standard),
+                        );
+                        let existing_value =
+                            existing_write_row(&self.write_editor.rows, &name, kind)
+                                .map(|row| row.edit_value.clone());
+                        let existing = existing_value.is_some();
+                        let input = existing_value
+                            .map(InteractiveTextInput::new)
+                            .unwrap_or_default();
                         self.scroll_preview_to_top();
                         self.write_editor.state = InteractiveWriteState::AddValue {
-                            name: (*name).to_string(),
-                            kind: InteractiveTagKind::Standard,
-                            input: InteractiveTextInput::default(),
+                            name,
+                            kind,
+                            input,
+                            existing,
                         };
                         self.reset_input_cursor();
                     }
@@ -959,7 +942,11 @@ impl InteractiveApp {
                     *selected = selected.saturating_sub(1);
                 }
                 KeyCode::Down => {
-                    let count = filtered_writable_standard_tags(query.as_str()).len();
+                    let count = if query.text.trim().is_empty() {
+                        0
+                    } else {
+                        filtered_writable_standard_tags(query.as_str()).len()
+                    };
                     if *selected + 1 < count {
                         *selected += 1;
                     }
@@ -967,6 +954,7 @@ impl InteractiveApp {
                 _ => match handle_interactive_text_input_key(query, key) {
                     InteractiveInputKeyOutcome::Changed => {
                         *selected = 0;
+                        self.write_editor.status = None;
                         self.reset_input_cursor();
                     }
                     InteractiveInputKeyOutcome::Moved => self.reset_input_cursor(),
@@ -1127,30 +1115,10 @@ impl InteractiveApp {
         );
         match state {
             InteractiveWriteState::Editing { name, kind, input }
-            | InteractiveWriteState::AddValue { name, kind, input } => {
+            | InteractiveWriteState::AddValue {
+                name, kind, input, ..
+            } => {
                 self.apply_interactive_tag(name, kind, input)?;
-            }
-            InteractiveWriteState::AddCustomName { input } => {
-                let name = input.text.trim();
-                if name.is_empty() {
-                    self.write_editor.status = Some(InteractiveStatus {
-                        kind: InteractiveStatusKind::Error,
-                        message: "custom tag name cannot be blank".to_string(),
-                    });
-                } else if WRITABLE_STANDARD_EXIF_TAG_NAMES.contains(&name) {
-                    self.write_editor.status = Some(InteractiveStatus {
-                        kind: InteractiveStatusKind::Error,
-                        message: "use Standard for writable EXIF tags".to_string(),
-                    });
-                } else {
-                    self.scroll_preview_to_top();
-                    self.write_editor.state = InteractiveWriteState::AddValue {
-                        name: name.to_string(),
-                        kind: InteractiveTagKind::Custom,
-                        input: InteractiveTextInput::default(),
-                    };
-                    self.reset_input_cursor();
-                }
             }
             other => {
                 self.write_editor.state = other;
@@ -2107,26 +2075,23 @@ fn write_editor_lines(app: &InteractiveApp) -> Vec<Line<'static>> {
             lines.push(Line::from(format!("Edit {name}")));
             lines.push(Line::from(format!("Value: {}", input_text(input))));
         }
-        InteractiveWriteState::AddKind => {
-            lines.push(Line::from("Add tag"));
-            lines.push(Line::from("s Standard"));
-            lines.push(Line::from("c Custom"));
-        }
-        InteractiveWriteState::AddStandard { query, selected } => {
-            lines.push(Line::from(format!(
-                "Standard tag search: {}",
-                input_text(query)
-            )));
-            let matches = filtered_writable_standard_tags(query.as_str());
-            if matches.is_empty() {
-                lines.push(Line::from("<No writable standard tags match>"));
+        InteractiveWriteState::AddTag { query, selected } => {
+            lines.push(Line::from(format!("Tag: {}", input_text(query))));
+            lines.push(Line::default());
+            let query_text = query.text.trim();
+            if query_text.is_empty() {
+                lines.push(Line::from("Type a standard or custom tag name."));
             } else {
+                let matches = filtered_writable_standard_tags(query_text);
+                if matches.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("> (Custom) {query_text}"),
+                        selected_dropdown_style(),
+                    )));
+                }
                 for (index, name) in matches.into_iter().take(18).enumerate() {
                     let style = if index == *selected {
-                        Style::default()
-                            .bg(Color::Blue)
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD)
+                        selected_dropdown_style()
                     } else {
                         Style::default()
                     };
@@ -2134,12 +2099,14 @@ fn write_editor_lines(app: &InteractiveApp) -> Vec<Line<'static>> {
                 }
             }
         }
-        InteractiveWriteState::AddCustomName { input } => {
-            lines.push(Line::from("Custom tag name"));
-            lines.push(Line::from(format!("Name: {}", input_text(input))));
-        }
-        InteractiveWriteState::AddValue { name, input, .. } => {
-            lines.push(Line::from(format!("Add {name}")));
+        InteractiveWriteState::AddValue {
+            name,
+            input,
+            existing,
+            ..
+        } => {
+            let action = if *existing { "Edit" } else { "Add" };
+            lines.push(Line::from(format!("{action} {name}")));
             lines.push(Line::from(format!("Value: {}", input_text(input))));
         }
     }
@@ -2149,6 +2116,22 @@ fn write_editor_lines(app: &InteractiveApp) -> Vec<Line<'static>> {
 
 fn input_text(input: &InteractiveTextInput) -> String {
     input.text.clone()
+}
+
+fn selected_dropdown_style() -> Style {
+    Style::default()
+        .bg(Color::Blue)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn existing_write_row<'a>(
+    rows: &'a [InteractiveTagRow],
+    name: &str,
+    kind: InteractiveTagKind,
+) -> Option<&'a InteractiveTagRow> {
+    rows.iter()
+        .find(|row| row.editable && row.kind == kind && row.name == name)
 }
 
 fn write_input_cursor_position(app: &InteractiveApp, preview_area: Rect) -> Option<Position> {
@@ -2193,12 +2176,9 @@ fn write_input_cursor_target(
     let start = write_header_line_count(app);
     match &app.write_editor.state {
         InteractiveWriteState::Editing { input, .. } => Some((start + 1, "Value: ".len(), input)),
-        InteractiveWriteState::AddStandard { query, .. } => {
-            Some((start, "Standard tag search: ".len(), query))
-        }
-        InteractiveWriteState::AddCustomName { input } => Some((start + 1, "Name: ".len(), input)),
+        InteractiveWriteState::AddTag { query, .. } => Some((start, "Tag: ".len(), query)),
         InteractiveWriteState::AddValue { input, .. } => Some((start + 1, "Value: ".len(), input)),
-        InteractiveWriteState::Browsing | InteractiveWriteState::AddKind => None,
+        InteractiveWriteState::Browsing => None,
     }
 }
 
@@ -7118,7 +7098,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_mode_starts_read_and_toggles_to_write() {
+    fn interactive_mode_starts_read_and_tab_toggles_to_write() {
         let directory = temporary_test_directory("interactive-mode-toggle");
         std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
             .expect("jpg should be written");
@@ -7132,12 +7112,35 @@ mod tests {
 
         assert_eq!(app.mode, InteractiveMode::Read);
 
-        app.handle_event(key_event(KeyCode::Char('w'), KeyEventKind::Press))
+        app.handle_event(key_event(KeyCode::Tab, KeyEventKind::Press))
             .expect("write toggle should be handled");
 
         assert_eq!(app.mode, InteractiveMode::Write);
         assert_eq!(app.focus, InteractiveFocus::WriteEditor);
         assert!(app.write_loading);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_w_key_does_not_toggle_mode() {
+        let directory = temporary_test_directory("interactive-w-no-toggle");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.label == "image.jpg")
+            .expect("image should exist");
+
+        app.handle_event(key_event(KeyCode::Char('w'), KeyEventKind::Press))
+            .expect("w key should be handled");
+
+        assert_eq!(app.mode, InteractiveMode::Read);
+        assert_eq!(app.focus, InteractiveFocus::List);
+        assert!(!app.write_loading);
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -7195,8 +7198,9 @@ mod tests {
 
         let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
         app.mode = InteractiveMode::Write;
-        app.write_editor.state = InteractiveWriteState::AddCustomName {
-            input: InteractiveTextInput::default(),
+        app.write_editor.state = InteractiveWriteState::AddTag {
+            query: InteractiveTextInput::default(),
+            selected: 0,
         };
 
         app.handle_event(key_event(KeyCode::Tab, KeyEventKind::Press))
@@ -7205,7 +7209,7 @@ mod tests {
         assert_eq!(app.mode, InteractiveMode::Write);
         assert!(matches!(
             app.write_editor.state,
-            InteractiveWriteState::AddCustomName { .. }
+            InteractiveWriteState::AddTag { .. }
         ));
 
         let _ = std::fs::remove_dir_all(directory);
@@ -7245,7 +7249,7 @@ mod tests {
             .iter()
             .position(|entry| entry.label == "image.jpg")
             .expect("image should exist");
-        app.handle_event(key_event(KeyCode::Char('w'), KeyEventKind::Press))
+        app.handle_event(key_event(KeyCode::Tab, KeyEventKind::Press))
             .expect("write toggle should be handled");
         app.handle_event(key_event(KeyCode::Right, KeyEventKind::Press))
             .expect("right should be handled");
@@ -8236,7 +8240,7 @@ mod tests {
             Some(Position { x: 20, y: 9 })
         );
 
-        app.write_editor.state = InteractiveWriteState::AddStandard {
+        app.write_editor.state = InteractiveWriteState::AddTag {
             query: InteractiveTextInput {
                 text: "ake".to_string(),
                 cursor: 1,
@@ -8245,18 +8249,7 @@ mod tests {
         };
         assert_eq!(
             write_input_cursor_position(&app, area),
-            Some(Position { x: 33, y: 8 })
-        );
-
-        app.write_editor.state = InteractiveWriteState::AddCustomName {
-            input: InteractiveTextInput {
-                text: "Film".to_string(),
-                cursor: 4,
-            },
-        };
-        assert_eq!(
-            write_input_cursor_position(&app, area),
-            Some(Position { x: 21, y: 9 })
+            Some(Position { x: 17, y: 8 })
         );
 
         app.write_editor.state = InteractiveWriteState::AddValue {
@@ -8266,6 +8259,7 @@ mod tests {
                 text: "Kodak".to_string(),
                 cursor: 5,
             },
+            existing: false,
         };
         assert_eq!(
             write_input_cursor_position(&app, area),
@@ -8307,15 +8301,52 @@ mod tests {
     }
 
     #[test]
-    fn interactive_add_standard_search_uses_cursor_and_resets_selection() {
-        let directory = temporary_test_directory("interactive-standard-search-cursor");
+    fn interactive_add_tag_key_opens_unified_search() {
+        let directory = temporary_test_directory("interactive-add-tag-key");
         std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
             .expect("jpg should be written");
 
         let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
         app.mode = InteractiveMode::Write;
         app.focus = InteractiveFocus::WriteEditor;
-        app.write_editor.state = InteractiveWriteState::AddStandard {
+
+        app.handle_write_key(KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::empty(),
+            KeyEventKind::Press,
+        ))
+        .expect("add key should be handled");
+
+        let InteractiveWriteState::AddTag { query, selected } = &app.write_editor.state else {
+            panic!("add-tag state should be active");
+        };
+        assert_eq!(query.text, "");
+        assert_eq!(*selected, 0);
+
+        let lines = write_editor_lines(&app);
+        let tag_line = lines
+            .iter()
+            .position(|line| line_text(line) == "Tag: ")
+            .expect("tag input should render");
+        assert!(line_text(&lines[tag_line + 1]).is_empty());
+        assert_eq!(
+            line_text(&lines[tag_line + 2]),
+            "Type a standard or custom tag name."
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_add_tag_search_uses_cursor_and_resets_selection() {
+        let directory = temporary_test_directory("interactive-tag-search-cursor");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.state = InteractiveWriteState::AddTag {
             query: InteractiveTextInput {
                 text: "ake".to_string(),
                 cursor: 0,
@@ -8330,13 +8361,266 @@ mod tests {
         ))
         .expect("search edit should be handled");
 
-        let InteractiveWriteState::AddStandard { query, selected } = &app.write_editor.state else {
-            panic!("add-standard state should remain active");
+        let InteractiveWriteState::AddTag { query, selected } = &app.write_editor.state else {
+            panic!("add-tag state should remain active");
         };
         assert_eq!(query.text, "Make");
         assert_eq!(query.cursor, 1);
         assert_eq!(*selected, 0);
         assert!(filtered_writable_standard_tags(query.as_str()).contains(&"Make"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_add_tag_enter_on_standard_opens_standard_value_input() {
+        let directory = temporary_test_directory("interactive-add-standard-enter");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        let selected = filtered_writable_standard_tags("Make")
+            .iter()
+            .position(|name| *name == "Make")
+            .expect("Make should be a writable standard tag");
+        app.write_editor.state = InteractiveWriteState::AddTag {
+            query: InteractiveTextInput::new("Make"),
+            selected,
+        };
+
+        app.handle_write_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            KeyEventKind::Press,
+        ))
+        .expect("enter should be handled");
+
+        let InteractiveWriteState::AddValue {
+            name,
+            kind,
+            input,
+            existing,
+        } = &app.write_editor.state
+        else {
+            panic!("standard add should proceed to value input");
+        };
+        assert_eq!(name, "Make");
+        assert_eq!(*kind, InteractiveTagKind::Standard);
+        assert_eq!(input.text, "");
+        assert!(!existing);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_add_tag_existing_standard_prefills_edit_value() {
+        let directory = temporary_test_directory("interactive-add-existing-standard");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.rows = vec![InteractiveTagRow {
+            name: "Make".to_string(),
+            label: "Make".to_string(),
+            value: "\"Nikon friendly\"".to_string(),
+            edit_value: "Nikon raw".to_string(),
+            raw_value: YamlValue::String("Nikon raw".to_string()),
+            kind: InteractiveTagKind::Standard,
+            group: PrettyReadGroup::Camera,
+            editable: true,
+        }];
+        let selected = filtered_writable_standard_tags("Make")
+            .iter()
+            .position(|name| *name == "Make")
+            .expect("Make should be a writable standard tag");
+        app.write_editor.state = InteractiveWriteState::AddTag {
+            query: InteractiveTextInput::new("Make"),
+            selected,
+        };
+
+        app.handle_write_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            KeyEventKind::Press,
+        ))
+        .expect("enter should be handled");
+
+        let InteractiveWriteState::AddValue {
+            name,
+            kind,
+            input,
+            existing,
+        } = &app.write_editor.state
+        else {
+            panic!("existing standard add should proceed to value input");
+        };
+        assert_eq!(name, "Make");
+        assert_eq!(*kind, InteractiveTagKind::Standard);
+        assert_eq!(input.text, "Nikon raw");
+        assert!(*existing);
+
+        let rendered = write_editor_lines(&app)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Edit Make"));
+        assert!(rendered.contains("Value: Nikon raw"));
+        assert!(!rendered.contains("Nikon friendly"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_add_tag_custom_query_shows_message_and_opens_custom_value_input() {
+        let directory = temporary_test_directory("interactive-add-custom-enter");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.state = InteractiveWriteState::AddTag {
+            query: InteractiveTextInput::new("MyCustomTag"),
+            selected: 0,
+        };
+
+        let lines = write_editor_lines(&app);
+        let tag_line = lines
+            .iter()
+            .position(|line| line_text(line) == "Tag: MyCustomTag")
+            .expect("tag input should render");
+        assert!(line_text(&lines[tag_line + 1]).is_empty());
+        let custom_row = &lines[tag_line + 2];
+        assert_eq!(line_text(custom_row), "> (Custom) MyCustomTag");
+        assert_eq!(custom_row.spans[0].style, selected_dropdown_style());
+
+        app.handle_write_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            KeyEventKind::Press,
+        ))
+        .expect("enter should be handled");
+
+        let InteractiveWriteState::AddValue {
+            name,
+            kind,
+            input,
+            existing,
+        } = &app.write_editor.state
+        else {
+            panic!("custom add should proceed to value input");
+        };
+        assert_eq!(name, "MyCustomTag");
+        assert_eq!(*kind, InteractiveTagKind::Custom);
+        assert_eq!(input.text, "");
+        assert!(!existing);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_add_tag_existing_custom_shows_edit_message_and_prefills_value() {
+        let directory = temporary_test_directory("interactive-add-existing-custom");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.rows = vec![InteractiveTagRow {
+            name: "FilmRoll".to_string(),
+            label: "Film Roll".to_string(),
+            value: "friendly roll".to_string(),
+            edit_value: "raw roll".to_string(),
+            raw_value: YamlValue::String("raw roll".to_string()),
+            kind: InteractiveTagKind::Custom,
+            group: PrettyReadGroup::Custom,
+            editable: true,
+        }];
+        app.write_editor.state = InteractiveWriteState::AddTag {
+            query: InteractiveTextInput::new("FilmRoll"),
+            selected: 0,
+        };
+
+        let lines = write_editor_lines(&app);
+        let tag_line = lines
+            .iter()
+            .position(|line| line_text(line) == "Tag: FilmRoll")
+            .expect("tag input should render");
+        assert!(line_text(&lines[tag_line + 1]).is_empty());
+        let custom_row = &lines[tag_line + 2];
+        assert_eq!(line_text(custom_row), "> (Custom) FilmRoll");
+        assert_eq!(custom_row.spans[0].style, selected_dropdown_style());
+
+        app.handle_write_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            KeyEventKind::Press,
+        ))
+        .expect("enter should be handled");
+
+        let InteractiveWriteState::AddValue {
+            name,
+            kind,
+            input,
+            existing,
+        } = &app.write_editor.state
+        else {
+            panic!("existing custom add should proceed to value input");
+        };
+        assert_eq!(name, "FilmRoll");
+        assert_eq!(*kind, InteractiveTagKind::Custom);
+        assert_eq!(input.text, "raw roll");
+        assert!(*existing);
+
+        let rendered = write_editor_lines(&app)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Edit FilmRoll"));
+        assert!(rendered.contains("Value: raw roll"));
+        assert!(!rendered.contains("friendly roll"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interactive_add_tag_blank_enter_stays_in_search() {
+        let directory = temporary_test_directory("interactive-add-blank");
+        std::fs::write(directory.join("image.jpg"), [0xff, 0xd8, 0xff, 0xd9])
+            .expect("jpg should be written");
+
+        let mut app = InteractiveApp::new(&directory, false).expect("app should initialize");
+        app.mode = InteractiveMode::Write;
+        app.focus = InteractiveFocus::WriteEditor;
+        app.write_editor.state = InteractiveWriteState::AddTag {
+            query: InteractiveTextInput::default(),
+            selected: 0,
+        };
+
+        app.handle_write_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            KeyEventKind::Press,
+        ))
+        .expect("enter should be handled");
+
+        assert!(matches!(
+            app.write_editor.state,
+            InteractiveWriteState::AddTag { .. }
+        ));
+        assert!(
+            app.write_editor
+                .status
+                .as_ref()
+                .is_some_and(|status| status.message == "tag name cannot be blank")
+        );
 
         let _ = std::fs::remove_dir_all(directory);
     }
