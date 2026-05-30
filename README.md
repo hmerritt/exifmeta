@@ -51,7 +51,7 @@ scoop install exifmeta
 | [`read`](#read)               | Read an image file's EXIF tags                                         |
 | [`write`](#write)             | Writes EXIF tags defined in `metadata.yml` to target image files       |
 | [`strip`](#strip)             | Tool to remove all (or a select few) EXIF tags from target image files |
-| [`interactive`](#interactive) | Interactively browse folders and read image EXIF tags                  |
+| [`interactive`](#interactive) | Interactively read/write EXIF tags and traverse different folders      |
 
 ### Flags
 
@@ -162,7 +162,9 @@ exifmeta strip --privacy
 
 ### `interactive`
 
-Open an interactive browser for folders and images. It starts in read mode by default.
+Interactive is a TLI whereby a user can easily traverse different folders to read and write EXIF tags all at once.
+
+Open an interactive browser for folders and images. It starts in read mode by default, press `Tab` to toggle write mode.
 
 ```sh
 exifmeta interactive
@@ -174,12 +176,13 @@ You can also open a specific directory:
 exifmeta interactive "Photos/shoot-001"
 ```
 
-Press `w` or `Tab` to toggle write mode. In write mode, select an image and press `Enter`
-or `Right` to edit writable tags. Press `a` to add a tag, then choose a
-writable standard EXIF tag or enter a custom tag name. Each confirmed edit is
-written immediately; with `--dry-run`, edits are simulated without changing
-files. The standard picker only lists EXIF tags currently supported by
-exifmeta's writer.
+Key bindings:
+
+| Key   | Function                                                                                  |
+| :---- | :---------------------------------------------------------------------------------------- |
+| `Tab` | Toggles `write` mode. EXIF tags can be edited, or new ones added                          |
+| `a`   | Add a new tag. Input can search standard EXIF tags, or you can enter your own custom ones |
+| `Esc` | Back / Cancel button                                                                      |
 
 ### `metadata.yml` file
 
