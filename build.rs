@@ -10,6 +10,10 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/icon.png");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
+    println!("cargo:rerun-if-changed=.git/refs/tags");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+    println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
+    println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
     println!("cargo:rerun-if-env-changed=EXIFMETA_VERSION_PRERELEASE");
     println!("cargo:rerun-if-env-changed=EXIFMETA_VERSION_METADATA");
     println!("cargo:rerun-if-env-changed=EXIFMETA_SUPPRESS_GIT_DIRTY");
@@ -109,7 +113,7 @@ fn git<const N: usize>(args: [&str; N]) -> String {
 
 fn is_git_dirty() -> bool {
     Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=no"])
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -117,6 +121,32 @@ fn is_git_dirty() -> bool {
         .unwrap_or(false)
 }
 
+fn is_numeric_release_tag(tag: &str) -> bool {
+    let mut parts = tag.split('.');
+
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(major), Some(minor), Some(patch), None)
+            if [major, minor, patch]
+                .iter()
+                .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+    )
+}
+
+fn is_release_tag_build() -> bool {
+    if std::env::var("GITHUB_REF_TYPE").as_deref() == Ok("tag") {
+        return std::env::var("GITHUB_REF_NAME")
+            .map(|tag| is_numeric_release_tag(&tag))
+            .unwrap_or(false);
+    }
+
+    git(["tag", "--points-at", "HEAD"])
+        .lines()
+        .any(is_numeric_release_tag)
+}
+
 fn should_emit_git_dirty() -> bool {
-    std::env::var("EXIFMETA_SUPPRESS_GIT_DIRTY").as_deref() != Ok("true") && is_git_dirty()
+    std::env::var("EXIFMETA_SUPPRESS_GIT_DIRTY").as_deref() != Ok("true")
+        && !is_release_tag_build()
+        && is_git_dirty()
 }
