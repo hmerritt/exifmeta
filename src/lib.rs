@@ -3999,6 +3999,7 @@ fn build_check_output(path: Option<&Path>) -> CheckOutput {
 
     match check_metadata_file(&resolution.path, &yaml) {
         Ok(report) => {
+            output.exif = report.exif;
             output.frames = Some(report.frames);
         }
         Err(error) => output.file_errors.push(error),
@@ -4013,17 +4014,19 @@ struct CheckOutput {
     yaml_ok: bool,
     file_warnings: Vec<String>,
     file_errors: Vec<String>,
+    exif: Option<ExifStageReport>,
     frames: Option<FramesStageReport>,
 }
 
 impl CheckOutput {
     fn error_count(&self) -> usize {
         self.file_errors.len()
+            + self.exif.as_ref().map_or(0, |exif| exif.invalid_tags.len())
             + self.frames.as_ref().map_or(0, |frames| {
                 frames
                     .frames
                     .iter()
-                    .map(|frame| frame.errors.len())
+                    .map(|frame| frame.errors.len() + frame.invalid_tags.len())
                     .sum::<usize>()
             })
     }
@@ -4038,6 +4041,18 @@ impl CheckOutput {
                         .map(|frame| frame.warnings.len())
                         .sum::<usize>()
             })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ExifStageReport {
+    tag_count: usize,
+    invalid_tags: Vec<String>,
+}
+
+impl ExifStageReport {
+    fn valid_count(&self) -> usize {
+        self.tag_count.saturating_sub(self.invalid_tags.len())
     }
 }
 
@@ -4058,6 +4073,7 @@ fn format_check_output(output: &CheckOutput) -> String {
     let mut first_group = true;
 
     append_check_file_group(&mut rendered, &mut first_group, output);
+    append_check_exif_group(&mut rendered, &mut first_group, output);
     append_check_frames_group(&mut rendered, &mut first_group, output);
     append_check_overview_group(&mut rendered, &mut first_group, output);
 
@@ -4091,6 +4107,35 @@ fn append_check_file_group(output: &mut String, first_group: &mut bool, report: 
     }
 }
 
+fn append_check_exif_group(output: &mut String, first_group: &mut bool, report: &CheckOutput) {
+    append_spaced_check_heading(output, first_group, "exif");
+
+    let Some(exif) = &report.exif else {
+        output.push_str("skipped\n");
+        return;
+    };
+
+    if exif.tag_count == 0 {
+        output.push_str("skipped\n");
+        return;
+    }
+
+    let valid_count = exif.valid_count();
+    let value_status = if exif.invalid_tags.is_empty() {
+        format_success_status(&format!("{valid_count}/{} valid", exif.tag_count))
+    } else {
+        format_error_status(&format!("{valid_count}/{} not valid", exif.tag_count))
+    };
+    append_check_tag_values_row(output, "Tag values", value_status);
+
+    if !exif.invalid_tags.is_empty() {
+        output.push_str(&format!(
+            "{}\n",
+            format_invalid_tag_values_error(&exif.invalid_tags)
+        ));
+    }
+}
+
 fn append_check_frames_group(output: &mut String, first_group: &mut bool, report: &CheckOutput) {
     append_spaced_check_heading(output, first_group, "frames");
 
@@ -4120,6 +4165,12 @@ fn append_check_frames_group(output: &mut String, first_group: &mut bool, report
         for warning in &frame.warnings {
             output.push_str(&format!("{}\n", format_check_warning(warning)));
         }
+        if !frame.invalid_tags.is_empty() {
+            output.push_str(&format!(
+                "{}\n",
+                format_invalid_tag_values_error(&frame.invalid_tags)
+            ));
+        }
         for error in &frame.errors {
             output.push_str(&format!("{}\n", format_check_frame_error(error)));
         }
@@ -4145,8 +4196,10 @@ fn append_check_overview_group(output: &mut String, first_group: &mut bool, repo
 
 const CHECK_HEADING_WIDTH: usize = 50;
 const CHECK_ROW_LABEL_WIDTH: usize = 14;
+const CHECK_TAG_VALUES_ROW_LABEL_WIDTH: usize = 15;
 const CHECK_FILE_ROW_LABEL_WIDTH: usize = 17;
 const CHECK_FRAME_SUMMARY_LABEL_WIDTH: usize = 10;
+const MAX_LINE_LENGTH: usize = 77;
 
 fn check_heading_text(label: &str) -> String {
     let dash_count = CHECK_HEADING_WIDTH.saturating_sub(label.len() + 1);
@@ -4172,6 +4225,10 @@ fn append_check_row(output: &mut String, label: &str, value: impl std::fmt::Disp
 
 fn append_check_file_row(output: &mut String, label: &str, value: impl std::fmt::Display) {
     append_check_row_with_width(output, label, value, CHECK_FILE_ROW_LABEL_WIDTH);
+}
+
+fn append_check_tag_values_row(output: &mut String, label: &str, value: impl std::fmt::Display) {
+    append_check_row_with_width(output, label, value, CHECK_TAG_VALUES_ROW_LABEL_WIDTH);
 }
 
 fn append_check_frame_summary_row(output: &mut String, label: &str, value: impl std::fmt::Display) {
@@ -4215,8 +4272,8 @@ fn check_frame_title(frame: &FrameReport) -> String {
 }
 
 fn format_check_frame_title(frame: &FrameReport) -> String {
-    let title = check_frame_title(frame).bright_cyan();
-    if !frame.errors.is_empty() {
+    let title = check_frame_title(frame);
+    if !frame.errors.is_empty() || !frame.invalid_tags.is_empty() {
         format!("{} {title}", check_error_icon())
     } else if !frame.warnings.is_empty() {
         format!("{} {title}", check_warning_icon())
@@ -4230,11 +4287,11 @@ fn format_success_status(text: &str) -> String {
 }
 
 fn format_warning_status(text: &str) -> String {
-    format!("{} {text}", check_warning_icon())
+    format!("{} {}", check_warning_icon(), text.yellow())
 }
 
 fn format_error_status(text: &str) -> String {
-    format!("{} {text}", check_error_icon())
+    format!("{} {}", check_error_icon(), text.red())
 }
 
 fn check_success_icon() -> String {
@@ -4289,6 +4346,131 @@ fn format_check_warning(warning: &str) -> String {
     format!("{}: {warning}", "warning".yellow())
 }
 
+fn format_invalid_tag_values_error(invalid_tags: &[String]) -> String {
+    let header = format!("error: tags with invalid values ({}):", invalid_tags.len())
+        .red()
+        .to_string();
+    let tags = invalid_tags.join(", ");
+    let single_line = format!("{header} {tags}").red().to_string();
+
+    if strip_ansi_codes_for_width(&single_line).chars().count() <= MAX_LINE_LENGTH {
+        single_line
+    } else {
+        format!("{header}\n    {}", wrap_at_length(&tags, 4))
+            .red()
+            .to_string()
+    }
+}
+
+fn wrap_at_length(value: &str, indent_spaces: usize) -> String {
+    wrap_string(
+        value,
+        MAX_LINE_LENGTH.saturating_sub(indent_spaces),
+        indent_spaces,
+    )
+}
+
+fn wrap_string(value: &str, limit: usize, indent_spaces: usize) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut current = 0usize;
+    let mut word = String::new();
+    let mut spaces = String::new();
+    let mut word_len = 0usize;
+    let mut spaces_len = 0usize;
+
+    for char in value.chars() {
+        if char == '\n' {
+            if word.is_empty() {
+                if current + spaces_len <= limit {
+                    output.push_str(&spaces);
+                }
+                spaces.clear();
+                spaces_len = 0;
+            } else {
+                output.push_str(&spaces);
+                spaces.clear();
+                spaces_len = 0;
+                output.push_str(&word);
+                word.clear();
+                word_len = 0;
+            }
+            output.push(char);
+            output.push_str(&" ".repeat(indent_spaces));
+            current = 0;
+        } else if char.is_whitespace() && char != '\u{00a0}' {
+            if spaces.is_empty() || !word.is_empty() {
+                current += spaces_len + word_len;
+                output.push_str(&spaces);
+                spaces.clear();
+                spaces_len = 0;
+                output.push_str(&word);
+                word.clear();
+                word_len = 0;
+            }
+
+            spaces.push(char);
+            spaces_len += 1;
+        } else {
+            word.push(char);
+            word_len += 1;
+
+            if current + word_len + spaces_len > limit && word_len < limit {
+                output.push('\n');
+                output.push_str(&" ".repeat(indent_spaces));
+                current = 0;
+                spaces.clear();
+                spaces_len = 0;
+            }
+        }
+    }
+
+    if word.is_empty() {
+        if current + spaces_len <= limit {
+            output.push_str(&spaces);
+        }
+    } else {
+        output.push_str(&spaces);
+        output.push_str(&word);
+    }
+
+    output
+}
+
+#[allow(dead_code)]
+fn indent_string(value: &str, indent_spaces: usize) -> String {
+    let mut output = String::with_capacity(value.len());
+
+    for char in value.chars() {
+        output.push(char);
+
+        if char == '\n' {
+            output.push_str(&" ".repeat(indent_spaces));
+        }
+    }
+
+    output
+}
+
+fn strip_ansi_codes_for_width(value: &str) -> String {
+    let mut output = String::new();
+    let mut chars = value.chars().peekable();
+
+    while let Some(char) = chars.next() {
+        if char == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for char in chars.by_ref() {
+                if char == 'm' {
+                    break;
+                }
+            }
+        } else {
+            output.push(char);
+        }
+    }
+
+    output
+}
+
 fn resolve_metadata_path_in_directory(directory: &Path) -> Result<MetadataPathResolution, String> {
     let yml_path = directory.join(METADATA_FILE_NAME);
     let yaml_path = directory.join(LEGACY_METADATA_FILE_NAME);
@@ -4325,6 +4507,7 @@ fn resolve_metadata_path_in_directory(directory: &Path) -> Result<MetadataPathRe
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CheckReport {
     location_matches: Vec<LocationMatch>,
+    exif: Option<ExifStageReport>,
     frames: FramesStageReport,
     warnings: Vec<String>,
 }
@@ -4340,6 +4523,7 @@ fn check_metadata_file(metadata_path: &Path, yaml: &YamlValue) -> Result<CheckRe
             .as_mapping()
             .ok_or_else(|| "metadata YAML `exif` key must be a mapping".to_string())?;
         check_tag_keys(exif, "exif")?;
+        report.exif = Some(check_exif_tag_values(exif));
     }
 
     if let Some(frames) = yaml_mapping_get(root, "frames") {
@@ -4367,6 +4551,7 @@ struct FrameReport {
     file: Option<PathBuf>,
     location_matches: Vec<LocationMatch>,
     warnings: Vec<String>,
+    invalid_tags: Vec<String>,
     errors: Vec<String>,
 }
 
@@ -4403,7 +4588,7 @@ fn check_frames_mapping(
         frames: FramesStageReport {
             frame_number_count,
             file_count,
-            warnings: frame_summary_warnings(frame_number_count, file_count),
+            warnings: Vec::new(),
             frames: Vec::new(),
         },
         warnings: Vec::new(),
@@ -4433,20 +4618,6 @@ fn check_frames_mapping(
     }
 
     Ok(report)
-}
-
-fn frame_summary_warnings(frame_number_count: usize, file_count: usize) -> Vec<String> {
-    if frame_number_count == 0 {
-        return Vec::new();
-    }
-
-    if frame_number_count > file_count {
-        vec![format!(
-            "there are more frames ({frame_number_count}) than image files ({file_count})"
-        )]
-    } else {
-        Vec::new()
-    }
 }
 
 fn frame_number_from_key(frame_key: &YamlValue) -> Option<usize> {
@@ -4533,12 +4704,57 @@ fn collect_frame_tag_mapping(
     check_tag_keys(mapping, "frames")?;
 
     for (key, value) in mapping {
-        if key.as_str() == Some("$Location") {
+        let Some(name) = key.as_str() else {
+            continue;
+        };
+
+        if name == "$Location" {
             check_location_value(value, geonames, report)?;
+        } else if check_standard_tag_value(name, value).is_err() {
+            report.invalid_tags.push(name.to_string());
         }
     }
 
     Ok(())
+}
+
+fn check_exif_tag_values(mapping: &Mapping) -> ExifStageReport {
+    let mut report = ExifStageReport::default();
+
+    for (key, value) in mapping {
+        let Some(name) = key.as_str() else {
+            continue;
+        };
+
+        if name == "$Location" || is_blank_yaml_value(value) {
+            continue;
+        }
+
+        report.tag_count += 1;
+        if check_standard_tag_value(name, value).is_err() {
+            report.invalid_tags.push(name.to_string());
+        }
+    }
+
+    report
+}
+
+fn check_standard_tag_value(name: &str, value: &YamlValue) -> Result<(), String> {
+    if is_blank_yaml_value(value) || !is_writable_standard_tag_name(name) {
+        return Ok(());
+    }
+
+    if writable_exif_tag(name, value).is_some() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} value is not valid for a standard writable EXIF tag"
+        ))
+    }
+}
+
+fn is_writable_standard_tag_name(name: &str) -> bool {
+    WRITABLE_STANDARD_EXIF_TAG_NAMES.contains(&name) || matches!(name, "Photographer")
 }
 
 fn check_location_value(
@@ -11027,8 +11243,308 @@ exif:
 
         let report = check_metadata_file(Path::new("metadata.yml"), &yaml)
             .expect("metadata should pass checks");
+        let exif = report.exif.expect("exif report should be present");
 
         assert!(report.warnings.is_empty());
+        assert_eq!(exif.tag_count, 4);
+        assert_eq!(exif.valid_count(), 4);
+        assert!(exif.invalid_tags.is_empty());
+    }
+
+    #[test]
+    fn check_metadata_accepts_valid_standard_values_in_exif_and_frames() {
+        let directory = temporary_test_directory("check-valid-standard-values");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+exif:
+  Make: Nikon
+  Photographer: "A. Person"
+  ISOSpeedRatings: 400
+  DateTimeOriginal: 2026-05-22
+frames:
+  1:
+    - ExposureTime: 1/500
+    - FNumber: f/5.6
+    - FocalLength: 75mm
+    - GPSAltitudeRef: 0
+"#,
+        )
+        .expect("test YAML should parse");
+        std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
+
+        let report = check_metadata_file(&metadata, &yaml).expect("metadata should pass checks");
+        let exif = report.exif.expect("exif report should be present");
+
+        assert!(report.warnings.is_empty());
+        assert_eq!(exif.tag_count, 4);
+        assert_eq!(exif.valid_count(), 4);
+        assert!(exif.invalid_tags.is_empty());
+        assert_eq!(report.frames.frames.len(), 1);
+        assert!(report.frames.frames[0].errors.is_empty());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn check_metadata_accepts_blank_standard_values() {
+        let directory = temporary_test_directory("check-blank-standard-values");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+exif:
+  Make: " "
+  FNumber:
+frames:
+  1:
+    - ExposureTime: ""
+"#,
+        )
+        .expect("test YAML should parse");
+        std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
+
+        let report = check_metadata_file(&metadata, &yaml).expect("metadata should pass checks");
+        let exif = report.exif.expect("exif report should be present");
+
+        assert_eq!(exif.tag_count, 0);
+        assert!(exif.invalid_tags.is_empty());
+        assert!(report.frames.frames[0].errors.is_empty());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn check_metadata_reports_invalid_standard_exif_values() {
+        let cases = [
+            ("FNumber: nope", "FNumber"),
+            ("ExposureTime: 1/0", "ExposureTime"),
+            ("GPSLatitude: north", "GPSLatitude"),
+            ("GPSAltitudeRef: 999", "GPSAltitudeRef"),
+            ("Make:\n    - Nikon", "Make"),
+            ("ISO:\n    speed: 400", "ISO"),
+        ];
+
+        for (body, tag_name) in cases {
+            let yaml = serde_yaml::from_str::<YamlValue>(&format!("exif:\n  {body}\n"))
+                .expect("test YAML should parse");
+
+            let report = check_metadata_file(Path::new("metadata.yml"), &yaml)
+                .expect("invalid exif tag values should not stop metadata checks");
+            let exif = report.exif.expect("exif report should be present");
+
+            assert_eq!(exif.tag_count, 1);
+            assert_eq!(exif.valid_count(), 0);
+            assert_eq!(exif.invalid_tags.len(), 1);
+            assert_eq!(exif.invalid_tags[0], tag_name);
+        }
+    }
+
+    #[test]
+    fn check_output_renders_valid_exif_tag_value_counts() {
+        let directory = temporary_test_directory("check-valid-exif-counts");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(
+            &metadata,
+            r#"
+exif:
+  Make: Nikon
+  DateTimeOriginal: 2026-05-22
+  FilmRoll:
+    - 1
+    - 2
+  Blank:
+  $Location: London
+"#,
+        )
+        .expect("metadata should be written");
+
+        let output = build_check_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
+
+        assert!(rendered.contains("exif "));
+        assert!(rendered.contains("Tag values     ✓ 3/3 valid"));
+        assert!(!rendered.contains("error:"));
+        assert!(rendered.contains("errors        0"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn check_output_renders_invalid_exif_tag_value_counts_and_errors() {
+        let directory = temporary_test_directory("check-invalid-exif-counts");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(
+            &metadata,
+            r#"
+exif:
+  Make: Nikon
+  FNumber: nope
+  GPSLatitude: north
+  FilmRoll:
+    - custom values are counted
+"#,
+        )
+        .expect("metadata should be written");
+
+        let output = build_check_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
+
+        assert!(rendered.contains("Tag values     ✗ 2/4 not valid"));
+        assert!(rendered.contains("error: tags with invalid values (2): FNumber, GPSLatitude"));
+        assert!(!rendered.contains("error: FNumber value is not valid"));
+        assert!(!rendered.contains("error: GPSLatitude value is not valid"));
+        assert!(rendered.contains("errors        2"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn check_output_skips_missing_and_empty_exif_groups() {
+        let no_exif = strip_ansi_codes(&format_check_output(&CheckOutput::default()));
+        assert!(no_exif.contains("exif "));
+        assert!(no_exif.contains("\nskipped\n\nframes "));
+
+        let output = CheckOutput {
+            exif: Some(ExifStageReport::default()),
+            ..CheckOutput::default()
+        };
+        let empty_exif = strip_ansi_codes(&format_check_output(&output));
+        assert!(empty_exif.contains("exif "));
+        assert!(empty_exif.contains("\nskipped\n\nframes "));
+    }
+
+    #[test]
+    fn check_output_continues_to_frames_after_exif_tag_value_errors() {
+        let directory = temporary_test_directory("check-exif-errors-continue-to-frames");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(
+            &metadata,
+            r#"
+exif:
+  FNumber: nope
+frames:
+  1:
+    - ExposureTime: 1/500
+"#,
+        )
+        .expect("metadata should be written");
+        std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
+
+        let output = build_check_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
+        let result = check_command(CheckArgs {
+            path: Some(metadata.clone()),
+        });
+
+        assert!(rendered.contains("Tag values     ✗ 0/1 not valid"));
+        assert!(rendered.contains("✓ image.jpg ← 1"));
+        assert!(rendered.contains("errors        1"));
+        assert!(matches!(result, Err(CliError::Failure)));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn check_output_wraps_many_invalid_exif_tag_names() {
+        let directory = temporary_test_directory("check-many-invalid-exif-tags");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(
+            &metadata,
+            r#"
+exif:
+  Artist: [bad]
+  Copyright: [bad]
+  CreateDate: [bad]
+  DateTimeOriginal: [bad]
+  ExposureProgram: nope
+  ExposureTime: nope
+  FNumber: nope
+  FileSource: 999
+  Flash: nope
+  FocalLength: nope
+  GPSAltitude: nope
+  GPSAltitudeRef: 999
+  Photographer: [bad]
+"#,
+        )
+        .expect("metadata should be written");
+
+        let output = build_check_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
+
+        assert!(rendered.contains("error: tags with invalid values (13):\n"));
+        assert!(rendered.contains("    Artist, Copyright, CreateDate"));
+        assert!(rendered.contains("GPSAltitudeRef"));
+        assert!(rendered.contains("Photographer"));
+        assert!(rendered.contains("\n    "));
+        assert!(rendered.contains("errors        13"));
+
+        for line in rendered.lines() {
+            if line.starts_with("    ") {
+                assert!(
+                    line.chars().count() <= MAX_LINE_LENGTH,
+                    "wrapped line exceeded {MAX_LINE_LENGTH} chars: {line}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn check_metadata_reports_invalid_standard_frame_values_as_frame_errors() {
+        let directory = temporary_test_directory("check-invalid-standard-frame-values");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+frames:
+  1:
+    - FNumber: nope
+    - GPSLatitude: north
+    - FilmRoll:
+        - custom values are allowed
+"#,
+        )
+        .expect("test YAML should parse");
+        std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
+
+        let report = check_metadata_file(&metadata, &yaml).expect("metadata should parse");
+        let frame = &report.frames.frames[0];
+
+        assert!(frame.errors.is_empty());
+        assert_eq!(frame.invalid_tags, ["FNumber", "GPSLatitude"]);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn check_command_fails_for_invalid_standard_frame_values() {
+        let directory = temporary_test_directory("check-command-invalid-standard-frame-value");
+        let metadata = directory.join(METADATA_FILE_NAME);
+        std::fs::write(
+            &metadata,
+            r#"
+frames:
+  1:
+    - FNumber: nope
+"#,
+        )
+        .expect("metadata should be written");
+        std::fs::write(directory.join("image.jpg"), []).expect("test image should be written");
+
+        let output = build_check_output(Some(&metadata));
+        let rendered = strip_ansi_codes(&format_check_output(&output));
+        let result = check_command(CheckArgs {
+            path: Some(metadata.clone()),
+        });
+
+        assert_eq!(output.error_count(), 1);
+        assert!(rendered.contains("errors        1"));
+        assert!(rendered.contains("error: tags with invalid values (1): FNumber"));
+        assert!(!rendered.contains("error: FNumber value is not valid"));
+        assert!(matches!(result, Err(CliError::Failure)));
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -11152,6 +11668,42 @@ frames:
         let output = format_check_warning("ignored metadata.yml");
 
         assert!(output.starts_with("\u{1b}[33mwarning\u{1b}[0m:"));
+    }
+
+    #[test]
+    fn wrap_string_leaves_short_text_unwrapped() {
+        assert_eq!(wrap_string("alpha beta", 20, 4), "alpha beta");
+    }
+
+    #[test]
+    fn wrap_string_wraps_on_whitespace_with_indent() {
+        assert_eq!(
+            wrap_string("alpha beta gamma", 10, 4),
+            "alpha beta\n    gamma"
+        );
+    }
+
+    #[test]
+    fn wrap_string_indents_existing_newlines() {
+        assert_eq!(wrap_string("alpha\nbeta", 77, 4), "alpha\n    beta");
+    }
+
+    #[test]
+    fn wrap_string_does_not_split_long_words() {
+        assert_eq!(wrap_string("superlongword", 5, 4), "superlongword");
+    }
+
+    #[test]
+    fn wrap_string_does_not_wrap_at_non_breaking_spaces() {
+        assert_eq!(
+            wrap_string("alpha\u{00a0}beta gamma", 10, 4),
+            "alpha\u{00a0}beta\n    gamma"
+        );
+    }
+
+    #[test]
+    fn indent_string_indents_after_all_line_breaks() {
+        assert_eq!(indent_string("alpha\nbeta\n", 2), "alpha\n  beta\n  ");
     }
 
     #[test]
@@ -11280,17 +11832,20 @@ frames:
         let rendered = strip_ansi_codes(&format_check_output(&output));
 
         let file = rendered.find("file ").expect("file group should render");
+        let exif = rendered.find("exif ").expect("exif group should render");
         let frames = rendered
             .find("frames ")
             .expect("frames group should render");
         let overview = rendered
             .find("overview ")
             .expect("overview group should render");
-        assert!(file < frames);
+        assert!(file < exif);
+        assert!(exif < frames);
         assert!(frames < overview);
         assert!(rendered.starts_with("file "));
-        assert!(rendered.contains("YAML format      ✓ ok\n\nframes "));
-        assert!(!rendered.contains("exif "));
+        assert!(rendered.contains("YAML format      ✓ ok\n\nexif "));
+        assert!(rendered.contains("Tag values     ✓ 2/2 valid"));
+        assert!(rendered.contains("\n\nframes "));
         assert!(!rendered.contains("standard tags"));
         assert!(!rendered.contains("unknown tags"));
         assert!(!rendered.contains("non-standard"));
@@ -11379,7 +11934,7 @@ frames:
         };
         let rendered = format_check_output(&output);
 
-        assert!(rendered.contains("validation    \u{1b}[33m⚠\u{1b}[0m warning"));
+        assert!(rendered.contains("validation    \u{1b}[33m⚠\u{1b}[0m \u{1b}[33mwarning\u{1b}[0m"));
     }
 
     #[test]
@@ -11396,6 +11951,7 @@ frames:
 
         assert!(rendered.contains("errors        \u{1b}[31m1\u{1b}[0m"));
         assert!(rendered.contains("warnings      \u{1b}[33m1\u{1b}[0m"));
+        assert!(rendered.contains("validation    \u{1b}[31m✗\u{1b}[0m \u{1b}[31merror\u{1b}[0m"));
         assert!(clean.contains("errors        0"));
         assert!(clean.contains("warnings      0"));
         assert!(!clean.contains("\u{1b}[31m0\u{1b}[0m"));
@@ -11464,7 +12020,7 @@ frames:
     }
 
     #[test]
-    fn check_output_warns_when_numeric_frames_exceed_files() {
+    fn check_output_does_not_warn_when_numeric_frames_exceed_files() {
         let directory = temporary_test_directory("check-more-frame-numbers");
         let metadata = directory.join(METADATA_FILE_NAME);
         std::fs::write(
@@ -11485,7 +12041,7 @@ frames:
 
         assert!(rendered.contains("frames    2"));
         assert!(rendered.contains("files     1"));
-        assert!(rendered.contains("warning: there are more frames (2) than image files (1)"));
+        assert!(!rendered.contains("warning: there are more frames"));
         assert!(rendered.contains("\n✗ frame 2\n"));
         assert!(rendered.contains("error: frame reference `2` does not match an image file"));
         assert!(!rendered.contains("warning: frame reference `2`"));
@@ -11555,9 +12111,9 @@ frames:
         let rendered = strip_ansi_codes(&format_check_output(&output));
 
         assert!(rendered.contains("YAML format      skipped"));
-        assert!(!rendered.contains("exif "));
+        assert!(rendered.contains("exif "));
         assert!(rendered.contains("frames "));
-        assert_eq!(rendered.matches("skipped").count(), 2);
+        assert_eq!(rendered.matches("skipped").count(), 3);
         assert!(rendered.contains("errors        1"));
         assert!(rendered.contains("validation    ✗ error"));
 
@@ -11581,18 +12137,25 @@ frames:
         colored::control::set_override(true);
 
         let output = build_check_output(Some(&metadata));
-        let rendered = format_check_output(&output);
+        let mut rendered = String::new();
+        for _ in 0..100 {
+            colored::control::set_override(true);
+            rendered = format_check_output(&output);
+            if rendered.contains("\u{1b}[94mfile ") {
+                break;
+            }
+        }
 
         assert!(rendered.contains("\u{1b}[94mfile "));
         assert!(rendered.contains("\u{1b}[32m✓\u{1b}[0m found "));
-        assert!(rendered.contains("\u{1b}[32m✓\u{1b}[0m \u{1b}[96mimage.jpg"));
+        assert!(rendered.contains("\u{1b}[32m✓\u{1b}[0m image.jpg"));
         assert!(rendered.contains("location: \u{1b}[32mmatch found\u{1b}[0m [London"));
 
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn check_frame_titles_use_status_icons_with_light_blue_titles() {
+    fn check_frame_titles_use_status_icons_without_title_colour() {
         colored::control::set_override(true);
 
         let warning_frame = FrameReport {
@@ -11610,11 +12173,11 @@ frames:
 
         assert_eq!(
             format_check_frame_title(&warning_frame),
-            "\u{1b}[33m⚠\u{1b}[0m \u{1b}[96mimage.jpg\u{1b}[0m"
+            "\u{1b}[33m⚠\u{1b}[0m image.jpg"
         );
         assert_eq!(
             format_check_frame_title(&error_frame),
-            "\u{1b}[31m✗\u{1b}[0m \u{1b}[96mframe 2\u{1b}[0m"
+            "\u{1b}[31m✗\u{1b}[0m frame 2"
         );
     }
 
